@@ -126,7 +126,7 @@ If you use this project in your research, please cite it as follows:
 
 ```
 GraphSpecAI: A Deep Learning Framework for Mass Spectrum Prediction from Molecular Structures
-https://github.com/yourusername/GraphSpecAI
+https://github.com/DeepMassSpec/GraphSpecAI
 ```
 
 ## Contributing
