@@ -1,0 +1,379 @@
+以下のコードではコサイン類似度が0.4で低い値となった。よりコサイン類似度を高くするコードにアップグレードしてください。
+
+import os
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch_geometric.nn import GCNConv, global_mean_pool
+from torch_geometric.data import Data, Batch
+from sklearn.model_selection import train_test_split
+from sklearn.metrics.pairwise import cosine_similarity
+import matplotlib.pyplot as plt
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from tqdm import tqdm
+import re
+
+# パス設定
+DATA_PATH = "data/"
+MOL_FILES_PATH = os.path.join(DATA_PATH, "mol_files/")
+MSP_FILE_PATH = os.path.join(DATA_PATH, "NIST17.MSP")
+
+# 原子の特徴マッピング
+ATOM_FEATURES = {
+    'C': 0, 'N': 1, 'O': 2, 'S': 3, 'F': 4, 'Cl': 5, 'Br': 6, 'I': 7, 'P': 8,
+    'Si': 9, 'B': 10, 'Na': 11, 'K': 12, 'Li': 13, 'Mg': 14, 'Ca': 15, 'Fe': 16,
+    'Co': 17, 'Ni': 18, 'Cu': 19, 'Zn': 20, 'H': 21, 'OTHER': 22
+}
+
+# 結合の特徴マッピング
+BOND_FEATURES = {
+    Chem.rdchem.BondType.SINGLE: 0,
+    Chem.rdchem.BondType.DOUBLE: 1,
+    Chem.rdchem.BondType.TRIPLE: 2,
+    Chem.rdchem.BondType.AROMATIC: 3
+}
+
+# 最大m/z値の設定
+MAX_MZ = 2000
+
+class MoleculeGraphDataset(Dataset):
+    def __init__(self, mol_ids, mol_files_path, msp_data):
+        self.mol_ids = mol_ids
+        self.mol_files_path = mol_files_path
+        self.msp_data = msp_data
+        
+    def __len__(self):
+        return len(self.mol_ids)
+    
+    def __getitem__(self, idx):
+        mol_id = self.mol_ids[idx]
+        mol_file = os.path.join(self.mol_files_path, f"ID{mol_id}.MOL")
+        
+        # MOLファイルからグラフ表現を生成
+        graph_data = self._mol_to_graph(mol_file)
+        
+        # MSPデータからマススペクトルを取得
+        mass_spectrum = self.msp_data.get(mol_id, np.zeros(MAX_MZ))
+        
+        return graph_data, torch.FloatTensor(mass_spectrum)
+    
+    def _mol_to_graph(self, mol_file):
+        # RDKitでMOLファイルを読み込む
+        mol = Chem.MolFromMolFile(mol_file)
+        if mol is None:
+            raise ValueError(f"Could not read molecule from {mol_file}")
+        
+        # 原子情報を取得
+        num_atoms = mol.GetNumAtoms()
+        x = []
+        for atom in mol.GetAtoms():
+            atom_symbol = atom.GetSymbol()
+            atom_feature_idx = ATOM_FEATURES.get(atom_symbol, ATOM_FEATURES['OTHER'])
+            atom_feature = [0] * len(ATOM_FEATURES)
+            atom_feature[atom_feature_idx] = 1
+            x.append(atom_feature)
+        
+        # 結合情報を取得
+        edge_indices = []
+        edge_attrs = []
+        for bond in mol.GetBonds():
+            i = bond.GetBeginAtomIdx()
+            j = bond.GetEndAtomIdx()
+            bond_type = BOND_FEATURES[bond.GetBondType()]
+            
+            # 双方向のエッジを追加
+            edge_indices.append([i, j])
+            edge_indices.append([j, i])
+            
+            edge_attr = [0] * len(BOND_FEATURES)
+            edge_attr[bond_type] = 1
+            edge_attrs.append(edge_attr)
+            edge_attrs.append(edge_attr)  # 双方向なので同じ属性
+        
+        # PyTorch Geometricのデータ形式に変換
+        x = torch.FloatTensor(x)
+        edge_index = torch.LongTensor(edge_indices).t().contiguous()
+        edge_attr = torch.FloatTensor(edge_attrs)
+        
+        return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
+
+def parse_msp_file(msp_file_path):
+    """MSPファイルを解析し、ID->マススペクトルのマッピングを返す"""
+    msp_data = {}
+    current_id = None
+    current_peaks = []
+    
+    with open(msp_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            
+            # IDを検出
+            if line.startswith("ID:"):
+                current_id = line.split(":")[1].strip()
+                current_id = int(current_id)
+            
+            # ピーク数を検出（これはピークデータの直前にある）
+            elif line.startswith("Num peaks:"):
+                current_peaks = []
+            
+            # 空行は化合物の区切り
+            elif line == "" and current_id is not None and current_peaks:
+                # マススペクトルをベクトルに変換
+                ms_vector = np.zeros(MAX_MZ)
+                for mz, intensity in current_peaks:
+                    if 0 <= mz < MAX_MZ:
+                        ms_vector[mz] = intensity
+                
+                # 強度を正規化
+                if np.sum(ms_vector) > 0:
+                    ms_vector = ms_vector / np.max(ms_vector) * 100
+                
+                msp_data[current_id] = ms_vector
+                current_id = None
+                current_peaks = []
+            
+            # ピークデータを処理
+            elif current_id is not None and " " in line and not any(line.startswith(prefix) for prefix in ["Name:", "Formula:", "MW:", "CASNO:", "Comment:"]):
+                try:
+                    parts = line.split()
+                    if len(parts) == 2:
+                        mz = int(parts[0])
+                        intensity = float(parts[1])
+                        current_peaks.append((mz, intensity))
+                except ValueError:
+                    pass  # 数値に変換できない行はスキップ
+    
+    return msp_data
+
+class GCNModel(nn.Module):
+    def __init__(self, node_features, edge_features, hidden_channels, out_channels):
+        super(GCNModel, self).__init__()
+        
+        # グラフコンボリューション層
+        self.conv1 = GCNConv(node_features, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, hidden_channels)
+        self.conv3 = GCNConv(hidden_channels, hidden_channels)
+        
+        # マススペクトル予測のための全結合層
+        self.fc1 = nn.Linear(hidden_channels, hidden_channels)
+        self.fc2 = nn.Linear(hidden_channels, out_channels)
+        
+        self.dropout = nn.Dropout(0.2)
+    
+    def forward(self, data):
+        x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
+        
+        # グラフコンボリューション
+        x = F.relu(self.conv1(x, edge_index))
+        x = self.dropout(x)
+        x = F.relu(self.conv2(x, edge_index))
+        x = self.dropout(x)
+        x = F.relu(self.conv3(x, edge_index))
+        
+        # グローバルプーリング
+        x = global_mean_pool(x, batch)
+        
+        # マススペクトル予測
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        
+        return x
+
+def cosine_similarity_score(y_true, y_pred):
+    """コサイン類似度を計算する"""
+    y_true_flat = y_true.reshape(y_true.shape[0], -1)
+    y_pred_flat = y_pred.reshape(y_pred.shape[0], -1)
+    
+    scores = []
+    for i in range(y_true_flat.shape[0]):
+        # ゼロ除算を避ける
+        if np.sum(y_true_flat[i]) == 0 or np.sum(y_pred_flat[i]) == 0:
+            scores.append(0)
+        else:
+            similarity = cosine_similarity(
+                y_true_flat[i].reshape(1, -1), 
+                y_pred_flat[i].reshape(1, -1)
+            )[0][0]
+            scores.append(similarity)
+    
+    return np.mean(scores)
+
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device):
+    """モデルの学習を行う"""
+    train_losses = []
+    val_losses = []
+    val_cosine_similarities = []
+    
+    for epoch in range(num_epochs):
+        # 訓練モード
+        model.train()
+        epoch_loss = 0
+        
+        for graph_data, mass_spectrum in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Training)"):
+            # データをGPUに転送
+            graph_data = graph_data.to(device)
+            mass_spectrum = mass_spectrum.to(device)
+            
+            # 勾配をゼロに初期化
+            optimizer.zero_grad()
+            
+            # 順伝播
+            output = model(graph_data)
+            loss = criterion(output, mass_spectrum)
+            
+            # 逆伝播
+            loss.backward()
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+        
+        train_losses.append(epoch_loss / len(train_loader))
+        
+        # 評価モード
+        model.eval()
+        val_loss = 0
+        y_true = []
+        y_pred = []
+        
+        with torch.no_grad():
+            for graph_data, mass_spectrum in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Validation)"):
+                graph_data = graph_data.to(device)
+                mass_spectrum = mass_spectrum.to(device)
+                
+                output = model(graph_data)
+                loss = criterion(output, mass_spectrum)
+                val_loss += loss.item()
+                
+                y_true.append(mass_spectrum.cpu().numpy())
+                y_pred.append(output.cpu().numpy())
+        
+        val_losses.append(val_loss / len(val_loader))
+        
+        # コサイン類似度を計算
+        y_true_concat = np.concatenate(y_true)
+        y_pred_concat = np.concatenate(y_pred)
+        cosine_sim = cosine_similarity_score(y_true_concat, y_pred_concat)
+        val_cosine_similarities.append(cosine_sim)
+        
+        print(f"Epoch {epoch+1}/{num_epochs}, "
+              f"Train Loss: {train_losses[-1]:.4f}, "
+              f"Val Loss: {val_losses[-1]:.4f}, "
+              f"Val Cosine Similarity: {cosine_sim:.4f}")
+    
+    return train_losses, val_losses, val_cosine_similarities
+
+def collate_fn(batch):
+    """バッチ内のグラフデータとマススペクトルを結合する"""
+    graphs, spectra = zip(*batch)
+    batched_graphs = Batch.from_data_list(list(graphs))
+    batched_spectra = torch.stack(spectra)
+    return batched_graphs, batched_spectra
+
+def main():
+    # MSPファイルを解析
+    print("MSPファイルを解析中...")
+    msp_data = parse_msp_file(MSP_FILE_PATH)
+    print(f"MSPファイルから{len(msp_data)}個の化合物データを読み込みました")
+    
+    # 利用可能なMOLファイルを確認
+    mol_ids = []
+    for filename in os.listdir(MOL_FILES_PATH):
+        if filename.startswith("ID") and filename.endswith(".MOL"):
+            mol_id = int(filename[2:-4])  # "ID300001.MOL" → 300001
+            if mol_id in msp_data:
+                mol_ids.append(mol_id)
+    
+    print(f"MOLファイルとMSPデータが揃っている化合物: {len(mol_ids)}個")
+    
+    # データを分割（訓練:検証:テスト = 90:3.3:6.7）
+    train_ids, remaining_ids = train_test_split(mol_ids, test_size=0.1, random_state=42)
+    val_ids, test_ids = train_test_split(remaining_ids, test_size=0.67, random_state=42)
+    
+    print(f"訓練データ: {len(train_ids)}個")
+    print(f"検証データ: {len(val_ids)}個")
+    print(f"テストデータ: {len(test_ids)}個")
+    
+    # データセットとデータローダーを作成
+    train_dataset = MoleculeGraphDataset(train_ids, MOL_FILES_PATH, msp_data)
+    val_dataset = MoleculeGraphDataset(val_ids, MOL_FILES_PATH, msp_data)
+    test_dataset = MoleculeGraphDataset(test_ids, MOL_FILES_PATH, msp_data)
+    
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
+    
+    # モデルのパラメータを設定
+    node_features = len(ATOM_FEATURES)
+    edge_features = len(BOND_FEATURES)
+    hidden_channels = 128
+    out_channels = MAX_MZ
+    
+    # デバイスの設定
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # モデル、損失関数、オプティマイザーの初期化
+    model = GCNModel(node_features, edge_features, hidden_channels, out_channels).to(device)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    
+    # モデルの訓練
+    num_epochs = 50
+    train_losses, val_losses, val_cosine_similarities = train_model(
+        model, train_loader, val_loader, criterion, optimizer, num_epochs, device
+    )
+    
+    # 学習曲線をプロット
+    plt.figure(figsize=(12, 5))
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Loss Curves')
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(val_cosine_similarities, label='Validation Cosine Similarity')
+    plt.xlabel('Epoch')
+    plt.ylabel('Cosine Similarity')
+    plt.legend()
+    plt.title('Cosine Similarity')
+    
+    plt.tight_layout()
+    plt.savefig('learning_curves.png')
+    plt.show()
+    
+    # テストデータでの評価
+    model.eval()
+    test_y_true = []
+    test_y_pred = []
+    
+    with torch.no_grad():
+        for graph_data, mass_spectrum in tqdm(test_loader, desc="Testing"):
+            graph_data = graph_data.to(device)
+            mass_spectrum = mass_spectrum.to(device)
+            
+            output = model(graph_data)
+            
+            test_y_true.append(mass_spectrum.cpu().numpy())
+            test_y_pred.append(output.cpu().numpy())
+    
+    test_y_true_concat = np.concatenate(test_y_true)
+    test_y_pred_concat = np.concatenate(test_y_pred)
+    test_cosine_sim = cosine_similarity_score(test_y_true_concat, test_y_pred_concat)
+    
+    print(f"テストデータでのコサイン類似度: {test_cosine_sim:.4f}")
+    
+    # モデルを保存
+    torch.save(model.state_dict(), 'gcn_ms_model.pth')
+    print("モデルを保存しました: gcn_ms_model.pth")
+
+if __name__ == "__main__":
+    main()
