@@ -64,7 +64,7 @@ BOND_FEATURES = {
 }
 
 # 最大m/z値の設定
-MAX_MZ = 3000
+MAX_MZ = 2000
 
 # フラグメントパターンの数（MACCSキー使用）
 NUM_FRAGS = 167  # MACCSキーのビット数
