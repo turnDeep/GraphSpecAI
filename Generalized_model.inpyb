@@ -43,7 +43,7 @@ BOND_FEATURES = {
 }
 
 # 最大m/z値の設定 - エラー修正: 大きな値をカバーするために増加
-MAX_MZ = 2000
+MAX_MZ = 3000
 
 # フラグメントパターンの数（MACCSキー使用）
 NUM_FRAGS = 167  # MACCSキーのビット数
@@ -995,44 +995,172 @@ class HybridGNNModel(nn.Module):
         
         return output, fragment_pred
 
-def peak_weighted_cosine_loss(y_pred, y_true, important_mz=None, important_weight=3.0, eps=1e-8):
-    """ピーク重視コサイン類似度損失
+def fragment_pattern_loss(y_pred, y_true, top_k=30):
+    """フラグメントパターンを重視した損失関数（修正版）"""
+    batch_size = y_pred.shape[0]
+    device = y_pred.device
     
-    重要なm/z値や高強度ピークに高い重みを与える損失関数。
-    """
-    # バッチサイズが異なる場合、最小のバッチサイズに合わせる
-    if y_pred.shape[0] != y_true.shape[0]:
-        min_batch_size = min(y_pred.shape[0], y_true.shape[0])
-        y_pred = y_pred[:min_batch_size]
-        y_true = y_true[:min_batch_size]
+    # 各スペクトルの上位k個のピークを抽出
+    k_pred = min(top_k, y_pred.size(1))
+    k_true = min(top_k, y_true.size(1))
+    _, pred_top_indices = torch.topk(y_pred, k=k_pred, dim=1)
+    _, true_top_indices = torch.topk(y_true, k=k_true, dim=1)
     
-    batch_size = y_true.size(0)
+    loss = 0.0
+    valid_samples = 0
     
-    # 重要なm/z値に高い重みを付ける
-    weights = torch.ones_like(y_true)
+    for i in range(batch_size):
+        # 予測と実測の上位ピーク位置
+        pred_peaks = pred_top_indices[i]
+        true_peaks = true_top_indices[i]
+        
+        # 予測と実測のピーク位置の一致度を評価（集合演算）
+        pred_set = set(pred_peaks.cpu().numpy())
+        true_set = set(true_peaks.cpu().numpy())
+        
+        common_peaks = len(pred_set.intersection(true_set))
+        union_peaks = len(pred_set.union(true_set))
+        
+        jaccard = common_peaks / max(1, union_peaks)
+        
+        # ピーク間の距離による評価
+        total_dist = 0.0
+        count = 0
+        
+        for p in pred_peaks:
+            p_val = p.item()
+            min_dist = float('inf')
+            for t in true_peaks:
+                t_val = t.item()
+                dist = abs(p_val - t_val)
+                min_dist = min(min_dist, dist)
+            
+            if min_dist != float('inf'):
+                total_dist += min_dist
+                count += 1
+        
+        # 平均距離を計算
+        if count > 0:
+            mean_distance = total_dist / count
+            dist_factor = math.exp(-mean_distance / 10.0)  # Python の math.exp を使用
+        else:
+            dist_factor = 0.0
+            
+        # パターン類似性損失
+        pattern_loss = 1.0 - (jaccard * dist_factor)
+        loss += pattern_loss
+        valid_samples += 1
     
-    # 特徴的なm/z値に重み付け
-    if important_mz is not None:
-        for mz in important_mz:
-            if mz < y_true.size(1):
-                weights[:, mz] = important_weight
+    if valid_samples > 0:
+        return loss / valid_samples
+    else:
+        return torch.tensor(1.0, device=device)  # 有効なサンプルがない場合
+
+def relative_intensity_loss(y_pred, y_true, top_k=30):
+    """フラグメントイオン間の相対強度比を保存するための損失関数（修正版）"""
+    batch_size = y_pred.shape[0]
+    device = y_pred.device
+    loss = 0.0
+    valid_samples = 0
     
-    # 高強度ピークにも重み付け
-    peak_mask = (y_true > torch.quantile(y_true, 0.95, dim=1, keepdim=True))
-    weights = torch.where(peak_mask, weights * 2.0, weights)
+    for i in range(batch_size):
+        pred = y_pred[i]
+        true = y_true[i]
+        
+        # 上位kピークを抽出（非ゼロ値の数とtop_kの小さい方）
+        nonzero_count = torch.count_nonzero(true)
+        if nonzero_count < 2:
+            continue
+            
+        k = min(top_k, nonzero_count.item())
+        true_values, true_indices = torch.topk(true, k=k)
+        
+        # 実測データに重要なピークがあるか確認
+        if torch.sum(true_values > 0) < 2:
+            continue
+            
+        # ピーク間の強度比の計算
+        ratios_true = []
+        ratios_pred = []
+        
+        # 各ピアのピーク強度比を計算
+        for idx1 in range(len(true_indices)):
+            for idx2 in range(idx1+1, len(true_indices)):
+                m1, m2 = true_indices[idx1].item(), true_indices[idx2].item()
+                
+                # 実測値の強度
+                i1_true = true[m1].item()
+                i2_true = true[m2].item()
+                
+                # どちらかが0なら無視
+                if i1_true <= 0 or i2_true <= 0:
+                    continue
+                    
+                # 予測値の強度
+                i1_pred = pred[m1].item()
+                i2_pred = pred[m2].item()
+                
+                # 負の値や極小値のチェック
+                if i1_pred <= 1e-6 or i2_pred <= 1e-6:
+                    continue
+                
+                # 強度比（大きい方を分子に）
+                if i1_true >= i2_true:
+                    ratio_true = i1_true / (i2_true + 1e-6)
+                    ratio_pred = i1_pred / (i2_pred + 1e-6)
+                else:
+                    ratio_true = i2_true / (i1_true + 1e-6)
+                    ratio_pred = i2_pred / (i1_pred + 1e-6)
+                
+                ratios_true.append(ratio_true)
+                ratios_pred.append(ratio_pred)
+        
+        # 強度比の差を損失として計算
+        if ratios_true:
+            # 警告を解消するために改善された方法でテンソルを作成
+            ratios_true_tensor = torch.tensor(ratios_true, device=device)
+            ratios_pred_tensor = torch.tensor(ratios_pred, device=device)
+            
+            # 比率の対数差（比率の違いを相対的に評価）
+            log_true = torch.log(ratios_true_tensor + 1e-6)
+            log_pred = torch.log(ratios_pred_tensor + 1e-6)
+            log_diff = torch.abs(log_true - log_pred)
+            
+            ratio_loss = torch.mean(log_diff)
+            loss += ratio_loss
+            valid_samples += 1
     
-    # 重み付きベクトル
-    y_pred_weighted = y_pred * weights
-    y_true_weighted = y_true * weights
-    
+    # バッチ内の有効なサンプル数で割って平均損失を計算
+    if valid_samples > 0:
+        return loss / valid_samples
+    else:
+        return torch.tensor(0.0, device=device)  # 有効なサンプルがない場合
+
+def peak_weighted_cosine_loss(y_pred, y_true, important_mz=None, important_weight=3.0):
+    """ピークと重要なm/z値を重視したコサイン類似度損失関数"""
     # 正規化
-    y_pred_norm = F.normalize(y_pred_weighted, p=2, dim=1)
-    y_true_norm = F.normalize(y_true_weighted, p=2, dim=1)
+    y_pred_norm = F.normalize(y_pred, p=2, dim=1)
+    y_true_norm = F.normalize(y_true, p=2, dim=1)
     
-    # コサイン類似度
+    # 特徴的なm/zの重み付け
+    if important_mz is not None:
+        batch_size = y_pred.size(0)
+        weights = torch.ones_like(y_pred)
+        for mz in important_mz:
+            if mz < y_pred.size(1):
+                weights[:, mz] = important_weight
+        
+        # 重み付きベクトルで正規化
+        y_pred_weighted = y_pred * weights
+        y_true_weighted = y_true * weights
+        
+        y_pred_norm = F.normalize(y_pred_weighted, p=2, dim=1)
+        y_true_norm = F.normalize(y_true_weighted, p=2, dim=1)
+    
+    # コサイン類似度（-1〜1の範囲）
     cosine = torch.sum(y_pred_norm * y_true_norm, dim=1)
     
-    # 損失
+    # 損失を1 - cosineにして、0〜2の範囲に
     loss = 1.0 - cosine
     
     return loss.mean()
@@ -1061,104 +1189,156 @@ def focal_cosine_similarity_loss(y_pred, y_true, alpha=0.25, gamma=2.0, eps=1e-8
     
     return weighted_loss.mean()
 
-def combined_loss(y_pred, y_true, fragment_pred=None, fragment_true=None, alpha=0.2):
-    """MSEとコサイン類似度損失の組み合わせ（マルチタスク対応）"""
-    # デバッグ情報
-    print(f"y_pred shape: {y_pred.shape}, y_true shape: {y_true.shape}")
-    
-    # バッチサイズの確認
+def combined_loss(y_pred, y_true, fragment_pred=None, fragment_true=None, 
+                 alpha=0.1, beta=0.4, gamma=0.2, delta=0.2, epsilon=0.1):
+    """最適化された複合損失関数"""
+    # バッチサイズのチェックと調整
     if y_pred.shape[0] != y_true.shape[0]:
-        print(f"バッチサイズの不一致を検出: y_pred={y_pred.shape[0]}, y_true={y_true.shape[0]}")
-        # バッチサイズが異なる場合、最小のバッチサイズに合わせる
         min_batch_size = min(y_pred.shape[0], y_true.shape[0])
         y_pred = y_pred[:min_batch_size]
         y_true = y_true[:min_batch_size]
-        print(f"バッチサイズ調整後: y_pred={y_pred.shape}, y_true={y_true.shape}")
     
-    # 特徴数の確認
+    # 特徴数のチェックと調整
     if y_pred.shape[1] != y_true.shape[1]:
-        print(f"特徴数の不一致を検出: y_pred={y_pred.shape}, y_true={y_true.shape}")
         min_size = min(y_pred.shape[1], y_true.shape[1])
         y_pred = y_pred[:, :min_size]
         y_true = y_true[:, :min_size]
-        print(f"特徴数調整後: y_pred={y_pred.shape}, y_true={y_true.shape}")
     
-    # スペクトル予測の損失
-    # ピーク重視MSE損失
+    # 1. ピーク重視MSE損失
     peak_mask = (y_true > 0).float()
     mse_weights = peak_mask * 10.0 + 1.0
+    
+    # 重要なm/z値にさらに重みを付ける
+    for mz in IMPORTANT_MZ:
+        if mz < y_true.size(1):
+            mse_weights[:, mz] *= 3.0
+    
     mse_loss = torch.mean(mse_weights * (y_pred - y_true) ** 2)
     
-    # コサイン類似度損失（特徴的なm/z値を重視）
+    # 2. コサイン類似度損失
     cosine_loss = peak_weighted_cosine_loss(y_pred, y_true, important_mz=IMPORTANT_MZ)
     
-    # 主要な損失関数の組み合わせ（コサイン類似度を重視）
-    main_loss = alpha * mse_loss + (1 - alpha) * cosine_loss
+    # 3. フラグメントパターン損失 - 計算コストが高いので重みを下げる
+    pattern_loss = fragment_pattern_loss(y_pred, y_true, top_k=30)  # top_kを小さくして高速化
+    
+    # 4. 相対強度比保存損失 - 計算コストが高いので重みを下げる
+    rel_intensity_loss_val = relative_intensity_loss(y_pred, y_true, top_k=20)  # top_kを小さくして高速化
+    
+    # 主要な損失関数の組み合わせ
+    main_loss = alpha * mse_loss + beta * cosine_loss + gamma * pattern_loss + delta * rel_intensity_loss_val
     
     # フラグメントパターン予測がある場合
     if fragment_pred is not None and fragment_true is not None:
-        # バッチサイズの確認
         if fragment_pred.shape[0] != fragment_true.shape[0]:
             min_batch_size = min(fragment_pred.shape[0], fragment_true.shape[0])
             fragment_pred = fragment_pred[:min_batch_size]
             fragment_true = fragment_true[:min_batch_size]
         
         fragment_loss = F.binary_cross_entropy_with_logits(fragment_pred, fragment_true)
-        # マルチタスク損失（スペクトル予測を主、フラグメント予測を副タスクとする）
-        return main_loss + 0.2 * fragment_loss
+        return main_loss + epsilon * fragment_loss
     
     return main_loss
 
 def cosine_similarity_score(y_true, y_pred, important_mz=IMPORTANT_MZ):
-    """コサイン類似度を計算する（改良版）"""
-    y_true_flat = y_true.reshape(y_true.shape[0], -1)
-    y_pred_flat = y_pred.reshape(y_pred.shape[0], -1)
+    """改良されたコサイン類似度スコア計算（フラグメントパターンと相対強度比評価を含む）"""
+    # NumPy配列に変換
+    y_true_np = y_true.cpu().numpy() if isinstance(y_true, torch.Tensor) else y_true
+    y_pred_np = y_pred.cpu().numpy() if isinstance(y_pred, torch.Tensor) else y_pred
     
-    # 各サンプルにおいて、値の高い上位Kのピークのみを考慮
-    K = 200  # 上位K個のピークを考慮（増加）
+    y_true_flat = y_true_np.reshape(y_true_np.shape[0], -1)
+    y_pred_flat = y_pred_np.reshape(y_pred_np.shape[0], -1)
+    
+    # 上位K個のピークのみを考慮
+    K = 200
     
     scores = []
+    pattern_scores = []  # フラグメントパターンスコア
+    rel_intensity_scores = []  # 相対強度比スコア
+    
     for i in range(y_true_flat.shape[0]):
         true_vec = y_true_flat[i]
         pred_vec = y_pred_flat[i]
         
-        # ゼロ除算を避ける
+        # ゼロベクターチェック
         if np.sum(true_vec) == 0 or np.sum(pred_vec) == 0:
             scores.append(0)
+            pattern_scores.append(0)
+            rel_intensity_scores.append(0)
             continue
+        
+        # 1. 基本コサイン類似度
+        cosine_sim = cosine_similarity(
+            true_vec.reshape(1, -1), 
+            pred_vec.reshape(1, -1)
+        )[0][0]
+        
+        # 2. フラグメントパターン類似度
+        # 上位Kピークを抽出
+        true_top_indices = np.argsort(true_vec)[-K:]
+        pred_top_indices = np.argsort(pred_vec)[-K:]
+        
+        # Jaccard類似度: 共通ピーク数 / 全ピーク数
+        common_peaks = len(set(true_top_indices) & set(pred_top_indices))
+        total_peaks = len(set(true_top_indices) | set(pred_top_indices))
+        pattern_sim = common_peaks / total_peaks if total_peaks > 0 else 0
+        
+        # 3. 相対強度比の評価
+        if len(true_top_indices) >= 5:
+            # 上位5ピークを使用
+            top5_true = np.argsort(true_vec)[-5:]
+            ratios_true = []
+            ratios_pred = []
             
-        # 重要なm/z値を強調
-        true_weighted = true_vec.copy()
-        pred_weighted = pred_vec.copy()
-        
-        for mz in important_mz:
-            if mz < len(true_vec):
-                true_weighted[mz] *= 2.0
-                pred_weighted[mz] *= 2.0
+            for idx1 in range(len(top5_true)):
+                for idx2 in range(idx1+1, len(top5_true)):
+                    m1, m2 = top5_true[idx1], top5_true[idx2]
+                    
+                    # 実測値の強度
+                    i1_true, i2_true = true_vec[m1], true_vec[m2]
+                    
+                    # 予測値の強度
+                    i1_pred, i2_pred = pred_vec[m1], pred_vec[m2]
+                    
+                    if i1_true > 0 and i2_true > 0 and i1_pred > 0 and i2_pred > 0:
+                        # 強度比（大きい方を分子に）
+                        if i1_true >= i2_true:
+                            ratio_true = i1_true / i2_true
+                            ratio_pred = i1_pred / i2_pred
+                        else:
+                            ratio_true = i2_true / i1_true
+                            ratio_pred = i2_pred / i1_pred
+                        
+                        # 比率の一致度（1.0が完全一致）
+                        ratio_match = min(ratio_true, ratio_pred) / max(ratio_true, ratio_pred)
+                        ratios_true.append(ratio_true)
+                        ratios_pred.append(ratio_pred)
             
-        # 上位Kピークのインデックスを取得
-        top_k_true = np.argsort(true_weighted)[-K:]
-        top_k_pred = np.argsort(pred_weighted)[-K:]
-        
-        # 上位ピークの和集合を取得
-        important_indices = np.union1d(top_k_true, top_k_pred)
-        
-        # 重要なインデックスのみでコサイン類似度を計算
-        true_vec_filtered = true_weighted[important_indices]
-        pred_vec_filtered = pred_weighted[important_indices]
-        
-        # ゼロベクターチェック
-        if np.sum(true_vec_filtered) == 0 or np.sum(pred_vec_filtered) == 0:
-            similarity = 0
+            # 相対強度比のスコア計算
+            if ratios_true:
+                rel_intensity_score = np.mean([min(r1, r2) / max(r1, r2) for r1, r2 in zip(ratios_true, ratios_pred)])
+                rel_intensity_scores.append(rel_intensity_score)
+            else:
+                rel_intensity_scores.append(0)
         else:
-            similarity = cosine_similarity(
-                true_vec_filtered.reshape(1, -1), 
-                pred_vec_filtered.reshape(1, -1)
-            )[0][0]
-            
-        scores.append(similarity)
+            rel_intensity_scores.append(0)
+        
+        # 4. 複合スコアの計算
+        # コサイン類似度(60%)、パターン類似度(20%)、相対強度比(20%)の加重平均
+        pattern_sim_value = pattern_sim if not np.isnan(pattern_sim) else 0
+        rel_intensity_value = rel_intensity_scores[-1] if rel_intensity_scores else 0
+        
+        composite_score = 0.6 * cosine_sim + 0.2 * pattern_sim_value + 0.2 * rel_intensity_value
+        scores.append(composite_score)
+        pattern_scores.append(pattern_sim)
     
-    return np.mean(scores)
+    # 各スコアの平均を表示
+    avg_cosine = np.mean(scores)
+    avg_pattern = np.mean(pattern_scores) if pattern_scores else 0
+    avg_rel_intensity = np.mean(rel_intensity_scores) if rel_intensity_scores else 0
+    
+    print(f"評価指標: コサイン類似度={avg_cosine:.4f}, パターン類似度={avg_pattern:.4f}, 相対強度比={avg_rel_intensity:.4f}")
+    
+    return avg_cosine  # 互換性のため、コサイン類似度を返す
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device):
     """モデルの学習を行う（改良版）"""
@@ -1542,6 +1722,19 @@ def main():
     # デバイスの設定
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+
+    # GPU使用効率の向上
+    if torch.cuda.is_available():
+        # GPUメモリの使用効率を高める
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False  # 再現性よりも速度を優先
+        
+        # GPUの現在の状態を表示
+        print(f"GPU: {torch.cuda.get_device_name()}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        
+        # メモリ使用量を監視（オプション）
+        torch.cuda.reset_peak_memory_stats()
     
     # モデルアンサンブル用のチェックポイントリスト
     model_checkpoints = []
