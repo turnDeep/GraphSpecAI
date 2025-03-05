@@ -1,54 +1,81 @@
 # GraphSpecAI
 
-GraphSpecAI is a deep learning framework for predicting mass spectra from molecular structures. It uses Graph Neural Networks (GNNs) to represent molecules as graphs, enabling high-accuracy mass spectrum prediction.
+GraphSpecAI は分子構造からマススペクトルを予測するための深層学習フレームワークです。Graph Neural Networks (GNNs) を使用して分子をグラフとして表現し、高精度なマススペクトル予測を可能にします。
 
-## Overview
+## 概要
 
-Mass Spectrometry is a widely used analytical technique for compound identification and structural analysis, but obtaining experimental mass spectra for all molecules is time-consuming and expensive. GraphSpecAI addresses this challenge by leveraging machine learning to predict mass spectra from molecular structures.
+質量分析法は化合物の同定や構造解析に広く使用される分析手法ですが、すべての分子について実験的なマススペクトルを取得するのは時間とコストがかかります。GraphSpecAI は機械学習を活用して分子構造からマススペクトルを予測することでこの課題に対応します。
 
-Key features:
-- Graph Neural Networks (GNNs) for learning molecular structure representations
-- Attention mechanisms to focus on important molecular substructures
-- Multi-task learning for simultaneous optimization with fragment pattern prediction
-- Ensemble learning to improve prediction accuracy
-- Cosine similarity-based evaluation metrics
+主な特徴:
+- 分子構造の表現学習のためのGraph Neural Networks (GNNs)
+- 重要な分子サブ構造に注目するアテンションメカニズム
+- フラグメントパターン予測との同時最適化のためのマルチタスク学習
+- 予測精度を向上させるアンサンブル学習
+- コサイン類似度ベースの評価指標
 
-## Technical Details
+## モデルの種類
 
-This project utilizes the following technologies:
+GraphSpecAI は3つの異なるモデルを提供しています：
 
-- **Graph Attention Networks (GATv2)**: Efficiently learning molecular graph structures
-- **Attention Mechanisms**: Focusing on important substructures within molecules
-- **Residual Connections**: Stabilizing the learning of deep networks
-- **Multi-task Learning**: Simultaneously learning mass spectrum prediction and fragment pattern prediction
-- **Ensemble Learning**: Combining predictions from multiple models to improve accuracy
-- **Cosine Similarity Loss**: Specialized loss function for mass spectrum prediction
+1. **GCN_model**: 基本的なGraph Convolutional Network (GCN)を使用した初期モデル。シンプルな構造でマススペクトル予測の基礎を提供します。
 
-## Requirements
+2. **Generalized_model**: より高度なGraph Attention Network (GAT)と残差接続を組み合わせた汎用モデル。幅広い分子に対して高い予測精度を実現します。
 
-The following libraries are required:
+3. **Specialized_model**: 特定の分子ファミリーに特化した最適化モデル。クラスタリングと転移学習を活用して、特定のターゲット分子に対する予測精度を最大化します。
 
-```
-numpy
-torch
-torch_geometric
-scikit-learn
-matplotlib
-rdkit
-tqdm
-```
+## 技術的詳細
 
-Installation:
+このプロジェクトは以下の技術を活用しています：
 
+- **Graph Attention Networks (GATv2)**: 分子グラフ構造を効率的に学習
+- **アテンションメカニズム**: 分子内の重要なサブ構造に焦点を当てる
+- **残差接続**: 深層ネットワークの学習を安定化
+- **マルチタスク学習**: マススペクトル予測とフラグメントパターン予測を同時に学習
+- **アンサンブル学習**: 複数のモデルからの予測を組み合わせて精度を向上
+- **コサイン類似度損失**: マススペクトル予測のための特殊な損失関数
+
+## Docker を使った環境構築
+
+GraphSpecAI は Docker を使って簡単に環境構築することができます。
+
+### 前提条件
+
+- Docker がインストールされていること
+- Docker Compose (オプション)
+- NVIDIA GPU + CUDA (推奨、GPU がない場合は CPU モードで動作)
+
+### ビルドと実行
+
+1. リポジトリをクローン:
 ```bash
-pip install numpy torch scikit-learn matplotlib tqdm
-pip install torch-geometric
-pip install rdkit
+git clone https://github.com/your-username/GraphSpecAI.git
+cd GraphSpecAI
 ```
 
-## Dataset Structure
+2. Docker イメージのビルド:
+```bash
+docker build -t graphspecai .
+```
 
-Arrange your data with the following directory structure:
+3. コンテナの実行:
+```bash
+docker run --gpus all -it -p 8888:8888 -v $(pwd)/data:/app/data graphspecai
+```
+
+起動すると、次のオプションが表示されます:
+```
+利用可能なモデル:
+1. GCN_model.py
+2. Generalized_model.py
+3. Specialized_model.py
+4. Jupyter Lab
+
+選択してください (1-4):
+```
+
+### データセット構造
+
+データは以下のディレクトリ構造で配置してください:
 
 ```
 data/
@@ -59,80 +86,98 @@ data/
 └── NIST17.MSP
 ```
 
-- `mol_files/`: Molecular structure files (MOL format)
-- `NIST17.MSP`: Mass spectrum data (MSP format)
+- `mol_files/`: 分子構造ファイル (MOL形式)
+- `NIST17.MSP`: マススペクトルデータ (MSP形式)
 
-## Usage
+## 各モデルの使用方法
 
-### Training and Evaluation
+### 1. GCN_model
+
+基本的なGraph Convolutional Networkを使用した初期モデルです。
 
 ```bash
-python main.py
+# Dockerコンテナ内でオプション1を選択
+python GCN_model.py
 ```
 
-This command executes the following processes:
-1. Loading MSP and MOL files
-2. Splitting data (training/validation/test)
-3. Converting molecules to graph representations
-4. Training models (ensemble of multiple models)
-5. Evaluating models and visualizing results
+または、Jupyter Labで対話的に実行:
+```bash
+# Dockerコンテナ内でオプション4を選択し、ブラウザでGCN_model.ipynbを開く
+```
 
-### Customization
+### 2. Generalized_model
 
-Key parameters:
+より高度なネットワーク構造を持つ汎用モデルです。
 
-- `NUM_FRAGS`: Number of fragment patterns
-- `MAX_MZ`: Maximum m/z value
-- `IMPORTANT_MZ`: List of m/z values to emphasize
-- `hidden_channels`: Size of model's hidden layers
-- `num_models`: Number of models to ensemble
-- `num_epochs`: Number of training epochs
+```bash
+# Dockerコンテナ内でオプション2を選択
+python Generalized_model.py
+```
 
-## Code Structure
+### 3. Specialized_model
 
-- **Data Processing**:
-  - `MoleculeGraphDataset`: Converting molecules to graphs
-  - `parse_msp_file`: Parsing MSP files
+特定の分子ファミリーに特化したモデルです。
 
-- **Models**:
-  - `HybridGNNModel`: Hybrid model combining GNN, CNN, and Transformer
-  - `AttentionBlock`: Attention mechanism
-  - `ResidualBlock`: Residual block
-  - `ModelEnsemble`: Ensemble of multiple models
+```bash
+# Dockerコンテナ内でオプション3を選択
+python Specialized_model.py
+```
 
-- **Loss Functions**:
-  - `peak_weighted_cosine_loss`: Peak-weighted cosine similarity loss
-  - `combined_loss`: Combination of MSE and cosine similarity loss
+## カスタマイズ
 
-- **Evaluation**:
-  - `cosine_similarity_score`: Model evaluation using cosine similarity
+主要なパラメータ:
 
-## Results
+- `NUM_FRAGS`: フラグメントパターンの数
+- `MAX_MZ`: 最大m/z値
+- `IMPORTANT_MZ`: 重視するm/z値のリスト
+- `hidden_channels`: モデルの隠れ層のサイズ
+- `num_models`: アンサンブルするモデルの数
+- `num_epochs`: トレーニングのエポック数
 
-The model evaluation outputs include:
+## 出力結果
 
-- Training and validation loss curves
-- Cosine similarity scores for each epoch
-- Final evaluation results on the test dataset
-- Comparison plots of predicted spectra vs. ground truth
+各モデルの評価結果は以下のディレクトリに出力されます:
 
-## License
+- **models/**: 学習済みモデルファイル
+- **results/**: 評価スコアやトレーニング履歴のJSON
+- **plots/**: 損失曲線や予測スペクトルのグラフ
 
-This project is released under the [MIT License](LICENSE).
+## コード構造
 
-## Citation
+- **データ処理**:
+  - `MoleculeGraphDataset`: 分子からグラフへの変換
+  - `parse_msp_file`: MSPファイルの解析
 
-If you use this project in your research, please cite it as follows:
+- **モデル**:
+  - `HybridGNNModel`: GNN、CNN、Transformerを組み合わせたハイブリッドモデル
+  - `AttentionBlock`: アテンションメカニズム
+  - `ResidualBlock`: 残差ブロック
+  - `ModelEnsemble`: 複数モデルのアンサンブル
+
+- **損失関数**:
+  - `peak_weighted_cosine_loss`: ピーク重み付きコサイン類似度損失
+  - `combined_loss`: MSEとコサイン類似度損失の組み合わせ
+
+- **評価**:
+  - `cosine_similarity_score`: コサイン類似度によるモデル評価
+
+## ライセンス
+
+このプロジェクトは [MIT License](LICENSE) の下でリリースされています。
+
+## 引用
+
+研究でこのプロジェクトを使用する場合は、以下のように引用してください:
 
 ```
 GraphSpecAI: A Deep Learning Framework for Mass Spectrum Prediction from Molecular Structures
 https://github.com/DeepMassSpec/GraphSpecAI
 ```
 
-## Contributing
+## コントリビューション
 
-Bug reports and pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
+バグ報告とプルリクエストを歓迎します。大きな変更を行う場合は、まず変更したい内容について議論するためにissueを開いてください。
 
 ---
 
-Last updated: March 2025
+最終更新: 2025年3月
