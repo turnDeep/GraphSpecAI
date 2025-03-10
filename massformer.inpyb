@@ -1,0 +1,1222 @@
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch_geometric.nn import GATv2Conv, GlobalAttention
+from torch_geometric.data import Data, Batch
+from sklearn.model_selection import train_test_split
+from sklearn.metrics.pairwise import cosine_similarity
+import matplotlib.pyplot as plt
+from rdkit import Chem
+from rdkit.Chem import AllChem, Descriptors, MACCSkeys
+from tqdm import tqdm
+import logging
+import copy
+import math
+import random
+import tempfile
+import pandas as pd
+import joblib
+from pprint import pprint
+import scipy.stats
+
+# ロガーの設定
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# パス設定
+DATA_PATH = "data/"
+MOL_FILES_PATH = os.path.join(DATA_PATH, "mol_files/")
+MSP_FILE_PATH = os.path.join(DATA_PATH, "NIST17.MSP")
+
+# 最大m/z値の設定 
+MAX_MZ = 3000
+
+# 重要なm/z値のリスト
+IMPORTANT_MZ = [18, 28, 43, 57, 71, 73, 77, 91, 105, 115, 128, 152, 165, 178, 207]
+
+# エフェメラル値
+EPS = np.finfo(np.float32).eps
+
+# 原子の特徴マッピング
+ATOM_FEATURES = {
+    'C': 0, 'N': 1, 'O': 2, 'S': 3, 'F': 4, 'Cl': 5, 'Br': 6, 'I': 7, 'P': 8,
+    'Si': 9, 'B': 10, 'Na': 11, 'K': 12, 'Li': 13, 'Mg': 14, 'Ca': 15, 'Fe': 16,
+    'Co': 17, 'Ni': 18, 'Cu': 19, 'Zn': 20, 'H': 21, 'OTHER': 22
+}
+
+# 結合の特徴マッピング
+BOND_FEATURES = {
+    Chem.rdchem.BondType.SINGLE: 0,
+    Chem.rdchem.BondType.DOUBLE: 1,
+    Chem.rdchem.BondType.TRIPLE: 2,
+    Chem.rdchem.BondType.AROMATIC: 3
+}
+
+# ELEMENT_LIST定義（MassFormerから）
+ELEMENT_LIST = ['H', 'C', 'O', 'N', 'P', 'S', 'Cl', 'F']
+
+###############################
+# データ処理関連の関数
+###############################
+
+def parse_msp_file(msp_file_path):
+    """MSPファイルを解析し、ID->マススペクトルのマッピングを返す"""
+    msp_data = {}
+    current_id = None
+    current_peaks = []
+    
+    with open(msp_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            
+            # IDを検出
+            if line.startswith("ID:"):
+                current_id = line.split(":")[1].strip()
+                current_id = int(current_id)
+            
+            # ピーク数を検出（これはピークデータの直前にある）
+            elif line.startswith("Num peaks:"):
+                current_peaks = []
+            
+            # 空行は化合物の区切り
+            elif line == "" and current_id is not None and current_peaks:
+                # マススペクトルをベクトルに変換
+                ms_vector = np.zeros(MAX_MZ)
+                for mz, intensity in current_peaks:
+                    if 0 <= mz < MAX_MZ:
+                        ms_vector[mz] = intensity
+                
+                # 強度を正規化
+                if np.sum(ms_vector) > 0:
+                    ms_vector = ms_vector / np.max(ms_vector) * 100
+                    
+                    # スペクトルをスムージング
+                    smoothed_vector = np.zeros_like(ms_vector)
+                    for i in range(len(ms_vector)):
+                        start = max(0, i-1)
+                        end = min(len(ms_vector), i+2)
+                        smoothed_vector[i] = np.mean(ms_vector[start:end])
+                    
+                    # 小さなピークをフィルタリング (ノイズ除去)
+                    threshold = np.percentile(smoothed_vector[smoothed_vector > 0], 10)
+                    smoothed_vector[smoothed_vector < threshold] = 0
+                    
+                    # 重要なm/z値のピークを強調
+                    for mz in IMPORTANT_MZ:
+                        if mz < len(smoothed_vector) and smoothed_vector[mz] > 0:
+                            smoothed_vector[mz] *= 1.5
+                    
+                    msp_data[current_id] = smoothed_vector
+                else:
+                    msp_data[current_id] = ms_vector
+                
+                current_id = None
+                current_peaks = []
+            
+            # ピークデータを処理
+            elif current_id is not None and " " in line and not any(line.startswith(prefix) for prefix in ["Name:", "Formula:", "MW:", "ExactMass:", "CASNO:", "Comment:"]):
+                try:
+                    parts = line.split()
+                    if len(parts) == 2:
+                        mz = int(parts[0])
+                        intensity = float(parts[1])
+                        current_peaks.append((mz, intensity))
+                except ValueError:
+                    pass  # 数値に変換できない行はスキップ
+    
+    return msp_data
+
+def bin_func(mzs, ints, mz_max, mz_bin_res, ints_thresh, return_index=False):
+    """スペクトルデータをビン化する"""
+    mzs = np.array(mzs, dtype=np.float32)
+    bins = np.arange(
+        mz_bin_res,
+        mz_max + mz_bin_res,
+        step=mz_bin_res).astype(np.float32)
+    bin_idx = np.searchsorted(bins, mzs, side="right")
+    
+    if return_index:
+        return bin_idx.tolist()
+    else:
+        ints = np.array(ints, dtype=np.float32)
+        bin_spec = np.zeros([len(bins)], dtype=np.float32)
+        for i in range(len(mzs)):
+            if bin_idx[i] < len(bin_spec) and ints[i] >= ints_thresh:
+                bin_spec[bin_idx[i]] = max(bin_spec[bin_idx[i]], ints[i])
+        
+        if np.all(bin_spec == 0.):
+            print("> warning: bin_spec is all zeros!")
+            bin_spec[-1] = 1.
+        
+        return bin_spec
+
+def unprocess_spec(spec, transform):
+    """スペクトルの変換を元に戻す"""
+    # transform signal
+    if transform == "log10":
+        max_ints = float(np.log10(1000. + 1.))
+        def untransform_fn(x): return 10**x - 1.
+    elif transform == "log10over3":
+        max_ints = float(np.log10(1000. + 1.) / 3.)
+        def untransform_fn(x): return 10**(3 * x) - 1.
+    elif transform == "loge":
+        max_ints = float(np.log(1000. + 1.))
+        def untransform_fn(x): return torch.exp(x) - 1.
+    elif transform == "sqrt":
+        max_ints = float(np.sqrt(1000.))
+        def untransform_fn(x): return x**2
+    elif transform == "linear":
+        raise NotImplementedError
+    elif transform == "none":
+        max_ints = 1000.
+        def untransform_fn(x): return x
+    else:
+        raise ValueError("invalid transform")
+        
+    spec = spec / (torch.max(spec, dim=-1, keepdim=True)[0] + EPS) * max_ints
+    spec = untransform_fn(spec)
+    spec = torch.clamp(spec, min=0.)
+    assert not torch.isnan(spec).any()
+    return spec
+
+def process_spec(spec, transform, normalization, eps=EPS):
+    """スペクトルにトランスフォームと正規化を適用"""
+    # スペクトルを1000までスケーリング
+    spec = spec / (torch.max(spec, dim=-1, keepdim=True)[0] + eps) * 1000.
+    
+    # 信号変換
+    if transform == "log10":
+        spec = torch.log10(spec + 1)
+    elif transform == "log10over3":
+        spec = torch.log10(spec + 1) / 3
+    elif transform == "loge":
+        spec = torch.log(spec + 1)
+    elif transform == "sqrt":
+        spec = torch.sqrt(spec)
+    elif transform == "none":
+        pass
+    else:
+        raise ValueError("invalid transform")
+    
+    # 正規化
+    if normalization == "l1":
+        spec = F.normalize(spec, p=1, dim=-1, eps=eps)
+    elif normalization == "l2":
+        spec = F.normalize(spec, p=2, dim=-1, eps=eps)
+    elif normalization == "none":
+        pass
+    else:
+        raise ValueError("invalid normalization")
+    
+    assert not torch.isnan(spec).any()
+    return spec
+
+def mask_prediction_by_mass(raw_prediction, prec_mass_idx, prec_mass_offset, mask_value=0.):
+    """前駆体質量によるマスキング"""
+    max_idx = raw_prediction.shape[1]
+    assert torch.all(prec_mass_idx < max_idx)
+    idx = torch.arange(max_idx, device=prec_mass_idx.device)
+    mask = (
+        idx.unsqueeze(0) <= (
+            prec_mass_idx.unsqueeze(1) +
+            prec_mass_offset)).float()
+    return mask * raw_prediction + (1. - mask) * mask_value
+
+def reverse_prediction(raw_prediction, prec_mass_idx, prec_mass_offset):
+    """予測を反転する（双方向予測用）"""
+    batch_size = raw_prediction.shape[0]
+    max_idx = raw_prediction.shape[1]
+    assert torch.all(prec_mass_idx < max_idx)
+    rev_prediction = torch.flip(raw_prediction, dims=(1,))
+    offset_idx = torch.minimum(
+        max_idx * torch.ones_like(prec_mass_idx),
+        prec_mass_idx + prec_mass_offset + 1)
+    shifts = - (max_idx - offset_idx)
+    gather_idx = torch.arange(
+        max_idx,
+        device=raw_prediction.device).unsqueeze(0).expand(
+        batch_size,
+        max_idx)
+    gather_idx = (gather_idx - shifts.unsqueeze(1)) % max_idx
+    offset_rev_prediction = torch.gather(rev_prediction, 1, gather_idx)
+    return offset_rev_prediction
+
+###############################
+# 分子グラフ処理関連の関数
+###############################
+
+def safe_index(l, e):
+    """リスト内の要素のインデックスを安全に取得（存在しない場合は最後のインデックスを返す）"""
+    try:
+        return l.index(e)
+    except:
+        return len(l) - 1
+
+def smiles2graph(mol):
+    """SMILES文字列またはRDKit分子をグラフに変換"""
+    # 分子がSMILES文字列の場合はRDKit分子に変換
+    if isinstance(mol, str):
+        mol = Chem.MolFromSmiles(mol)
+    
+    # 原子情報
+    num_atoms = mol.GetNumAtoms()
+    x = []
+    
+    for atom in mol.GetAtoms():
+        atom_symbol = atom.GetSymbol()
+        atom_feature_idx = ATOM_FEATURES.get(atom_symbol, ATOM_FEATURES['OTHER'])
+        
+        # 基本的な原子タイプの特徴
+        atom_feature = [0] * len(ATOM_FEATURES)
+        atom_feature[atom_feature_idx] = 1
+        
+        # 追加特徴
+        try:
+            degree = atom.GetDegree() / 8.0
+            formal_charge = atom.GetFormalCharge() / 8.0
+            radical_electrons = atom.GetNumRadicalElectrons() / 4.0
+            is_aromatic = atom.GetIsAromatic() * 1.0
+            atom_mass = atom.GetMass() / 200.0
+            is_in_ring = atom.IsInRing() * 1.0
+            hybridization = int(atom.GetHybridization()) / 8.0
+            explicit_valence = atom.GetExplicitValence() / 8.0
+            implicit_valence = atom.GetImplicitValence() / 8.0
+            num_h = atom.GetTotalNumHs() / 8.0
+        except:
+            degree = formal_charge = radical_electrons = is_aromatic = atom_mass = is_in_ring = 0.0
+            hybridization = explicit_valence = implicit_valence = num_h = 0.0
+        
+        # 追加特徴をリストに追加
+        additional_features = [
+            degree, formal_charge, radical_electrons, is_aromatic, atom_mass,
+            is_in_ring, hybridization, explicit_valence, implicit_valence, num_h
+        ]
+        
+        # すべての特徴を結合
+        atom_feature.extend(additional_features)
+        x.append(atom_feature)
+    
+    # 結合情報
+    edge_indices = []
+    edge_attrs = []
+    for bond in mol.GetBonds():
+        i = bond.GetBeginAtomIdx()
+        j = bond.GetEndAtomIdx()
+        
+        # 結合タイプ
+        bond_type = BOND_FEATURES.get(bond.GetBondType(), BOND_FEATURES[Chem.rdchem.BondType.SINGLE])
+        
+        # 双方向のエッジを追加
+        edge_indices.append([i, j])
+        edge_indices.append([j, i])
+        
+        # 結合特徴
+        bond_feature = [0] * len(BOND_FEATURES)
+        bond_feature[bond_type] = 1
+        
+        # 安全な追加特徴の取得
+        try:
+            is_in_ring = bond.IsInRing() * 1.0
+            is_conjugated = bond.GetIsConjugated() * 1.0
+            is_aromatic = bond.GetIsAromatic() * 1.0
+            stereo = int(bond.GetStereo()) / 8.0
+        except:
+            is_in_ring = is_conjugated = is_aromatic = stereo = 0.0
+        
+        # 追加結合特徴
+        additional_bond_features = [is_in_ring, is_conjugated, is_aromatic, stereo]
+        
+        bond_feature.extend(additional_bond_features)
+        edge_attrs.append(bond_feature)
+        edge_attrs.append(bond_feature)  # 双方向なので同じ属性
+    
+    # エッジが存在するか確認
+    if not edge_indices:
+        # 単一原子分子の場合や結合情報が取得できない場合、セルフループを追加
+        for i in range(num_atoms):
+            edge_indices.append([i, i])
+            
+            bond_feature = [0] * len(BOND_FEATURES)
+            bond_feature[BOND_FEATURES[Chem.rdchem.BondType.SINGLE]] = 1
+            
+            # ダミーの追加特徴量
+            additional_bond_features = [0.0, 0.0, 0.0, 0.0]
+            bond_feature.extend(additional_bond_features)
+            edge_attrs.append(bond_feature)
+    
+    # NumPy配列に変換
+    x = np.array(x, dtype=np.int64)
+    edge_index = np.array(edge_indices, dtype=np.int64).T
+    edge_attr = np.array(edge_attrs, dtype=np.int64)
+    
+    # 結果の辞書を返す
+    graph = dict()
+    graph['edge_index'] = edge_index
+    graph['edge_feat'] = edge_attr
+    graph['node_feat'] = x
+    graph['num_nodes'] = len(x)
+    
+    return graph
+
+def graph2data(graph):
+    """グラフ辞書をPyTorch Geometricのデータオブジェクトに変換"""
+    data = Data()
+    assert len(graph['edge_feat']) == graph['edge_index'].shape[1]
+    assert len(graph['node_feat']) == graph['num_nodes']
+    data.__num_nodes__ = int(graph['num_nodes'])
+    data.edge_index = torch.from_numpy(graph['edge_index']).to(torch.int64)
+    data.edge_attr = torch.from_numpy(graph['edge_feat']).to(torch.int64)
+    data.x = torch.from_numpy(graph['node_feat']).to(torch.int64)
+    data.global_attr = torch.zeros(16)  # グローバル属性のダミー値
+    return data
+
+###############################
+# 損失関数と類似度計算
+###############################
+
+def kl(p, q): 
+    return torch.sum(p * (torch.log(p + EPS) - torch.log(q + EPS)), dim=1)
+
+def mse(x, y): 
+    return 0.5 * torch.mean((x - y)**2, dim=1)
+
+def compute_weights(x, mz_bin_res):
+    """m/z位置に基づく重み付け計算"""
+    mass_pow = 0.5
+    weights = (
+        mz_bin_res *
+        torch.arange(
+            1,
+            x.shape[1] + 1,
+            device=x.device,
+            dtype=torch.float32))**mass_pow
+    weights = (weights / torch.sum(weights)).unsqueeze(0)
+    return weights
+
+def get_loss_func(loss_type, mz_bin_res, agg=None):
+    """損失関数を取得"""
+    # 損失関数を設定
+    if loss_type == "mse":
+        loss_func = mse
+    elif loss_type == "wmse":
+        def w_mse(pred, targ):
+            weights = compute_weights(pred, mz_bin_res)
+            return torch.sum(weights * (pred - targ)**2, dim=1)
+        loss_func = w_mse
+    elif loss_type == "js":
+        def js(pred, targ):
+            pred = F.normalize(pred, dim=1, p=1)
+            targ = F.normalize(targ, dim=1, p=1)
+            z = 0.5 * (pred + targ)
+            return torch.sqrt(F.relu(0.5 * kl(pred, z) + 0.5 * kl(targ, z)))
+        loss_func = js
+    elif loss_type == "forw_kl":
+        # p=targ, q=pred
+        def forw_kl(pred, targ):
+            pred = F.normalize(pred, dim=1, p=1)
+            targ = F.normalize(targ, dim=1, p=1)
+            return kl(targ, pred)
+        loss_func = forw_kl
+    elif loss_type == "rev_kl":
+        # p=pred, q=targ
+        def rev_kl(pred, targ):
+            pred = F.normalize(pred, dim=1, p=1)
+            targ = F.normalize(targ, dim=1, p=1)
+            return kl(pred, targ)
+        loss_func = rev_kl
+    elif loss_type == "cos":
+        def cos(pred, targ):
+            pred = F.normalize(pred, dim=1, p=2).unsqueeze(1)
+            targ = F.normalize(targ, dim=1, p=2).unsqueeze(2)
+            return 1. - torch.matmul(pred, targ).squeeze(-1).squeeze(-1)
+        loss_func = cos
+    elif loss_type == "wcos":
+        def w_cos(pred, targ):
+            weights = compute_weights(pred, mz_bin_res)
+            w_pred = F.normalize(weights * pred, dim=1, p=2).unsqueeze(1)
+            w_targ = F.normalize(weights * targ, dim=1, p=2).unsqueeze(2)
+            return 1. - torch.matmul(w_pred, w_targ).squeeze(-1).squeeze(-1)
+        loss_func = w_cos
+    else:
+        raise NotImplementedError(f"Unknown loss type: {loss_type}")
+    
+    # 集約関数を適用
+    if agg is not None:
+        if agg == "mean":
+            def loss_func_agg(p, t): return torch.mean(loss_func(p, t), dim=0)
+        elif agg == "sum":
+            def loss_func_agg(p, t): return torch.sum(loss_func(p, t), dim=0)
+    else:
+        loss_func_agg = loss_func
+    
+    return loss_func_agg
+
+def get_sim_func(sim_type, mz_bin_res):
+    """類似度関数を取得"""
+    if sim_type == "cos":
+        def cos(pred, targ):
+            n_pred = F.normalize(pred, p=2, dim=1).unsqueeze(1)
+            n_targ = F.normalize(targ, p=2, dim=1).unsqueeze(2)
+            return torch.bmm(n_pred, n_targ).squeeze(-1).squeeze(-1)
+        sim_func = cos
+    elif sim_type == "wcos":
+        def w_cos(pred, targ):
+            weights = compute_weights(pred, mz_bin_res)
+            n_pred = F.normalize(weights * pred, p=2, dim=1).unsqueeze(1)
+            n_targ = F.normalize(weights * targ, p=2, dim=1).unsqueeze(2)
+            return torch.bmm(n_pred, n_targ).squeeze(-1).squeeze(-1)
+        sim_func = w_cos
+    elif sim_type == "js":
+        ln2 = math.log(2)
+        def js(pred, targ):
+            pred = F.normalize(pred, dim=1, p=1)
+            targ = F.normalize(targ, dim=1, p=1)
+            z = 0.5 * (pred + targ)
+            return ln2 - (0.5 * kl(pred, z) + 0.5 * kl(targ, z))
+        sim_func = js
+    else:
+        raise ValueError(f"Unknown similarity type: {sim_type}")
+    
+    return sim_func
+
+###############################
+# データセット定義
+###############################
+
+class MoleculeGraphDataset(Dataset):
+    def __init__(self, mol_ids, mol_files_path, msp_data, transform="log10over3", 
+                normalization="l1", mz_max=MAX_MZ, mz_bin_res=1.0, augment=False):
+        self.mol_ids = mol_ids
+        self.mol_files_path = mol_files_path
+        self.msp_data = msp_data
+        self.augment = augment
+        self.transform = transform
+        self.normalization = normalization
+        self.mz_max = mz_max
+        self.mz_bin_res = mz_bin_res
+        self.ints_thresh = 0.0
+        
+        # 有効な分子IDを抽出
+        self.valid_mol_ids = []
+        self._preprocess_mol_ids()
+        
+    def _preprocess_mol_ids(self):
+        """有効な分子IDのみを抽出"""
+        valid_ids = []
+        
+        for mol_id in tqdm(self.mol_ids, desc="Validating molecules"):
+            mol_file = os.path.join(self.mol_files_path, f"ID{mol_id}.MOL")
+            try:
+                # 分子ファイルが読み込めるか確認
+                mol = Chem.MolFromMolFile(mol_file, sanitize=False)
+                if mol is None:
+                    continue
+                
+                # 分子の基本的なサニタイズを試みる
+                try:
+                    # プロパティキャッシュを更新
+                    for atom in mol.GetAtoms():
+                        atom.UpdatePropertyCache(strict=False)
+                    
+                    # 部分的なサニタイズ
+                    Chem.SanitizeMol(mol, 
+                                   sanitizeOps=Chem.SanitizeFlags.SANITIZE_FINDRADICALS|
+                                              Chem.SanitizeFlags.SANITIZE_KEKULIZE|
+                                              Chem.SanitizeFlags.SANITIZE_SETAROMATICITY|
+                                              Chem.SanitizeFlags.SANITIZE_SETCONJUGATION|
+                                              Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION|
+                                              Chem.SanitizeFlags.SANITIZE_SYMMRINGS,
+                                   catchErrors=True)
+                except Exception as e:
+                    logger.warning(f"Skipping molecule ID{mol_id} due to sanitization error: {str(e)}")
+                    continue
+                
+                # グラフに変換できるか確認
+                try:
+                    graph_data = self._mol_to_graph(mol)
+                    valid_ids.append(mol_id)
+                except Exception as e:
+                    logger.warning(f"Skipping molecule ID{mol_id} due to graph conversion error: {str(e)}")
+                    continue
+                    
+            except Exception as e:
+                logger.warning(f"Skipping molecule ID{mol_id} due to error: {str(e)}")
+                continue
+                
+        self.valid_mol_ids = valid_ids
+        logger.info(f"Found {len(valid_ids)} valid molecules out of {len(self.mol_ids)}")
+        
+    def __len__(self):
+        return len(self.valid_mol_ids)
+    
+    def __getitem__(self, idx):
+        mol_id = self.valid_mol_ids[idx]
+        mol_file = os.path.join(self.mol_files_path, f"ID{mol_id}.MOL")
+        
+        # MOLファイルからグラフ表現を生成
+        graph_data = self._mol_to_graph(Chem.MolFromMolFile(mol_file, sanitize=False))
+        
+        # MSPデータからマススペクトルを取得
+        mass_spectrum = self.msp_data.get(mol_id, np.zeros(MAX_MZ))
+        
+        # スペクトルの前処理
+        mass_spectrum = self._preprocess_spectrum(mass_spectrum)
+        
+        # 前駆体m/zの計算（m/z最大値としてシンプルに実装）
+        peaks = np.nonzero(mass_spectrum)[0]
+        if len(peaks) > 0:
+            prec_mz = np.max(peaks)
+        else:
+            prec_mz = 0
+            
+        prec_mz_bin = int(prec_mz / self.mz_bin_res)
+        
+        return {
+            'graph_data': graph_data, 
+            'mass_spectrum': torch.FloatTensor(mass_spectrum),
+            'mol_id': mol_id,
+            'spec_id': mol_id,  # 簡略化のためにmol_idと同じにする
+            'group_id': mol_id,  # 簡略化のためにmol_idと同じにする
+            'prec_mz': prec_mz,
+            'prec_mz_bin': prec_mz_bin
+        }
+    
+    def _preprocess_spectrum(self, spectrum):
+        """スペクトルの前処理"""
+        # スペクトルをPyTorchテンソルに変換
+        spec_tensor = torch.FloatTensor(spectrum)
+        
+        # MassFormerスタイルの処理
+        processed_spec = process_spec(spec_tensor.unsqueeze(0), self.transform, self.normalization)
+        
+        return processed_spec.squeeze(0).numpy()
+        
+    def _mol_to_graph(self, mol):
+        """分子をグラフデータに変換"""
+        # サニタイズを適用
+        try:
+            # プロパティキャッシュを更新
+            for atom in mol.GetAtoms():
+                atom.UpdatePropertyCache(strict=False)
+            
+            # 部分的なサニタイズ
+            Chem.SanitizeMol(mol, 
+                           sanitizeOps=Chem.SanitizeFlags.SANITIZE_FINDRADICALS|
+                                      Chem.SanitizeFlags.SANITIZE_KEKULIZE|
+                                      Chem.SanitizeFlags.SANITIZE_SETAROMATICITY|
+                                      Chem.SanitizeFlags.SANITIZE_SETCONJUGATION|
+                                      Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION|
+                                      Chem.SanitizeFlags.SANITIZE_SYMMRINGS,
+                           catchErrors=True)
+        except Exception as e:
+            logger.warning(f"Warning during molecule sanitization: {str(e)}")
+            # それでも処理を続行
+        
+        # グラフに変換
+        graph = smiles2graph(mol)
+        data = graph2data(graph)
+        
+        # データ拡張（トレーニング時のみ）
+        if self.augment and random.random() < 0.3:
+            # ノイズ追加（MassFormerと同様）
+            data.x = data.x + torch.randn_like(data.x) * 0.01
+            data.edge_attr = data.edge_attr + torch.randn_like(data.edge_attr) * 0.01
+        
+        return data
+
+def collate_fn(batch):
+    """バッチ内のデータを結合"""
+    graph_data = [item['graph_data'] for item in batch]
+    mass_spectrum = torch.stack([item['mass_spectrum'] for item in batch])
+    mol_id = torch.tensor([item['mol_id'] for item in batch])
+    spec_id = torch.tensor([item['spec_id'] for item in batch])
+    group_id = torch.tensor([item['group_id'] for item in batch])
+    prec_mz = torch.tensor([item['prec_mz'] for item in batch])
+    prec_mz_bin = torch.tensor([item['prec_mz_bin'] for item in batch])
+    
+    batched_graphs = Batch.from_data_list(graph_data)
+    
+    return {
+        'graph': batched_graphs,
+        'spec': mass_spectrum,
+        'mol_id': mol_id,
+        'spec_id': spec_id,
+        'group_id': group_id,
+        'prec_mz': prec_mz,
+        'prec_mz_bin': prec_mz_bin
+    }
+
+###############################
+# モデル定義
+###############################
+
+class ResidualBlock(nn.Module):
+    """残差ブロック"""
+    def __init__(self, in_channels, out_channels, dropout=0.1):
+        super(ResidualBlock, self).__init__()
+        self.linear1 = nn.Linear(in_channels, out_channels)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.linear2 = nn.Linear(out_channels, out_channels)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        
+        # 入力と出力のチャネル数が異なる場合の調整用レイヤー
+        self.shortcut = nn.Sequential()
+        if in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Linear(in_channels, out_channels),
+                nn.BatchNorm1d(out_channels)
+            )
+            
+        # ドロップアウト
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x):
+        residual = self.shortcut(x)
+        
+        out = F.leaky_relu(self.bn1(self.linear1(x)))
+        out = self.dropout(out)
+        out = self.bn2(self.linear2(out))
+        
+        out += residual  # 残差接続
+        out = F.leaky_relu(out)
+        
+        return out
+
+class MassFormerModel(nn.Module):
+    """MassFormerモデル - GATとTransformer機構を使用"""
+    def __init__(self, node_features, edge_features, hidden_channels, out_channels, 
+                 prec_mass_offset=10, bidirectional=True, gate_prediction=True):
+        super(MassFormerModel, self).__init__()
+        
+        self.prec_mass_offset = prec_mass_offset
+        self.bidirectional = bidirectional
+        self.gate_prediction = gate_prediction
+        
+        # GATレイヤー
+        self.gat1 = GATv2Conv(node_features, hidden_channels, edge_dim=edge_features, heads=4)
+        self.gat2 = GATv2Conv(hidden_channels*4, hidden_channels, edge_dim=edge_features, heads=4)
+        self.gat3 = GATv2Conv(hidden_channels*4, hidden_channels, edge_dim=edge_features, heads=2)
+        
+        # グローバルアテンション（MassFormerスタイル）
+        self.global_gate_nn = nn.Sequential(
+            nn.Linear(hidden_channels*2, 1),
+            nn.Sigmoid()
+        )
+        
+        self.global_nn = nn.Sequential(
+            nn.Linear(hidden_channels*2, hidden_channels*2),
+            nn.LeakyReLU()
+        )
+        
+        # バッチ正規化
+        self.bn1 = nn.BatchNorm1d(hidden_channels*4)
+        self.bn2 = nn.BatchNorm1d(hidden_channels*4)
+        self.bn3 = nn.BatchNorm1d(hidden_channels*2)
+        
+        # スペクトル予測ネットワーク
+        self.fc_layers = nn.ModuleList([
+            ResidualBlock(hidden_channels*2, hidden_channels*4),
+            ResidualBlock(hidden_channels*4, hidden_channels*4),
+            ResidualBlock(hidden_channels*4, hidden_channels*2)
+        ])
+        
+        # 双方向予測用レイヤー（MassFormerスタイル）
+        if bidirectional:
+            self.forw_out_layer = nn.Linear(hidden_channels*2, out_channels)
+            self.rev_out_layer = nn.Linear(hidden_channels*2, out_channels)
+            self.out_gate = nn.Sequential(
+                nn.Linear(hidden_channels*2, out_channels),
+                nn.Sigmoid()
+            )
+        else:
+            # 通常の出力レイヤー
+            self.out_layer = nn.Linear(hidden_channels*2, out_channels)
+            if gate_prediction:
+                self.out_gate = nn.Sequential(
+                    nn.Linear(hidden_channels*2, out_channels),
+                    nn.Sigmoid()
+                )
+        
+        # ドロップアウト
+        self.dropout = nn.Dropout(0.2)
+        
+        # 重み初期化
+        self._init_weights()
+    
+    def _init_weights(self):
+        """モデルの重みを初期化"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, data):
+        x, edge_index, edge_attr, batch = data['graph'].x, data['graph'].edge_index, data['graph'].edge_attr, data['graph'].batch
+        prec_mz_bin = data['prec_mz_bin']
+        
+        # 特徴量の型変換
+        x = x.float()
+        edge_attr = edge_attr.float()
+        
+        # GATレイヤーを通す
+        x1 = F.leaky_relu(self.gat1(x, edge_index, edge_attr))
+        x1 = self.dropout(x1)
+        
+        x2 = F.leaky_relu(self.gat2(x1, edge_index, edge_attr))
+        x2 = self.bn1(x2)
+        x2 = self.dropout(x2)
+        
+        x3 = F.leaky_relu(self.gat3(x2, edge_index, edge_attr))
+        x3 = self.bn2(x3)
+        
+        # グローバルアテンションを使用して分子表現を取得
+        gate_score = self.global_gate_nn(x3)
+        node_feat_transformed = self.global_nn(x3)
+        
+        # ノード特徴量を重み付け合計
+        graph_feat = torch.zeros(batch.max().item() + 1, node_feat_transformed.size(-1), 
+                             device=node_feat_transformed.device)
+        
+        for i in range(x3.size(0)):
+            b = batch[i].item()
+            graph_feat[b] += gate_score[i] * node_feat_transformed[i]
+        
+        # バッチ正規化
+        graph_feat = self.bn3(graph_feat)
+        
+        # 残差ブロックを通す
+        for fc_layer in self.fc_layers:
+            graph_feat = fc_layer(graph_feat)
+        
+        # 双方向予測を使用する場合
+        if self.bidirectional:
+            # 順方向と逆方向の予測
+            ff = self.forw_out_layer(graph_feat)
+            fr = reverse_prediction(
+                self.rev_out_layer(graph_feat),
+                prec_mz_bin,
+                self.prec_mass_offset)
+            
+            # ゲート機構で重み付け
+            fg = self.out_gate(graph_feat)
+            fo = ff * fg + fr * (1. - fg)
+            
+            # 前駆体質量でマスク
+            fo = mask_prediction_by_mass(fo, prec_mz_bin, self.prec_mass_offset)
+        else:
+            # 通常の予測
+            fo = self.out_layer(graph_feat)
+            
+            # ゲート予測を使用する場合
+            if self.gate_prediction:
+                fg = self.out_gate(graph_feat)
+                fo = fg * fo
+        
+        # 出力をReLUで活性化
+        fo = F.relu(fo)
+        
+        return fo
+
+###############################
+# 訓練ロジック
+###############################
+
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, 
+               device, num_epochs, mz_bin_res, early_stopping_patience=10):
+    """モデルの訓練を行う"""
+    train_losses = []
+    val_losses = []
+    val_cosine_similarities = []
+    best_cosine = 0.0
+    early_stopping_counter = 0
+    
+    # 類似度計算関数
+    sim_func = get_sim_func("cos", mz_bin_res)
+    
+    for epoch in range(num_epochs):
+        # 訓練モード
+        model.train()
+        epoch_loss = 0
+        batch_count = 0
+        
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Training)"):
+            try:
+                # データをGPUに転送
+                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                
+                # 勾配をゼロに初期化
+                optimizer.zero_grad()
+                
+                # 順伝播
+                output = model(batch)
+                
+                # 損失計算
+                loss = criterion(output, batch['spec'])
+                
+                # 逆伝播
+                loss.backward()
+                
+                # 勾配クリッピング
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+                batch_count += 1
+                
+            except RuntimeError as e:
+                print(f"エラーが発生しました: {str(e)}")
+                continue
+        
+        if batch_count > 0:
+            avg_epoch_loss = epoch_loss / batch_count
+            train_losses.append(avg_epoch_loss)
+        else:
+            print("警告：このエポックで成功したバッチ処理がありません。")
+            train_losses.append(float('inf'))
+        
+        # 評価モード
+        model.eval()
+        val_loss = 0
+        val_batch_count = 0
+        y_true = []
+        y_pred = []
+        
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Validation)"):
+                try:
+                    # データをGPUに転送
+                    batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                    
+                    # 予測
+                    output = model(batch)
+                    
+                    # 損失計算
+                    loss = criterion(output, batch['spec'])
+                    val_loss += loss.item()
+                    val_batch_count += 1
+                    
+                    # 類似度計算用に結果を保存
+                    y_true.append(batch['spec'].cpu())
+                    y_pred.append(output.cpu())
+                    
+                except RuntimeError as e:
+                    print(f"評価中にエラーが発生しました: {str(e)}")
+                    continue
+        
+        if val_batch_count > 0:
+            avg_val_loss = val_loss / val_batch_count
+            val_losses.append(avg_val_loss)
+            
+            # コサイン類似度を計算
+            all_true = torch.cat(y_true, dim=0)
+            all_pred = torch.cat(y_pred, dim=0)
+            cosine_sim = sim_func(all_pred, all_true).mean().item()
+            val_cosine_similarities.append(cosine_sim)
+            
+            print(f"Epoch {epoch+1}/{num_epochs}, "
+                  f"Train Loss: {train_losses[-1]:.4f}, "
+                  f"Val Loss: {val_losses[-1]:.4f}, "
+                  f"Val Cosine Similarity: {cosine_sim:.4f}")
+            
+            # 最良モデルの保存
+            if cosine_sim > best_cosine:
+                best_cosine = cosine_sim
+                early_stopping_counter = 0
+                torch.save(model.state_dict(), 'best_massformer_model.pth')
+                print(f"新しい最良モデル保存: {cosine_sim:.4f}")
+            else:
+                early_stopping_counter += 1
+                
+            # 早期停止
+            if early_stopping_counter >= early_stopping_patience:
+                print(f"Early stopping triggered after {epoch+1} epochs")
+                break
+            
+        else:
+            print("警告：評価中に成功したバッチ処理がありません。")
+            val_losses.append(float('inf'))
+            val_cosine_similarities.append(0.0)
+        
+        # 学習率スケジューラーの更新
+        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(val_losses[-1])
+        else:
+            scheduler.step()
+    
+    return train_losses, val_losses, val_cosine_similarities, best_cosine
+
+def eval_model(model, test_loader, device, mz_bin_res):
+    """モデルの評価"""
+    model.eval()
+    y_true = []
+    y_pred = []
+    mol_ids = []
+    
+    # 類似度計算関数
+    sim_func = get_sim_func("cos", mz_bin_res)
+    
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="Testing"):
+            try:
+                # データをGPUに転送
+                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                
+                # 予測
+                output = model(batch)
+                
+                # 結果を保存
+                y_true.append(batch['spec'].cpu())
+                y_pred.append(output.cpu())
+                mol_ids.extend(batch['mol_id'].cpu().numpy())
+                
+            except RuntimeError as e:
+                print(f"テスト中にエラーが発生しました: {str(e)}")
+                continue
+    
+    # 結果を連結
+    all_true = torch.cat(y_true, dim=0)
+    all_pred = torch.cat(y_pred, dim=0)
+    
+    # コサイン類似度を計算
+    similarities = sim_func(all_pred, all_true)
+    avg_cosine_sim = similarities.mean().item()
+    
+    # 分子ごとのパフォーマンス
+    mol_id_array = np.array(mol_ids)
+    unique_mol_ids = np.unique(mol_id_array)
+    mol_performance = {}
+    
+    for mol_id in unique_mol_ids:
+        indices = mol_id_array == mol_id
+        if sum(indices) > 0:
+            mol_similarities = similarities[indices].cpu().numpy()
+            mol_performance[mol_id] = {
+                'mean': np.mean(mol_similarities),
+                'min': np.min(mol_similarities),
+                'max': np.max(mol_similarities)
+            }
+    
+    return avg_cosine_sim, similarities.cpu().numpy(), mol_performance
+
+def visualize_results(model, test_loader, device, num_samples=5):
+    """予測結果の可視化"""
+    model.eval()
+    
+    # ランダムにバッチを選択
+    all_batches = list(test_loader)
+    if not all_batches:
+        print("テストデータがありません")
+        return
+        
+    selected_batch = random.choice(all_batches)
+    
+    # データをGPUに転送
+    selected_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in selected_batch.items()}
+    
+    # 予測
+    with torch.no_grad():
+        pred_spectra = model(selected_batch)
+    
+    # 表示するサンプル数を制限
+    num_samples = min(num_samples, len(selected_batch['spec']))
+    
+    # 結果を可視化
+    plt.figure(figsize=(15, num_samples*5))
+    
+    for i in range(num_samples):
+        # 真のスペクトル
+        plt.subplot(num_samples, 2, 2*i + 1)
+        true_spec = selected_batch['spec'][i].cpu().numpy()
+        plt.stem(range(len(true_spec)), true_spec, markerfmt=" ", basefmt="b-")
+        plt.title(f"True Spectrum - Molecule {selected_batch['mol_id'][i].item()}")
+        plt.xlabel("m/z")
+        plt.ylabel("Intensity")
+        
+        # 予測スペクトル
+        plt.subplot(num_samples, 2, 2*i + 2)
+        pred_spec = pred_spectra[i].cpu().numpy()
+        plt.stem(range(len(pred_spec)), pred_spec, markerfmt=" ", basefmt="r-")
+        plt.title(f"Predicted Spectrum - Molecule {selected_batch['mol_id'][i].item()}")
+        plt.xlabel("m/z")
+        plt.ylabel("Intensity")
+    
+    plt.tight_layout()
+    plt.savefig('prediction_visualization.png')
+    plt.show()
+
+###############################
+# メイン関数
+###############################
+
+def main():
+    # MSPファイルを解析
+    print("MSPファイルを解析中...")
+    msp_data = parse_msp_file(MSP_FILE_PATH)
+    print(f"MSPファイルから{len(msp_data)}個の化合物データを読み込みました")
+    
+    # 利用可能なMOLファイルを確認
+    mol_ids = []
+    for filename in os.listdir(MOL_FILES_PATH):
+        if filename.startswith("ID") and filename.endswith(".MOL"):
+            mol_id = int(filename[2:-4])  # "ID300001.MOL" → 300001
+            if mol_id in msp_data:
+                mol_ids.append(mol_id)
+    
+    print(f"MOLファイルとMSPデータが揃っている化合物: {len(mol_ids)}個")
+    
+    # データ分割 (訓練:検証:テスト = 85:5:10)
+    train_ids, test_ids = train_test_split(mol_ids, test_size=0.15, random_state=42)
+    val_ids, test_ids = train_test_split(test_ids, test_size=0.67, random_state=42)
+    
+    print(f"訓練データ: {len(train_ids)}個")
+    print(f"検証データ: {len(val_ids)}個")
+    print(f"テストデータ: {len(test_ids)}個")
+    
+    # ハイパーパラメータ
+    mz_max = MAX_MZ  # 最大m/z値
+    mz_bin_res = 1.0  # ビンの解像度
+    transform = "log10over3"  # スペクトル変換タイプ
+    normalization = "l1"  # 正規化タイプ
+    loss_type = "cos"  # 損失関数タイプ
+    
+    # データセット作成
+    train_dataset = MoleculeGraphDataset(train_ids, MOL_FILES_PATH, msp_data, 
+                                        transform=transform, normalization=normalization, 
+                                        mz_max=mz_max, mz_bin_res=mz_bin_res, augment=True)
+    val_dataset = MoleculeGraphDataset(val_ids, MOL_FILES_PATH, msp_data,
+                                      transform=transform, normalization=normalization,
+                                      mz_max=mz_max, mz_bin_res=mz_bin_res, augment=False)
+    test_dataset = MoleculeGraphDataset(test_ids, MOL_FILES_PATH, msp_data,
+                                       transform=transform, normalization=normalization,
+                                       mz_max=mz_max, mz_bin_res=mz_bin_res, augment=False)
+    
+    print(f"有効な訓練データ: {len(train_dataset)}個")
+    print(f"有効な検証データ: {len(val_dataset)}個")
+    print(f"有効なテストデータ: {len(test_dataset)}個")
+    
+    # データローダー作成
+    batch_size = 32
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4)
+    
+    # モデルの次元を決定
+    sample = train_dataset[0]
+    node_features = sample['graph_data'].x.shape[1]
+    edge_features = sample['graph_data'].edge_attr.shape[1]
+    hidden_channels = 256
+    out_channels = MAX_MZ
+    
+    print(f"ノード特徴量次元: {node_features}")
+    print(f"エッジ特徴量次元: {edge_features}")
+    
+    # デバイスの設定
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # モデルの初期化
+    model = MassFormerModel(
+        node_features=node_features,
+        edge_features=edge_features,
+        hidden_channels=hidden_channels,
+        out_channels=out_channels,
+        prec_mass_offset=10,  # 前駆体質量オフセット
+        bidirectional=True,   # 双方向予測を使用
+        gate_prediction=True  # ゲート予測を使用
+    ).to(device)
+    
+    # 損失関数、オプティマイザー、スケジューラーの設定
+    criterion = get_loss_func(loss_type, mz_bin_res, agg="mean")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
+    
+    # 学習率スケジューラー（ポリノミアル減衰）
+    num_epochs = 100
+    steps_per_epoch = len(train_loader)
+    tot_updates = num_epochs * steps_per_epoch
+    warmup_updates = int(0.1 * tot_updates)  # 10%をウォームアップに
+    
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda step: min(
+            1.0,
+            float(step) / float(max(1, warmup_updates))
+        ) * max(
+            0.0,
+            float(tot_updates - step) / float(max(1, tot_updates - warmup_updates))
+        ) ** 1.0
+    )
+    
+    # モデルの訓練
+    train_losses, val_losses, val_cosine_similarities, best_cosine = train_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        num_epochs=num_epochs,
+        mz_bin_res=mz_bin_res,
+        early_stopping_patience=10
+    )
+    
+    # 学習曲線を可視化
+    plt.figure(figsize=(12, 5))
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Loss Curves')
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(val_cosine_similarities, label='Validation Cosine Similarity')
+    plt.axhline(y=best_cosine, color='r', linestyle='--', label=f'Best: {best_cosine:.4f}')
+    plt.xlabel('Epoch')
+    plt.ylabel('Cosine Similarity')
+    plt.legend()
+    plt.title('Cosine Similarity')
+    
+    plt.tight_layout()
+    plt.savefig('massformer_learning_curves.png')
+    
+    # 最良モデルを読み込む
+    model.load_state_dict(torch.load('best_massformer_model.pth'))
+    
+    # テストデータでの評価
+    test_cosine, test_similarities, mol_performance = eval_model(
+        model=model,
+        test_loader=test_loader,
+        device=device,
+        mz_bin_res=mz_bin_res
+    )
+    
+    print(f"テストデータでの平均コサイン類似度: {test_cosine:.4f}")
+    
+    # 予測結果の可視化
+    visualize_results(model, test_loader, device)
+    
+    # 分布の可視化
+    plt.figure(figsize=(10, 6))
+    plt.hist(test_similarities, bins=30, alpha=0.7)
+    plt.axvline(x=test_cosine, color='r', linestyle='--', label=f'Mean: {test_cosine:.4f}')
+    plt.xlabel('Cosine Similarity')
+    plt.ylabel('Count')
+    plt.title('Distribution of Cosine Similarities on Test Data')
+    plt.legend()
+    plt.savefig('massformer_similarity_distribution.png')
+    
+    print("学習完了！")
+
+if __name__ == "__main__":
+    main()
