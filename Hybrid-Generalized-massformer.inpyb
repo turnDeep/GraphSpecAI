@@ -240,7 +240,7 @@ def parse_msp_file(msp_file_path):
 ###############################
 
 class SqueezeExcitation(nn.Module):
-    """Squeeze-and-Excitation ブロック"""
+    """Squeeze-and-Excitation ブロック - バッチサイズに依存しない実装"""
     def __init__(self, channel, reduction=16):
         super(SqueezeExcitation, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool1d(1)
@@ -253,25 +253,32 @@ class SqueezeExcitation(nn.Module):
 
     def forward(self, x):
         b, c = x.size()
-        y = self.avg_pool(x.unsqueeze(-1)).view(b, c)
-        y = self.fc(y).view(b, c, 1)
-        return x * y.squeeze(-1)
+        # バッチサイズが1の場合でも動作するように修正
+        if b == 1:
+            # バッチサイズが1の場合、単純にグローバル平均を計算
+            y = torch.mean(x, dim=0, keepdim=True).expand(b, c)
+        else:
+            # 通常のケース
+            y = self.avg_pool(x.unsqueeze(-1)).view(b, c)
+            
+        y = self.fc(y).view(b, c)
+        return x * y
 
 class ResidualBlock(nn.Module):
-    """残差ブロック（バッチ正規化付き）"""
+    """残差ブロック（レイヤー正規化付き - バッチサイズに依存しない）"""
     def __init__(self, in_channels, out_channels, dropout=0.2):
         super(ResidualBlock, self).__init__()
         self.conv1 = nn.Linear(in_channels, out_channels)
-        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.ln1 = nn.LayerNorm(out_channels)  # BatchNormをLayerNormに変更
         self.conv2 = nn.Linear(out_channels, out_channels)
-        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.ln2 = nn.LayerNorm(out_channels)  # BatchNormをLayerNormに変更
         
         # 入力と出力のチャネル数が異なる場合の調整用レイヤー
         self.shortcut = nn.Sequential()
         if in_channels != out_channels:
             self.shortcut = nn.Sequential(
                 nn.Linear(in_channels, out_channels),
-                nn.BatchNorm1d(out_channels)
+                nn.LayerNorm(out_channels)  # BatchNormをLayerNormに変更
             )
             
         # Squeeze-and-Excitation
@@ -283,9 +290,9 @@ class ResidualBlock(nn.Module):
     def forward(self, x):
         residual = self.shortcut(x)
         
-        out = F.leaky_relu(self.bn1(self.conv1(x)))
+        out = F.leaky_relu(self.ln1(self.conv1(x)))
         out = self.dropout(out)
-        out = self.bn2(self.conv2(out))
+        out = self.ln2(self.conv2(out))
         
         # SE適用
         out = self.se(out)
@@ -473,7 +480,7 @@ class HybridMSModel(nn.Module):
         # Transformer出力をモデルの元の次元に戻す
         self.transformer_unprojection = nn.Linear(self.transformer_dim, hidden_channels*4)
         
-        # スペクトル予測のための全結合層
+        # スペクトル予測のための全結合層 - LayerNormを使用
         self.fc_layers = nn.ModuleList([
             ResidualBlock(hidden_channels*4, hidden_channels*4),
             ResidualBlock(hidden_channels*4, hidden_channels*4),
@@ -505,12 +512,12 @@ class HybridMSModel(nn.Module):
                     nn.Sigmoid()
                 )
         
-        # 正規化とドロップアウト
-        self.bn1 = nn.BatchNorm1d(hidden_channels*4)
-        self.bn2 = nn.BatchNorm1d(hidden_channels*4)
-        self.bn3 = nn.BatchNorm1d(hidden_channels*4)
-        self.bn4 = nn.BatchNorm1d(hidden_channels*2)
+        # レイヤー正規化（バッチサイズに依存しない）
         self.ln1 = nn.LayerNorm(hidden_channels*4)
+        self.ln2 = nn.LayerNorm(hidden_channels*4)
+        self.ln3 = nn.LayerNorm(hidden_channels*4)
+        self.ln4 = nn.LayerNorm(hidden_channels*2)
+        
         self.dropout = nn.Dropout(0.3)
         
         # 重み初期化
@@ -1859,20 +1866,25 @@ def main():
     # マルチプロセスのためのPyTorch設定
     torch.multiprocessing.set_sharing_strategy('file_system')
     
-    # データローダー作成 - num_workersを0に設定（デバイス間の問題を回避）
-    batch_size = 16  # バッチサイズを小さくして実験
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
-                             collate_fn=collate_fn, num_workers=0, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, 
-                           collate_fn=collate_fn, num_workers=0, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, 
-                            collate_fn=collate_fn, num_workers=0, pin_memory=True)
+    # データローダー作成 - バッチサイズを2以上に保証（BatchNormの問題を回避）
+    min_batch_size = 2  # バッチサイズ最小値を2に設定
+    train_loader = DataLoader(train_dataset, batch_size=min_batch_size, shuffle=True, 
+                             collate_fn=collate_fn, num_workers=0, pin_memory=True, 
+                             drop_last=True)  # 最後の中途半端なバッチを落とす
+    
+    val_loader = DataLoader(val_dataset, batch_size=min_batch_size, shuffle=False, 
+                           collate_fn=collate_fn, num_workers=0, pin_memory=True,
+                           drop_last=True)  # 最後の中途半端なバッチを落とす
+    
+    test_loader = DataLoader(test_dataset, batch_size=min_batch_size, shuffle=False, 
+                            collate_fn=collate_fn, num_workers=0, pin_memory=True,
+                            drop_last=True)  # 最後の中途半端なバッチを落とす
     
     # モデルの次元を決定
     sample = train_dataset[0]
     node_features = sample['graph_data'].x.shape[1]
     edge_features = sample['graph_data'].edge_attr.shape[1]
-    hidden_channels = 128  # メモリ消費を抑えるために次元を小さくする
+    hidden_channels = 64  # メモリ消費を抑えるためにさらに次元を小さくする
     out_channels = MAX_MZ
     
     print(f"ノード特徴量次元: {node_features}")
