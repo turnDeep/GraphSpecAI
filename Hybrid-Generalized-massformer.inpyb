@@ -1768,9 +1768,9 @@ def eval_model(model, test_loader, device):
         'mol_ids': mol_ids
     }
 
-def visualize_results(test_results, num_samples=5):
+def visualize_results(test_results, num_samples=10):
     """予測結果の可視化"""
-    plt.figure(figsize=(15, num_samples*5))
+    plt.figure(figsize=(15, num_samples*4))
     
     # サンプルのインデックスをランダムに選択
     if 'mol_ids' in test_results and len(test_results['mol_ids']) > 0:
@@ -1783,20 +1783,13 @@ def visualize_results(test_results, num_samples=5):
                                          min(num_samples, len(test_results['y_true'])), 
                                          replace=False)
     
-    # コサイン類似度をベースにサンプルをソート（オプション）
-    similarities = []
-    for i in range(len(test_results['y_true'])):
+    for i, idx in enumerate(sample_indices):
+        # 類似度を計算
         sim = cosine_similarity(
-            test_results['y_true'][i].reshape(1, -1),
-            test_results['y_pred'][i].reshape(1, -1)
+            test_results['y_true'][idx].reshape(1, -1),
+            test_results['y_pred'][idx].reshape(1, -1)
         )[0][0]
-        similarities.append((i, sim))
-    
-    # 類似度の高い順にソート
-    similarities.sort(key=lambda x: x[1], reverse=True)
-    top_samples = similarities[:num_samples]
-    
-    for i, (idx, sim) in enumerate(top_samples):
+        
         # 真のスペクトル
         plt.subplot(num_samples, 2, 2*i + 1)
         true_spec = test_results['y_true'][idx].numpy()
@@ -1808,9 +1801,11 @@ def visualize_results(test_results, num_samples=5):
         else:
             plt.plot(range(len(true_spec)), true_spec, 'b-')
             
-        plt.title(f"真のスペクトル - サンプル #{idx}")
+        # タイトルの設定 (英語)
+        mol_id_str = f" - Molecule {test_results['mol_ids'][idx]}" if 'mol_ids' in test_results else ""
+        plt.title(f"True Spectrum{mol_id_str}")
         plt.xlabel("m/z")
-        plt.ylabel("強度")
+        plt.ylabel("Intensity")
         
         # 予測スペクトル
         plt.subplot(num_samples, 2, 2*i + 2)
@@ -1823,9 +1818,9 @@ def visualize_results(test_results, num_samples=5):
         else:
             plt.plot(range(len(pred_spec)), pred_spec, 'r-')
             
-        plt.title(f"予測スペクトル - 類似度: {sim:.4f}")
+        plt.title(f"Predicted Spectrum - Cosine Sim: {sim:.4f}")
         plt.xlabel("m/z")
-        plt.ylabel("強度")
+        plt.ylabel("Intensity")
     
     plt.tight_layout()
     plt.savefig('hybrid_prediction_visualization.png')
@@ -1972,29 +1967,29 @@ def main():
         
         plt.tight_layout()
         plt.savefig('hybrid_learning_curves.png')
-        print("学習曲線を保存しました: hybrid_learning_curves.png")
+        print("Learning curves saved to: hybrid_learning_curves.png")
         plt.close()
     except Exception as e:
-        print(f"プロット生成中にエラーが発生しました: {e}")
+        print(f"Error during plotting: {e}")
     
     # 最良モデルを読み込む
     try:
         model.load_state_dict(torch.load('best_hybrid_ms_model.pth', weights_only=True))
     except Exception as e:
-        print(f"モデル読み込み中にエラーが発生: {e}")
+        print(f"Error loading model: {e}")
     
     # テストデータでの評価
     try:
         test_results = eval_model(model, test_loader, device)
-        print(f"テストデータでの平均コサイン類似度: {test_results['cosine_similarity']:.4f}")
+        print(f"Test data average cosine similarity: {test_results['cosine_similarity']:.4f}")
         
         # 予測結果の可視化
-        visualize_results(test_results, num_samples=5)
-        print("予測結果の可視化を保存しました: hybrid_prediction_visualization.png")
+        visualize_results(test_results, num_samples=10)
+        print("Prediction visualization saved to: hybrid_prediction_visualization.png")
     except Exception as e:
-        print(f"テスト評価中にエラーが発生: {e}")
+        print(f"Error during test evaluation: {e}")
     
-    print("学習完了！")
+    print("Training completed!")
     
     # 追加の結果分析
     try:
@@ -2010,17 +2005,17 @@ def main():
         plt.figure(figsize=(10, 6))
         plt.hist(similarities, bins=20, alpha=0.7)
         plt.axvline(x=test_results['cosine_similarity'], color='r', linestyle='--', 
-                    label=f'平均: {test_results["cosine_similarity"]:.4f}')
-        plt.xlabel('コサイン類似度')
-        plt.ylabel('サンプル数')
-        plt.title('テストデータにおけるコサイン類似度の分布')
+                    label=f'Mean: {test_results["cosine_similarity"]:.4f}')
+        plt.xlabel('Cosine Similarity')
+        plt.ylabel('Number of Samples')
+        plt.title('Distribution of Cosine Similarities on Test Data')
         plt.legend()
         plt.grid(alpha=0.3)
         plt.savefig('similarity_distribution.png')
-        print("類似度分布を保存しました: similarity_distribution.png")
+        print("Similarity distribution saved to: similarity_distribution.png")
         plt.close()
     except Exception as e:
-        print(f"追加分析中にエラーが発生: {e}")
+        print(f"Error during additional analysis: {e}")
     
     return model, train_losses, val_losses, val_cosine_similarities, test_results
     
