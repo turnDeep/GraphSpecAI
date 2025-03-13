@@ -1772,48 +1772,63 @@ def visualize_results(test_results, num_samples=5):
     """予測結果の可視化"""
     plt.figure(figsize=(15, num_samples*5))
     
-    # ランダムにサンプルを選択
-    indices = np.random.choice(len(test_results['y_true']), min(num_samples, len(test_results['y_true'])), replace=False)
+    # サンプルのインデックスをランダムに選択
+    if 'mol_ids' in test_results and len(test_results['mol_ids']) > 0:
+        sample_indices = np.random.choice(len(test_results['mol_ids']), 
+                                         min(num_samples, len(test_results['mol_ids'])), 
+                                         replace=False)
+    else:
+        # mol_idsがない場合は予測結果から選択
+        sample_indices = np.random.choice(len(test_results['y_true']), 
+                                         min(num_samples, len(test_results['y_true'])), 
+                                         replace=False)
     
-    for i, idx in enumerate(indices):
-        # 真のスペクトル
-        plt.subplot(num_samples, 2, 2*i + 1)
-        true_spec = test_results['y_true'][idx].numpy()
-        plt.stem(range(len(true_spec)), true_spec, markerfmt=" ", basefmt="b-")
-        plt.title(f"True Spectrum - Molecule {test_results['mol_ids'][idx]}")
-        plt.xlabel("m/z")
-        plt.ylabel("Intensity")
-        
-        # 予測スペクトル
-        plt.subplot(num_samples, 2, 2*i + 2)
-        pred_spec = test_results['y_pred'][idx].numpy()
-        plt.stem(range(len(pred_spec)), pred_spec, markerfmt=" ", basefmt="r-")
-        plt.title(f"Predicted Spectrum - Molecule {test_results['mol_ids'][idx]}")
-        plt.xlabel("m/z")
-        plt.ylabel("Intensity")
-    
-    plt.tight_layout()
-    plt.savefig('hybrid_prediction_visualization.png')
-    plt.close()
-    
-    # 類似度分布のプロット
+    # コサイン類似度をベースにサンプルをソート（オプション）
     similarities = []
     for i in range(len(test_results['y_true'])):
         sim = cosine_similarity(
             test_results['y_true'][i].reshape(1, -1),
             test_results['y_pred'][i].reshape(1, -1)
         )[0][0]
-        similarities.append(sim)
+        similarities.append((i, sim))
     
-    plt.figure(figsize=(10, 6))
-    plt.hist(similarities, bins=30, alpha=0.7)
-    plt.axvline(x=np.mean(similarities), color='r', linestyle='--', 
-                label=f'Mean: {np.mean(similarities):.4f}')
-    plt.xlabel('Cosine Similarity')
-    plt.ylabel('Count')
-    plt.title('Distribution of Cosine Similarities on Test Data')
-    plt.legend()
-    plt.savefig('hybrid_similarity_distribution.png')
+    # 類似度の高い順にソート
+    similarities.sort(key=lambda x: x[1], reverse=True)
+    top_samples = similarities[:num_samples]
+    
+    for i, (idx, sim) in enumerate(top_samples):
+        # 真のスペクトル
+        plt.subplot(num_samples, 2, 2*i + 1)
+        true_spec = test_results['y_true'][idx].numpy()
+        
+        # 非ゼロの位置を強調
+        nonzero_indices = np.nonzero(true_spec)[0]
+        if len(nonzero_indices) > 0:
+            plt.stem(nonzero_indices, true_spec[nonzero_indices], markerfmt=" ", basefmt="b-")
+        else:
+            plt.plot(range(len(true_spec)), true_spec, 'b-')
+            
+        plt.title(f"真のスペクトル - サンプル #{idx}")
+        plt.xlabel("m/z")
+        plt.ylabel("強度")
+        
+        # 予測スペクトル
+        plt.subplot(num_samples, 2, 2*i + 2)
+        pred_spec = test_results['y_pred'][idx].numpy()
+        
+        # 非ゼロの位置を強調
+        nonzero_indices = np.nonzero(pred_spec)[0]
+        if len(nonzero_indices) > 0:
+            plt.stem(nonzero_indices, pred_spec[nonzero_indices], markerfmt=" ", basefmt="r-")
+        else:
+            plt.plot(range(len(pred_spec)), pred_spec, 'r-')
+            
+        plt.title(f"予測スペクトル - 類似度: {sim:.4f}")
+        plt.xlabel("m/z")
+        plt.ylabel("強度")
+    
+    plt.tight_layout()
+    plt.savefig('hybrid_prediction_visualization.png')
     plt.close()
 
 ###############################
@@ -1905,6 +1920,109 @@ def main():
         bidirectional=True,     # 双方向予測を使用
         gate_prediction=True    # ゲート予測を使用
     ).to(device)
+    
+    # 損失関数、オプティマイザー、スケジューラーの設定
+    criterion = combined_loss
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
+    
+    # 学習率スケジューラー（OneCycleLR）
+    num_epochs = 100
+    steps_per_epoch = len(train_loader)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=0.003,
+        steps_per_epoch=steps_per_epoch,
+        epochs=num_epochs,
+        pct_start=0.1,  # 10%の期間でウォームアップ
+        div_factor=25.0,  # 初期学習率 = max_lr/div_factor
+        final_div_factor=10000.0  # 最終学習率 = max_lr/final_div_factor
+    )
+    
+    # モデルの訓練
+    train_losses, val_losses, val_cosine_similarities, best_cosine = train_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        num_epochs=num_epochs
+    )
+    
+    # 学習曲線を可視化
+    try:
+        plt.figure(figsize=(12, 5))
+        
+        plt.subplot(1, 2, 1)
+        plt.plot(train_losses, label='Training Loss')
+        plt.plot(val_losses, label='Validation Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.title('Loss Curves')
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(val_cosine_similarities, label='Validation Cosine Similarity')
+        plt.axhline(y=best_cosine, color='r', linestyle='--', label=f'Best: {best_cosine:.4f}')
+        plt.xlabel('Epoch')
+        plt.ylabel('Cosine Similarity')
+        plt.legend()
+        plt.title('Cosine Similarity')
+        
+        plt.tight_layout()
+        plt.savefig('hybrid_learning_curves.png')
+        print("学習曲線を保存しました: hybrid_learning_curves.png")
+        plt.close()
+    except Exception as e:
+        print(f"プロット生成中にエラーが発生しました: {e}")
+    
+    # 最良モデルを読み込む
+    try:
+        model.load_state_dict(torch.load('best_hybrid_ms_model.pth', weights_only=True))
+    except Exception as e:
+        print(f"モデル読み込み中にエラーが発生: {e}")
+    
+    # テストデータでの評価
+    try:
+        test_results = eval_model(model, test_loader, device)
+        print(f"テストデータでの平均コサイン類似度: {test_results['cosine_similarity']:.4f}")
+        
+        # 予測結果の可視化
+        visualize_results(test_results, num_samples=5)
+        print("予測結果の可視化を保存しました: hybrid_prediction_visualization.png")
+    except Exception as e:
+        print(f"テスト評価中にエラーが発生: {e}")
+    
+    print("学習完了！")
+    
+    # 追加の結果分析
+    try:
+        # 類似度分布のヒストグラム
+        similarities = []
+        for i in range(len(test_results['y_true'])):
+            sim = cosine_similarity(
+                test_results['y_true'][i].reshape(1, -1),
+                test_results['y_pred'][i].reshape(1, -1)
+            )[0][0]
+            similarities.append(sim)
+        
+        plt.figure(figsize=(10, 6))
+        plt.hist(similarities, bins=20, alpha=0.7)
+        plt.axvline(x=test_results['cosine_similarity'], color='r', linestyle='--', 
+                    label=f'平均: {test_results["cosine_similarity"]:.4f}')
+        plt.xlabel('コサイン類似度')
+        plt.ylabel('サンプル数')
+        plt.title('テストデータにおけるコサイン類似度の分布')
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.savefig('similarity_distribution.png')
+        print("類似度分布を保存しました: similarity_distribution.png")
+        plt.close()
+    except Exception as e:
+        print(f"追加分析中にエラーが発生: {e}")
+    
+    return model, train_losses, val_losses, val_cosine_similarities, test_results
     
     # モデルの次元を決定
     sample = train_dataset[0]
