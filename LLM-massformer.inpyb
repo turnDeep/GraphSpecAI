@@ -1,0 +1,1268 @@
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.metrics.pairwise import cosine_similarity
+import matplotlib.pyplot as plt
+from rdkit import Chem
+from rdkit.Chem import AllChem, Descriptors, MACCSkeys
+from tqdm import tqdm
+import logging
+import copy
+import math
+from typing import List, Dict, Tuple, Optional, Union
+from transformers import AutoTokenizer, AutoModel, PreTrainedTokenizer, PreTrainedModel
+from transformers import BertTokenizer, BertModel
+from transformers import RobertaTokenizer, RobertaModel
+from transformers import T5EncoderModel, T5Tokenizer
+from transformers import AdamW, get_linear_schedule_with_warmup
+
+# Logger setup
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Path settings
+DATA_PATH = "data/"
+MOL_FILES_PATH = os.path.join(DATA_PATH, "mol_files/")
+MSP_FILE_PATH = os.path.join(DATA_PATH, "NIST17.MSP")
+
+# Maximum m/z value
+MAX_MZ = 2000
+
+# Important m/z values list
+IMPORTANT_MZ = [18, 28, 43, 57, 71, 73, 77, 91, 105, 115, 128, 152, 165, 178, 207]
+
+# Epsilon value for numerical stability
+EPS = np.finfo(np.float32).eps
+
+# Number of fragment patterns (using MACCS keys)
+NUM_FRAGS = 167
+
+###############################
+# Data Processing Functions
+###############################
+
+def process_spec(spec, transform, normalization, eps=EPS):
+    """Apply transformation and normalization to spectrum"""
+    # Scale spectrum to 1000
+    spec = spec / (torch.max(spec, dim=-1, keepdim=True)[0] + eps) * 1000.
+    
+    # Transform signal
+    if transform == "log10":
+        spec = torch.log10(spec + 1)
+    elif transform == "log10over3":
+        spec = torch.log10(spec + 1) / 3
+    elif transform == "loge":
+        spec = torch.log(spec + 1)
+    elif transform == "sqrt":
+        spec = torch.sqrt(spec)
+    elif transform == "none":
+        pass
+    else:
+        raise ValueError("invalid transform")
+    
+    # Normalization
+    if normalization == "l1":
+        spec = F.normalize(spec, p=1, dim=-1, eps=eps)
+    elif normalization == "l2":
+        spec = F.normalize(spec, p=2, dim=-1, eps=eps)
+    elif normalization == "none":
+        pass
+    else:
+        raise ValueError("invalid normalization")
+    
+    assert not torch.isnan(spec).any()
+    return spec
+
+def unprocess_spec(spec, transform):
+    """Reverse the transformation applied to the spectrum"""
+    # Transform signal
+    if transform == "log10":
+        max_ints = float(np.log10(1000. + 1.))
+        def untransform_fn(x): return 10**x - 1.
+    elif transform == "log10over3":
+        max_ints = float(np.log10(1000. + 1.) / 3.)
+        def untransform_fn(x): return 10**(3 * x) - 1.
+    elif transform == "loge":
+        max_ints = float(np.log(1000. + 1.))
+        def untransform_fn(x): return torch.exp(x) - 1.
+    elif transform == "sqrt":
+        max_ints = float(np.sqrt(1000.))
+        def untransform_fn(x): return x**2
+    elif transform == "linear":
+        raise NotImplementedError
+    elif transform == "none":
+        max_ints = 1000.
+        def untransform_fn(x): return x
+    else:
+        raise ValueError("invalid transform")
+        
+    spec = spec / (torch.max(spec, dim=-1, keepdim=True)[0] + EPS) * max_ints
+    spec = untransform_fn(spec)
+    spec = torch.clamp(spec, min=0.)
+    assert not torch.isnan(spec).any()
+    return spec
+
+def mask_prediction_by_mass(raw_prediction, prec_mass_idx, prec_mass_offset, mask_value=0.):
+    """Mask prediction based on precursor mass"""
+    device = raw_prediction.device
+    max_idx = raw_prediction.shape[1]
+    
+    # Check and adjust data type of prec_mass_idx
+    if prec_mass_idx.dtype != torch.long:
+        prec_mass_idx = prec_mass_idx.long()
+    
+    # Add error checking
+    if not torch.all(prec_mass_idx < max_idx):
+        # Clip out-of-range values to avoid errors
+        prec_mass_idx = torch.clamp(prec_mass_idx, max=max_idx-1)
+    
+    idx = torch.arange(max_idx, device=device)
+    mask = (
+        idx.unsqueeze(0) <= (
+            prec_mass_idx.unsqueeze(1) +
+            prec_mass_offset)).float()
+    return mask * raw_prediction + (1. - mask) * mask_value
+
+def parse_msp_file(msp_file_path):
+    """Parse MSP file and return ID->mass spectrum mapping"""
+    msp_data = {}
+    current_id = None
+    current_peaks = []
+    
+    with open(msp_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            
+            # Detect ID
+            if line.startswith("ID:"):
+                current_id = line.split(":")[1].strip()
+                current_id = int(current_id)
+            
+            # Detect number of peaks (this is right before peak data)
+            elif line.startswith("Num peaks:"):
+                current_peaks = []
+            
+            # Blank line marks end of compound
+            elif line == "" and current_id is not None and current_peaks:
+                # Convert mass spectrum to vector
+                ms_vector = np.zeros(MAX_MZ)
+                for mz, intensity in current_peaks:
+                    if 0 <= mz < MAX_MZ:
+                        ms_vector[mz] = intensity
+                
+                # Normalize intensities
+                if np.sum(ms_vector) > 0:
+                    ms_vector = ms_vector / np.max(ms_vector) * 100
+                    
+                    # Smooth spectrum
+                    smoothed_vector = np.zeros_like(ms_vector)
+                    for i in range(len(ms_vector)):
+                        start = max(0, i-1)
+                        end = min(len(ms_vector), i+2)
+                        smoothed_vector[i] = np.mean(ms_vector[start:end])
+                    
+                    # Filter small peaks (noise removal)
+                    threshold = np.percentile(smoothed_vector[smoothed_vector > 0], 10)
+                    smoothed_vector[smoothed_vector < threshold] = 0
+                    
+                    # Emphasize important m/z value peaks
+                    for mz in IMPORTANT_MZ:
+                        if mz < len(smoothed_vector) and smoothed_vector[mz] > 0:
+                            smoothed_vector[mz] *= 1.5
+                    
+                    msp_data[current_id] = smoothed_vector
+                else:
+                    msp_data[current_id] = ms_vector
+                
+                current_id = None
+                current_peaks = []
+            
+            # Process peak data
+            elif current_id is not None and " " in line and not any(line.startswith(prefix) for prefix in ["Name:", "Formula:", "MW:", "ExactMass:", "CASNO:", "Comment:"]):
+                try:
+                    parts = line.split()
+                    if len(parts) == 2:
+                        mz = int(parts[0])
+                        intensity = float(parts[1])
+                        current_peaks.append((mz, intensity))
+                except ValueError:
+                    pass  # Skip lines that can't be converted to numbers
+    
+    return msp_data
+
+###############################
+# LLM-Based Model Components
+###############################
+
+class SpectralTransformer(nn.Module):
+    """Transformer-based model for mass spectrum prediction with SMILES input"""
+    def __init__(self, 
+                 out_channels=MAX_MZ, 
+                 num_fragments=NUM_FRAGS,
+                 pretrained_model_name="seyonec/ChemBERTa-zinc-base-v1",
+                 prec_mass_offset=10, 
+                 bidirectional=True, 
+                 gate_prediction=True):
+        super(SpectralTransformer, self).__init__()
+        
+        self.prec_mass_offset = prec_mass_offset
+        self.bidirectional = bidirectional
+        self.gate_prediction = gate_prediction
+        
+        # Load pretrained tokenizer and model
+        self.tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name)
+        self.encoder = AutoModel.from_pretrained(pretrained_model_name)
+        
+        # Get dimensions from the pretrained model
+        self.hidden_dim = self.encoder.config.hidden_size
+        
+        # Spectrum decoder components
+        self.spectrum_proj = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim*2),
+            nn.LayerNorm(self.hidden_dim*2),
+            nn.LeakyReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(self.hidden_dim*2, self.hidden_dim*2),
+            nn.LayerNorm(self.hidden_dim*2),
+            nn.LeakyReLU(),
+            nn.Dropout(0.2)
+        )
+        
+        # Attention mechanism for spectrum generation
+        self.attention = nn.MultiheadAttention(self.hidden_dim*2, num_heads=8, dropout=0.1)
+        
+        # Additional feature extraction layers
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(self.hidden_dim*2, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.LeakyReLU(),
+            nn.Dropout(0.2)
+        )
+        
+        # Fragment pattern prediction
+        self.fragment_pred = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim//2),
+            nn.LeakyReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(self.hidden_dim//2, num_fragments),
+        )
+        
+        # Bidirectional prediction layers (MassFormer style)
+        if bidirectional:
+            self.forw_out_layer = nn.Linear(self.hidden_dim, out_channels)
+            self.rev_out_layer = nn.Linear(self.hidden_dim, out_channels)
+            self.out_gate = nn.Sequential(
+                nn.Linear(self.hidden_dim, out_channels),
+                nn.Sigmoid()
+            )
+        else:
+            # Standard output layer
+            self.out_layer = nn.Linear(self.hidden_dim, out_channels)
+            if gate_prediction:
+                self.out_gate = nn.Sequential(
+                    nn.Linear(self.hidden_dim, out_channels),
+                    nn.Sigmoid()
+                )
+        
+        # Initialize weights
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Initialize weights for faster convergence"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+    
+    def prepare_smiles_input(self, smiles_list):
+        """Tokenize SMILES strings for input to the model"""
+        # Tokenize with padding
+        encoded_inputs = self.tokenizer(
+            smiles_list, 
+            padding=True, 
+            truncation=True, 
+            return_tensors="pt",
+            max_length=512  # Adjust based on your SMILES complexity
+        )
+        
+        return encoded_inputs
+    
+    def forward(self, data):
+        device = next(self.parameters()).device
+        
+        if isinstance(data, dict):
+            # Check if we're dealing with SMILES input
+            if 'smiles' in data:
+                # Process SMILES input
+                smiles_list = data['smiles']
+                encoded_inputs = self.prepare_smiles_input(smiles_list)
+                
+                # Move to the same device as model
+                input_ids = encoded_inputs['input_ids'].to(device)
+                attention_mask = encoded_inputs['attention_mask'].to(device)
+                
+                # Get molecule embeddings from the pretrained model
+                outputs = self.encoder(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                )
+                
+                # Get the [CLS] token embedding as the molecule representation
+                molecule_embeddings = outputs.last_hidden_state[:, 0, :]
+                
+            # Handle cases with pre-computed molecule features
+            elif 'molecule_features' in data:
+                molecule_embeddings = data['molecule_features'].to(device)
+            
+            # Process other inputs
+            prec_mz_bin = data.get('prec_mz_bin', None)
+            if prec_mz_bin is not None:
+                prec_mz_bin = prec_mz_bin.to(device)
+        else:
+            raise ValueError("Input must be a dictionary with 'smiles' or 'molecule_features'")
+        
+        # Project features
+        features = self.spectrum_proj(molecule_embeddings)
+        
+        # Apply attention for more context awareness
+        features = features.unsqueeze(0)  # (batch_size, hidden_dim) -> (1, batch_size, hidden_dim)
+        attn_output, _ = self.attention(features, features, features)
+        features = attn_output.squeeze(0)  # (1, batch_size, hidden_dim) -> (batch_size, hidden_dim)
+        
+        # Extract final features
+        final_features = self.feature_extractor(features)
+        
+        # Predict fragment patterns
+        fragment_pred = self.fragment_pred(final_features)
+        
+        # Bidirectional prediction if enabled (MassFormer approach)
+        if self.bidirectional and prec_mz_bin is not None:
+            # Forward and reverse prediction
+            ff = self.forw_out_layer(final_features)
+            fr = self.rev_out_layer(final_features)
+            
+            # Reverse the reverse prediction based on precursor mass
+            fr_reversed = torch.zeros_like(fr)
+            for i in range(fr.size(0)):
+                mass_idx = min(prec_mz_bin[i].item(), fr.size(1)-1)
+                offset = min(self.prec_mass_offset, fr.size(1) - mass_idx - 1)
+                reversed_indices = torch.arange(mass_idx + offset, -1, -1, device=device)
+                fr_reversed[i, :len(reversed_indices)] = fr[i, reversed_indices]
+            
+            # Gate mechanism for weighting
+            fg = self.out_gate(final_features)
+            output = ff * fg + fr_reversed * (1. - fg)
+            
+            # Mask by precursor mass
+            output = mask_prediction_by_mass(output, prec_mz_bin, self.prec_mass_offset)
+        else:
+            # Standard prediction
+            if hasattr(self, 'out_layer'):
+                output = self.out_layer(final_features)
+                
+                # Gate prediction if enabled
+                if self.gate_prediction and hasattr(self, 'out_gate'):
+                    fg = self.out_gate(final_features)
+                    output = fg * output
+            else:
+                # Fallback to forward prediction layer if bidirectional layers exist but no precursor mass
+                output = self.forw_out_layer(final_features)
+        
+        # Apply ReLU to ensure non-negative intensities
+        output = F.relu(output)
+        
+        return output, fragment_pred
+
+###############################
+# Dataset Definition
+###############################
+
+class MoleculeSpectrumDataset(Dataset):
+    def __init__(self, mol_ids, mol_files_path, msp_data, transform="log10over3", 
+                normalization="l1", augment=False):
+        self.mol_ids = mol_ids
+        self.mol_files_path = mol_files_path
+        self.msp_data = msp_data
+        self.augment = augment
+        self.transform = transform
+        self.normalization = normalization
+        self.valid_mol_ids = []
+        self.smiles_dict = {}
+        self.fragment_patterns = {}  # Fragment patterns by molecule ID
+        
+        # Extract valid molecule IDs in preprocessing
+        self._preprocess_mol_ids()
+        
+    def _preprocess_mol_ids(self):
+        """Extract only valid molecule IDs"""
+        valid_ids = []
+        smiles_dict = {}
+        fragment_patterns = {}
+        
+        for mol_id in tqdm(self.mol_ids, desc="Validating molecules"):
+            mol_file = os.path.join(self.mol_files_path, f"ID{mol_id}.MOL")
+            try:
+                # Check if molecule file can be loaded
+                mol = Chem.MolFromMolFile(mol_file, sanitize=False)
+                if mol is None:
+                    continue
+                
+                # Try basic sanitization
+                try:
+                    # Update property cache
+                    for atom in mol.GetAtoms():
+                        atom.UpdatePropertyCache(strict=False)
+                    
+                    # Partial sanitization
+                    Chem.SanitizeMol(mol, 
+                                   sanitizeOps=Chem.SanitizeFlags.SANITIZE_FINDRADICALS|
+                                              Chem.SanitizeFlags.SANITIZE_KEKULIZE|
+                                              Chem.SanitizeFlags.SANITIZE_SETAROMATICITY|
+                                              Chem.SanitizeFlags.SANITIZE_SETCONJUGATION|
+                                              Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION|
+                                              Chem.SanitizeFlags.SANITIZE_SYMMRINGS,
+                                   catchErrors=True)
+                except Exception as e:
+                    logger.warning(f"Skipping molecule ID{mol_id} due to sanitization error: {str(e)}")
+                    continue
+                
+                # Generate SMILES for the molecule
+                try:
+                    smiles = Chem.MolToSmiles(mol)
+                    if not smiles:
+                        logger.warning(f"Could not generate SMILES for ID{mol_id}")
+                        continue
+                    
+                    smiles_dict[mol_id] = smiles
+                    valid_ids.append(mol_id)
+                    
+                    # Generate fragment pattern for multi-task learning
+                    try:
+                        # Calculate MACCS fingerprint
+                        fragments = self._generate_fragment_features(mol)
+                        fragment_patterns[mol_id] = fragments
+                    except Exception as e:
+                        logger.warning(f"Could not generate fragments for ID{mol_id}: {str(e)}")
+                        # Use zero vector if fragment calculation fails
+                        fragment_patterns[mol_id] = np.zeros(NUM_FRAGS)
+                        
+                except Exception as e:
+                    logger.warning(f"Skipping molecule ID{mol_id}: {str(e)}")
+                    continue
+                    
+            except Exception as e:
+                logger.warning(f"Error processing molecule ID{mol_id}: {str(e)}")
+                continue
+                
+        self.valid_mol_ids = valid_ids
+        self.smiles_dict = smiles_dict
+        self.fragment_patterns = fragment_patterns
+        logger.info(f"Found {len(valid_ids)} valid molecules out of {len(self.mol_ids)}")
+        
+    def _generate_fragment_features(self, mol):
+        """Generate fragment features for a molecule"""
+        # Calculate MACCS fingerprint
+        maccs = MACCSkeys.GenMACCSKeys(mol)
+        maccs_bits = np.zeros(NUM_FRAGS)
+        
+        # Get bits
+        for i in range(NUM_FRAGS):
+            if maccs.GetBit(i):
+                maccs_bits[i] = 1.0
+                
+        return maccs_bits
+        
+    def __len__(self):
+        return len(self.valid_mol_ids)
+    
+    def __getitem__(self, idx):
+        mol_id = self.valid_mol_ids[idx]
+        
+        # Get SMILES representation
+        smiles = self.smiles_dict[mol_id]
+        
+        # Get mass spectrum from MSP data
+        mass_spectrum = self.msp_data.get(mol_id, np.zeros(MAX_MZ))
+        mass_spectrum = self._preprocess_spectrum(mass_spectrum)
+        
+        # Get fragment pattern
+        fragment_pattern = self.fragment_patterns.get(mol_id, np.zeros(NUM_FRAGS))
+        
+        # Calculate precursor m/z
+        peaks = np.nonzero(mass_spectrum)[0]
+        if len(peaks) > 0:
+            prec_mz = np.max(peaks)
+        else:
+            prec_mz = 0
+            
+        prec_mz_bin = prec_mz
+        
+        # Data augmentation for SMILES if enabled
+        if self.augment and np.random.random() < 0.3:
+            # Try to create an alternative SMILES representation
+            try:
+                mol = Chem.MolFromSmiles(smiles)
+                if mol:
+                    # Randomize atom order to get different, but equivalent SMILES
+                    mol = Chem.MolFromSmiles(Chem.MolToSmiles(mol, doRandom=True))
+                    if mol:
+                        smiles_aug = Chem.MolToSmiles(mol)
+                        if smiles_aug and len(smiles_aug) > 0:
+                            smiles = smiles_aug
+            except:
+                pass
+        
+        return {
+            'mol_id': mol_id,
+            'smiles': smiles,
+            'mass_spectrum': torch.FloatTensor(mass_spectrum),
+            'fragment_pattern': torch.FloatTensor(fragment_pattern),
+            'prec_mz': prec_mz,
+            'prec_mz_bin': prec_mz_bin
+        }
+    
+    def _preprocess_spectrum(self, spectrum):
+        """Preprocess spectrum"""
+        # Convert spectrum to PyTorch tensor
+        spec_tensor = torch.FloatTensor(spectrum)
+        
+        # MassFormer style processing
+        processed_spec = process_spec(spec_tensor.unsqueeze(0), self.transform, self.normalization)
+        
+        return processed_spec.squeeze(0).numpy()
+
+def collate_fn(batch):
+    """Combine batch data"""
+    smiles_list = [item['smiles'] for item in batch]
+    mass_spectrum = torch.stack([item['mass_spectrum'] for item in batch])
+    fragment_pattern = torch.stack([item['fragment_pattern'] for item in batch])
+    mol_id = [item['mol_id'] for item in batch]
+    prec_mz = torch.tensor([item['prec_mz'] for item in batch], dtype=torch.float32)
+    prec_mz_bin = torch.tensor([item['prec_mz_bin'] for item in batch], dtype=torch.long)
+    
+    return {
+        'smiles': smiles_list,
+        'spec': mass_spectrum,
+        'fragment_pattern': fragment_pattern,
+        'mol_id': mol_id,
+        'prec_mz': prec_mz,
+        'prec_mz_bin': prec_mz_bin
+    }
+
+###############################
+# Loss Functions and Similarity Calculation
+###############################
+
+def cosine_similarity_loss(y_pred, y_true, important_mz=None, important_weight=3.0):
+    """Cosine similarity loss function with emphasis on peaks and important m/z values"""
+    # Normalize
+    y_pred_norm = F.normalize(y_pred, p=2, dim=1)
+    y_true_norm = F.normalize(y_true, p=2, dim=1)
+    
+    # Weight important m/z values
+    if important_mz is not None:
+        batch_size = y_pred.size(0)
+        weights = torch.ones_like(y_pred)
+        for mz in important_mz:
+            if mz < y_pred.size(1):
+                weights[:, mz] = important_weight
+        
+        # Normalize with weights
+        y_pred_weighted = y_pred * weights
+        y_true_weighted = y_true * weights
+        
+        y_pred_norm = F.normalize(y_pred_weighted, p=2, dim=1)
+        y_true_norm = F.normalize(y_true_weighted, p=2, dim=1)
+    
+    # Cosine similarity (range -1 to 1)
+    cosine = torch.sum(y_pred_norm * y_true_norm, dim=1)
+    
+    # Loss as 1 - cosine, range 0 to 2
+    loss = 1.0 - cosine
+    
+    return loss.mean()
+
+def fragment_pattern_loss(y_pred, y_true, top_k=30):
+    """Loss function emphasizing fragment patterns"""
+    batch_size = y_pred.shape[0]
+    device = y_pred.device
+    
+    # Extract top k peaks from each spectrum
+    k_pred = min(top_k, y_pred.size(1))
+    k_true = min(top_k, y_true.size(1))
+    _, pred_top_indices = torch.topk(y_pred, k=k_pred, dim=1)
+    _, true_top_indices = torch.topk(y_true, k=k_true, dim=1)
+    
+    loss = 0.0
+    valid_samples = 0
+    
+    for i in range(batch_size):
+        # Peak positions in prediction and ground truth
+        pred_peaks = pred_top_indices[i]
+        true_peaks = true_top_indices[i]
+        
+        # Evaluate match between predicted and actual peak positions (set operations)
+        pred_set = set(pred_peaks.cpu().numpy())
+        true_set = set(true_peaks.cpu().numpy())
+        
+        common_peaks = len(pred_set.intersection(true_set))
+        union_peaks = len(pred_set.union(true_set))
+        
+        jaccard = common_peaks / max(1, union_peaks)
+        
+        # Evaluate distance between peaks
+        total_dist = 0.0
+        count = 0
+        
+        for p in pred_peaks:
+            p_val = p.item()
+            min_dist = float('inf')
+            for t in true_peaks:
+                t_val = t.item()
+                dist = abs(p_val - t_val)
+                min_dist = min(min_dist, dist)
+            
+            if min_dist != float('inf'):
+                total_dist += min_dist
+                count += 1
+        
+        # Calculate mean distance
+        if count > 0:
+            mean_distance = total_dist / count
+            dist_factor = math.exp(-mean_distance / 10.0)
+        else:
+            dist_factor = 0.0
+            
+        # Pattern similarity loss
+        pattern_loss = 1.0 - (jaccard * dist_factor)
+        loss += pattern_loss
+        valid_samples += 1
+    
+    if valid_samples > 0:
+        return loss / valid_samples
+    else:
+        return torch.tensor(1.0, device=device)
+
+def relative_intensity_loss(y_pred, y_true, top_k=20):
+    """Loss function to preserve relative intensity ratios between fragment ions"""
+    batch_size = y_pred.shape[0]
+    device = y_pred.device
+    loss = 0.0
+    valid_samples = 0
+    
+    for i in range(batch_size):
+        pred = y_pred[i]
+        true = y_true[i]
+        
+        # Extract top k peaks
+        nonzero_count = torch.count_nonzero(true)
+        if nonzero_count < 2:
+            continue
+            
+        k = min(top_k, nonzero_count.item())
+        true_values, true_indices = torch.topk(true, k=k)
+        
+        # Check if there are important peaks in the ground truth
+        if torch.sum(true_values > 0) < 2:
+            continue
+            
+        # Calculate intensity ratios
+        ratios_true = []
+        ratios_pred = []
+        
+        # Calculate peak intensity ratios for each pair
+        for idx1 in range(len(true_indices)):
+            for idx2 in range(idx1+1, len(true_indices)):
+                m1, m2 = true_indices[idx1].item(), true_indices[idx2].item()
+                
+                # Ground truth intensities
+                i1_true = true[m1].item()
+                i2_true = true[m2].item()
+                
+                # Skip if either is 0
+                if i1_true <= 0 or i2_true <= 0:
+                    continue
+                    
+                # Predicted intensities
+                i1_pred = pred[m1].item()
+                i2_pred = pred[m2].item()
+                
+                # Check for negative or very small values
+                if i1_pred <= 1e-6 or i2_pred <= 1e-6:
+                    continue
+                
+                # Intensity ratio (larger as numerator)
+                if i1_true >= i2_true:
+                    ratio_true = i1_true / (i2_true + 1e-6)
+                    ratio_pred = i1_pred / (i2_pred + 1e-6)
+                else:
+                    ratio_true = i2_true / (i1_true + 1e-6)
+                    ratio_pred = i2_pred / (i1_pred + 1e-6)
+                
+                ratios_true.append(ratio_true)
+                ratios_pred.append(ratio_pred)
+        
+        # Calculate loss as the difference in intensity ratios
+        if ratios_true:
+            ratios_true_tensor = torch.tensor(ratios_true, device=device)
+            ratios_pred_tensor = torch.tensor(ratios_pred, device=device)
+            
+            # Log ratio difference (evaluate relative differences)
+            log_true = torch.log(ratios_true_tensor + 1e-6)
+            log_pred = torch.log(ratios_pred_tensor + 1e-6)
+            log_diff = torch.abs(log_true - log_pred)
+            
+            ratio_loss = torch.mean(log_diff)
+            loss += ratio_loss
+            valid_samples += 1
+    
+    # Divide by number of valid samples in batch to get average loss
+    if valid_samples > 0:
+        return loss / valid_samples
+    else:
+        return torch.tensor(0.0, device=device)
+
+def combined_loss(y_pred, y_true, fragment_pred=None, fragment_true=None, 
+                 alpha=0.1, beta=0.4, gamma=0.2, delta=0.2, epsilon=0.1):
+    """Optimized combined loss function"""
+    # Check and adjust batch size
+    if y_pred.shape[0] != y_true.shape[0]:
+        min_batch_size = min(y_pred.shape[0], y_true.shape[0])
+        y_pred = y_pred[:min_batch_size]
+        y_true = y_true[:min_batch_size]
+    
+    # Check and adjust feature count
+    if y_pred.shape[1] != y_true.shape[1]:
+        min_size = min(y_pred.shape[1], y_true.shape[1])
+        y_pred = y_pred[:, :min_size]
+        y_true = y_true[:, :min_size]
+    
+    # 1. Peak-focused MSE loss
+    peak_mask = (y_true > 0).float()
+    mse_weights = peak_mask * 10.0 + 1.0
+    
+    # Add more weight to important m/z values
+    for mz in IMPORTANT_MZ:
+        if mz < y_true.size(1):
+            mse_weights[:, mz] *= 3.0
+    
+    mse_loss = torch.mean(mse_weights * (y_pred - y_true) ** 2)
+    
+    # 2. Cosine similarity loss
+    cosine_loss = cosine_similarity_loss(y_pred, y_true, important_mz=IMPORTANT_MZ)
+    
+    # 3. Fragment pattern loss
+    pattern_loss = fragment_pattern_loss(y_pred, y_true, top_k=30)
+    
+    # 4. Relative intensity ratio preservation loss
+    rel_intensity_loss_val = relative_intensity_loss(y_pred, y_true, top_k=20)
+    
+    # Combine main loss components
+    main_loss = alpha * mse_loss + beta * cosine_loss + gamma * pattern_loss + delta * rel_intensity_loss_val
+    
+    # Add fragment pattern prediction if available
+    if fragment_pred is not None and fragment_true is not None:
+        if fragment_pred.shape[0] != fragment_true.shape[0]:
+            min_batch_size = min(fragment_pred.shape[0], fragment_true.shape[0])
+            fragment_pred = fragment_pred[:min_batch_size]
+            fragment_true = fragment_true[:min_batch_size]
+        
+        fragment_loss = F.binary_cross_entropy_with_logits(fragment_pred, fragment_true)
+        return main_loss + epsilon * fragment_loss
+    
+    return main_loss
+
+def cosine_similarity_score(y_true, y_pred):
+    """Calculate cosine similarity score"""
+    # Convert to NumPy arrays
+    y_true_np = y_true.cpu().numpy() if isinstance(y_true, torch.Tensor) else y_true
+    y_pred_np = y_pred.cpu().numpy() if isinstance(y_pred, torch.Tensor) else y_pred
+    
+    y_true_flat = y_true_np.reshape(y_true_np.shape[0], -1)
+    y_pred_flat = y_pred_np.reshape(y_pred_np.shape[0], -1)
+    
+    scores = []
+    for i in range(y_true_flat.shape[0]):
+        true_vec = y_true_flat[i]
+        pred_vec = y_pred_flat[i]
+        
+        # Check for zero vectors
+        if np.sum(true_vec) == 0 or np.sum(pred_vec) == 0:
+            scores.append(0)
+            continue
+            
+        score = cosine_similarity(
+            true_vec.reshape(1, -1), 
+            pred_vec.reshape(1, -1)
+        )[0][0]
+        scores.append(score)
+    
+    return np.mean(scores)
+
+###############################
+# Training and Model Evaluation
+###############################
+
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, device, num_epochs):
+    """Train the model"""
+    train_losses = []
+    val_losses = []
+    val_cosine_similarities = []
+    best_cosine = 0.0
+    early_stopping_counter = 0
+    early_stopping_patience = 10
+    
+    # Explicitly move model to device
+    model = model.to(device)
+    
+    for epoch in range(num_epochs):
+        # Training mode
+        model.train()
+        epoch_loss = 0
+        batch_count = 0
+        
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Training)"):
+            try:
+                # Move data to device
+                batch_specs = batch['spec'].to(device)
+                batch_fragments = batch['fragment_pattern'].to(device)
+                batch_prec_mz_bin = batch['prec_mz_bin'].to(device)
+                
+                # Reset gradients
+                optimizer.zero_grad()
+                
+                # Forward pass
+                output, fragment_pred = model({
+                    'smiles': batch['smiles'],
+                    'prec_mz_bin': batch_prec_mz_bin
+                })
+                
+                # Calculate loss
+                loss = criterion(output, batch_specs, fragment_pred, batch_fragments)
+                
+                # Backward pass
+                loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+                batch_count += 1
+                
+            except RuntimeError as e:
+                print(f"Error occurred: {str(e)}")
+                # Print stack trace (useful for debugging)
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        # Check if any batches were processed successfully
+        if batch_count > 0:
+            train_losses.append(epoch_loss / batch_count)
+        else:
+            print("Warning: No successful batch processing in this epoch.")
+            train_losses.append(float('inf'))
+        
+        # Evaluation mode
+        model.eval()
+        val_loss = 0
+        val_batch_count = 0
+        y_true = []
+        y_pred = []
+        
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Validation)"):
+                try:
+                    # Move data to device
+                    batch_specs = batch['spec'].to(device)
+                    batch_fragments = batch['fragment_pattern'].to(device)
+                    batch_prec_mz_bin = batch['prec_mz_bin'].to(device)
+                    
+                    # Prediction
+                    output, fragment_pred = model({
+                        'smiles': batch['smiles'],
+                        'prec_mz_bin': batch_prec_mz_bin
+                    })
+                    
+                    # Calculate loss
+                    loss = criterion(output, batch_specs, fragment_pred, batch_fragments)
+                    val_loss += loss.item()
+                    val_batch_count += 1
+                    
+                    # Save results for similarity calculation
+                    y_true.append(batch_specs.cpu())
+                    y_pred.append(output.cpu())
+                    
+                except RuntimeError as e:
+                    print(f"Error during evaluation: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+        
+        # Check if any validation batches were processed successfully
+        if val_batch_count > 0:
+            val_losses.append(val_loss / val_batch_count)
+            
+            # Calculate cosine similarity
+            all_true = torch.cat(y_true, dim=0)
+            all_pred = torch.cat(y_pred, dim=0)
+            cosine_sim = cosine_similarity_score(all_true, all_pred)
+            val_cosine_similarities.append(cosine_sim)
+            
+            print(f"Epoch {epoch+1}/{num_epochs}, "
+                  f"Train Loss: {train_losses[-1]:.4f}, "
+                  f"Val Loss: {val_losses[-1]:.4f}, "
+                  f"Val Cosine Similarity: {cosine_sim:.4f}")
+            
+            # Save best model
+            if cosine_sim > best_cosine:
+                best_cosine = cosine_sim
+                early_stopping_counter = 0
+                torch.save(model.state_dict(), 'best_llm_ms_model.pth')
+                print(f"New best model saved: {cosine_sim:.4f}")
+            else:
+                early_stopping_counter += 1
+                
+            # Early stopping
+            if early_stopping_counter >= early_stopping_patience:
+                print(f"Early stopping triggered after {epoch+1} epochs")
+                break
+        else:
+            print("Warning: No successful validation batch processing.")
+            val_losses.append(float('inf'))
+            val_cosine_similarities.append(0.0)
+        
+        # Update learning rate scheduler
+        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(val_losses[-1])
+        else:
+            scheduler.step()
+    
+    return train_losses, val_losses, val_cosine_similarities, best_cosine
+
+def eval_model(model, test_loader, device):
+    """Evaluate the model"""
+    model = model.to(device)
+    model.eval()
+    y_true = []
+    y_pred = []
+    fragment_true = []
+    fragment_pred = []
+    mol_ids = []
+    
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="Testing"):
+            try:
+                # Move data to device
+                batch_specs = batch['spec'].to(device)
+                batch_fragments = batch['fragment_pattern'].to(device)
+                batch_prec_mz_bin = batch['prec_mz_bin'].to(device)
+                
+                # Prediction
+                output, frag_pred = model({
+                    'smiles': batch['smiles'],
+                    'prec_mz_bin': batch_prec_mz_bin
+                })
+                
+                # Save results
+                y_true.append(batch_specs.cpu())
+                y_pred.append(output.cpu())
+                fragment_true.append(batch_fragments.cpu())
+                fragment_pred.append(frag_pred.cpu())
+                mol_ids.extend(batch['mol_id'])
+                
+            except RuntimeError as e:
+                print(f"Error during testing: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                continue
+    
+    # Concatenate results
+    all_true = torch.cat(y_true, dim=0)
+    all_pred = torch.cat(y_pred, dim=0)
+    all_fragment_true = torch.cat(fragment_true, dim=0)
+    all_fragment_pred = torch.cat(fragment_pred, dim=0)
+    
+    # Calculate score
+    cosine_sim = cosine_similarity_score(all_true, all_pred)
+    
+    return {
+        'cosine_similarity': cosine_sim,
+        'y_true': all_true,
+        'y_pred': all_pred,
+        'fragment_true': all_fragment_true,
+        'fragment_pred': all_fragment_pred,
+        'mol_ids': mol_ids
+    }
+
+def visualize_results(test_results, num_samples=10):
+    """Visualize prediction results"""
+    plt.figure(figsize=(15, num_samples*4))
+    
+    # Select random sample indices
+    if 'mol_ids' in test_results and len(test_results['mol_ids']) > 0:
+        sample_indices = np.random.choice(len(test_results['mol_ids']), 
+                                         min(num_samples, len(test_results['mol_ids'])), 
+                                         replace=False)
+    else:
+        # Select from prediction results if mol_ids not available
+        sample_indices = np.random.choice(len(test_results['y_true']), 
+                                         min(num_samples, len(test_results['y_true'])), 
+                                         replace=False)
+    
+    for i, idx in enumerate(sample_indices):
+        # Calculate similarity
+        sim = cosine_similarity(
+            test_results['y_true'][idx].reshape(1, -1),
+            test_results['y_pred'][idx].reshape(1, -1)
+        )[0][0]
+        
+        # True spectrum
+        plt.subplot(num_samples, 2, 2*i + 1)
+        true_spec = test_results['y_true'][idx].numpy()
+        
+        # Emphasize non-zero positions
+        nonzero_indices = np.nonzero(true_spec)[0]
+        if len(nonzero_indices) > 0:
+            plt.stem(nonzero_indices, true_spec[nonzero_indices], markerfmt=" ", basefmt="b-")
+        else:
+            plt.plot(range(len(true_spec)), true_spec, 'b-')
+            
+        # Set title
+        mol_id_str = f" - Molecule {test_results['mol_ids'][idx]}" if 'mol_ids' in test_results else ""
+        plt.title(f"True Spectrum{mol_id_str}")
+        plt.xlabel("m/z")
+        plt.ylabel("Intensity")
+        
+        # Predicted spectrum
+        plt.subplot(num_samples, 2, 2*i + 2)
+        pred_spec = test_results['y_pred'][idx].numpy()
+        
+        # Emphasize non-zero positions
+        nonzero_indices = np.nonzero(pred_spec)[0]
+        if len(nonzero_indices) > 0:
+            plt.stem(nonzero_indices, pred_spec[nonzero_indices], markerfmt=" ", basefmt="r-")
+        else:
+            plt.plot(range(len(pred_spec)), pred_spec, 'r-')
+            
+        plt.title(f"Predicted Spectrum - Cosine Sim: {sim:.4f}")
+        plt.xlabel("m/z")
+        plt.ylabel("Intensity")
+    
+    plt.tight_layout()
+    plt.savefig('llm_prediction_visualization.png')
+    plt.close()
+
+###############################
+# Main Function
+###############################
+
+def main():
+    # Parse MSP file
+    print("Parsing MSP file...")
+    msp_data = parse_msp_file(MSP_FILE_PATH)
+    print(f"Loaded {len(msp_data)} compound data from MSP file")
+    
+    # Check available MOL files
+    mol_ids = []
+    for filename in os.listdir(MOL_FILES_PATH):
+        if filename.startswith("ID") and filename.endswith(".MOL"):
+            mol_id = int(filename[2:-4])  # "ID300001.MOL" → 300001
+            if mol_id in msp_data:
+                mol_ids.append(mol_id)
+    
+    print(f"Compounds with both MOL files and MSP data: {len(mol_ids)}")
+    
+    # Data split (train:val:test = 85:5:10)
+    train_ids, test_ids = train_test_split(mol_ids, test_size=0.15, random_state=42)
+    val_ids, test_ids = train_test_split(test_ids, test_size=0.67, random_state=42)
+    
+    print(f"Training data: {len(train_ids)} compounds")
+    print(f"Validation data: {len(val_ids)} compounds")
+    print(f"Test data: {len(test_ids)} compounds")
+    
+    # Hyperparameters
+    transform = "log10over3"  # Spectrum transformation type
+    normalization = "l1"      # Normalization type
+    
+    # Create datasets
+    train_dataset = MoleculeSpectrumDataset(
+        train_ids, MOL_FILES_PATH, msp_data, 
+        transform=transform, normalization=normalization,
+        augment=True
+    )
+    val_dataset = MoleculeSpectrumDataset(
+        val_ids, MOL_FILES_PATH, msp_data,
+        transform=transform, normalization=normalization,
+        augment=False
+    )
+    test_dataset = MoleculeSpectrumDataset(
+        test_ids, MOL_FILES_PATH, msp_data,
+        transform=transform, normalization=normalization,
+        augment=False
+    )
+    
+    print(f"Valid training data: {len(train_dataset)} compounds")
+    print(f"Valid validation data: {len(val_dataset)} compounds")
+    print(f"Valid test data: {len(test_dataset)} compounds")
+    
+    # Set PyTorch multiprocessing strategy
+    torch.multiprocessing.set_sharing_strategy('file_system')
+    
+    # Create data loaders
+    min_batch_size = 2  # Minimum batch size of 2 to avoid BatchNorm issues
+    train_loader = DataLoader(
+        train_dataset, batch_size=min_batch_size, shuffle=True, 
+        collate_fn=collate_fn, num_workers=0, pin_memory=True, 
+        drop_last=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset, batch_size=min_batch_size, shuffle=False, 
+        collate_fn=collate_fn, num_workers=0, pin_memory=True,
+        drop_last=True
+    )
+    
+    test_loader = DataLoader(
+        test_dataset, batch_size=min_batch_size, shuffle=False, 
+        collate_fn=collate_fn, num_workers=0, pin_memory=True,
+        drop_last=True
+    )
+    
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Create model
+    # Options for pretrained_model_name:
+    # - 'seyonec/ChemBERTa-zinc-base-v1' (recommended for most chemistry tasks)
+    # - 'DeepChem/ChemBERTa-77M-MLM' (alternative chemistry model)
+    # - 'hongliangduan/GPT-GNN-for-SMILES' (specialized for SMILES)
+    # - 'DeepChem/MolFormer' (best for molecules but larger)
+    model = SpectralTransformer(
+        out_channels=MAX_MZ,
+        num_fragments=NUM_FRAGS,
+        pretrained_model_name="seyonec/ChemBERTa-zinc-base-v1",
+        prec_mass_offset=10,
+        bidirectional=True,
+        gate_prediction=True
+    ).to(device)
+    
+    # Loss function, optimizer, and scheduler
+    criterion = combined_loss
+    
+    # We'll use a layered learning rate approach: lower LR for pretrained parts
+    base_params = {'params': [p for n, p in model.named_parameters() if 'encoder' not in n]}
+    pretrained_params = {'params': [p for n, p in model.named_parameters() if 'encoder' in n], 'lr': 1e-5}
+    
+    optimizer = AdamW([base_params, pretrained_params], lr=1e-4, weight_decay=1e-5)
+    
+    # Learning rate scheduler
+    num_epochs = 20  # Reduced number of epochs for LLM fine-tuning
+    steps_per_epoch = len(train_loader)
+    total_steps = steps_per_epoch * num_epochs
+    
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(0.1 * total_steps),  # 10% warmup
+        num_training_steps=total_steps
+    )
+    
+    # Train model
+    train_losses, val_losses, val_cosine_similarities, best_cosine = train_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        num_epochs=num_epochs
+    )
+    
+    # Visualize learning curves
+    try:
+        plt.figure(figsize=(12, 5))
+        
+        plt.subplot(1, 2, 1)
+        plt.plot(train_losses, label='Training Loss')
+        plt.plot(val_losses, label='Validation Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.title('Loss Curves')
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(val_cosine_similarities, label='Validation Cosine Similarity')
+        plt.axhline(y=best_cosine, color='r', linestyle='--', label=f'Best: {best_cosine:.4f}')
+        plt.xlabel('Epoch')
+        plt.ylabel('Cosine Similarity')
+        plt.legend()
+        plt.title('Cosine Similarity')
+        
+        plt.tight_layout()
+        plt.savefig('llm_learning_curves.png')
+        print("Learning curves saved to: llm_learning_curves.png")
+        plt.close()
+    except Exception as e:
+        print(f"Error during plotting: {e}")
+    
+    # Load best model
+    try:
+        model.load_state_dict(torch.load('best_llm_ms_model.pth', map_location=device))
+    except Exception as e:
+        print(f"Error loading model: {e}")
+    
+    # Evaluate on test data
+    try:
+        test_results = eval_model(model, test_loader, device)
+        print(f"Test data average cosine similarity: {test_results['cosine_similarity']:.4f}")
+        
+        # Visualize prediction results
+        visualize_results(test_results, num_samples=10)
+        print("Prediction visualization saved to: llm_prediction_visualization.png")
+    except Exception as e:
+        print(f"Error during test evaluation: {e}")
+    
+    print("Training completed!")
+    
+    # Additional result analysis
+    try:
+        # Histogram of similarity distribution
+        similarities = []
+        for i in range(len(test_results['y_true'])):
+            sim = cosine_similarity(
+                test_results['y_true'][i].reshape(1, -1),
+                test_results['y_pred'][i].reshape(1, -1)
+            )[0][0]
+            similarities.append(sim)
+        
+        plt.figure(figsize=(10, 6))
+        plt.hist(similarities, bins=20, alpha=0.7)
+        plt.axvline(x=test_results['cosine_similarity'], color='r', linestyle='--', 
+                    label=f'Mean: {test_results["cosine_similarity"]:.4f}')
+        plt.xlabel('Cosine Similarity')
+        plt.ylabel('Number of Samples')
+        plt.title('Distribution of Cosine Similarities on Test Data')
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.savefig('llm_similarity_distribution.png')
+        print("Similarity distribution saved to: llm_similarity_distribution.png")
+        plt.close()
+    except Exception as e:
+        print(f"Error during additional analysis: {e}")
+    
+    return model, train_losses, val_losses, val_cosine_similarities, test_results
+
+if __name__ == "__main__":
+    main()
