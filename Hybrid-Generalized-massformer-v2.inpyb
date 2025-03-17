@@ -1656,7 +1656,17 @@ def eval_model(model, test_loader, device):
                 y_pred.append(output.cpu())
                 fragment_true.append(processed_batch['fragment_pattern'].cpu())
                 fragment_pred.append(frag_pred.cpu())
-                mol_ids.extend(processed_batch['mol_id'].cpu().numpy())
+                
+                # mol_idがリストかTensorか確認して適切に処理
+                if isinstance(processed_batch['mol_id'], list):
+                    # リストの場合は直接追加
+                    mol_ids.extend(processed_batch['mol_id'])
+                elif isinstance(processed_batch['mol_id'], torch.Tensor):
+                    # Tensorの場合はcpu().numpy()を使用
+                    mol_ids.extend(processed_batch['mol_id'].cpu().numpy())
+                else:
+                    # その他の型の場合は文字列に変換して追加
+                    mol_ids.extend([str(item) for item in processed_batch['mol_id']])
                 
             except RuntimeError as e:
                 print(f"テスト中にエラーが発生しました: {str(e)}")
