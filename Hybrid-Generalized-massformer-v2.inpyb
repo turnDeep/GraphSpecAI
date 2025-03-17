@@ -2101,6 +2101,12 @@ class ModelEnsemble:
                 mean_fragment = torch.zeros(outputs[0].size(0), NUM_FRAGS, device=self.device)
         
         return mean_output, mean_fragment
+    
+    # ModelEnsembleクラスにtoメソッドを追加
+    def to(self, device):
+        """デバイスへの移動 - デバイスを更新するだけで、モデルはすでに特定のデバイスに配置されています"""
+        self.device = device
+        return self
 
 def create_ensemble_from_checkpoints(model_class, checkpoint_paths, node_features, edge_features, 
                                     hidden_channels, out_channels, device, **kwargs):
