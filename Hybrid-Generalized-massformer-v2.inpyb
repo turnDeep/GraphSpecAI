@@ -2245,6 +2245,8 @@ def main():
             final_div_factor=10000.0  # 最終学習率 = max_lr/final_div_factor
         )
         
+        # 各モデル用のチェックポイントパスを個別に設定
+        best_model_path = f'best_hybrid_ms_model_{model_idx}.pth'
         checkpoint_path = f'hybrid_ms_model_{model_idx}.pth'
         
         try:
@@ -2283,11 +2285,14 @@ def main():
             plt.savefig(f'hybrid_learning_curves_model_{model_idx}.png')
             plt.close()
             
-            # 最良モデルを保存
+            # ベストモデルをロードしてモデル固有のチェックポイントファイルに保存
+            model.load_state_dict(torch.load('best_hybrid_ms_model.pth', weights_only=True))
+            
+            # 個別のモデルファイルを保存
+            torch.save(model.state_dict(), checkpoint_path)
             model_checkpoints.append(checkpoint_path)
             
             # テストデータでモデルを評価
-            model.load_state_dict(torch.load('best_hybrid_ms_model.pth'))
             test_result = eval_model(model, test_loader, device)
             model_results[f"Model_{model_idx+1}"] = test_result
             
