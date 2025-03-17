@@ -1617,7 +1617,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
 
 def eval_model(model, test_loader, device):
     """モデルの評価"""
-    model = model.to(device)  # モデルを明示的にデバイスに配置
+    # 通常のtorch.nn.Moduleモデルの場合のみデバイスに移動（ModelEnsembleはすでにデバイスを持っています）
+    if hasattr(model, 'to') and callable(model.to) and not isinstance(model, ModelEnsemble):
+        model = model.to(device)
+        
     model.eval()
     y_true = []
     y_pred = []
@@ -1653,7 +1656,7 @@ def eval_model(model, test_loader, device):
                 y_pred.append(output.cpu())
                 fragment_true.append(processed_batch['fragment_pattern'].cpu())
                 fragment_pred.append(frag_pred.cpu())
-                mol_ids.extend(processed_batch['mol_id'])
+                mol_ids.extend(processed_batch['mol_id'].cpu().numpy())
                 
             except RuntimeError as e:
                 print(f"テスト中にエラーが発生しました: {str(e)}")
