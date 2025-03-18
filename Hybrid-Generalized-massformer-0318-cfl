@@ -1206,6 +1206,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     total_steps = len(train_loader) * num_epochs
     logger.info(f"トレーニング開始: 総ステップ数 = {total_steps}")
     
+    # バッチ処理中の定期的なメモリ管理
+    total_batches = len(train_loader)
+    memory_check_interval = max(1, total_batches // 10)  # 10回程度チェック
+    
     for epoch in range(num_epochs):
         # 訓練モード
         model.train()
@@ -1217,6 +1221,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         
         for batch_idx, batch in enumerate(train_pbar):
             try:
+                # 定期的なメモリチェック
+                if batch_idx % memory_check_interval == 0:
+                    memory_cleared = limit_memory_usage(80)
+                    if memory_cleared and batch_idx > 0:
+                        logger.info("メモリ使用量を削減しました")
+                
                 # データをGPUに転送（効率化）
                 processed_batch = {}
                 for k, v in batch.items():
@@ -1269,9 +1279,17 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                     'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
                 })
                 
-                # メモリ解放
-                del loss, output, fragment_pred
+                # バッチごとにメモリ解放
+                del loss, output, fragment_pred, processed_batch
                 torch.cuda.empty_cache()
+                
+                # 非常に大規模なデータセットでは定期的にキャッシュをクリア
+                if len(train_dataset) > 100000 and batch_idx % (memory_check_interval * 2) == 0:
+                    if hasattr(train_dataset, 'graph_cache'):
+                        # キャッシュサイズが大きくなりすぎたらクリア
+                        if len(train_dataset.graph_cache) > 5000:
+                            train_dataset.graph_cache.clear()
+                            gc.collect()
                 
             except RuntimeError as e:
                 print(f"バッチ処理エラー: {str(e)}")
@@ -1593,13 +1611,11 @@ def main():
     
     # 利用可能なMOLファイルを確認
     mol_ids = []
-    # データセットサイズを制限（メモリ制約のため）
-    max_dataset_size = 50000  # 最大サンプル数を制限
     mol_files = os.listdir(MOL_FILES_PATH)
     logger.info(f"MOLファイル総数: {len(mol_files)}")
     
     # キャッシュファイルのパス
-    mol_id_cache_file = os.path.join(CACHE_DIR, f"valid_mol_ids_limit_{max_dataset_size}.pkl")
+    mol_id_cache_file = os.path.join(CACHE_DIR, "valid_mol_ids_full.pkl")
     
     # キャッシュが存在するか確認
     if os.path.exists(mol_id_cache_file):
@@ -1623,13 +1639,7 @@ def main():
                     except:
                         continue
                         
-        # キャッシュに保存
-        # データセットサイズを制限
-        if len(mol_ids) > max_dataset_size:
-            logger.info(f"データセットを{max_dataset_size}サンプルに制限中...")
-            random.seed(42)  # 再現性のための固定シード
-            mol_ids = random.sample(mol_ids, max_dataset_size)
-            
+        # キャッシュに保存            
         logger.info(f"mol_idsをキャッシュに保存中: {mol_id_cache_file} (合計: {len(mol_ids)}件)")
         with open(mol_id_cache_file, 'wb') as f:
             pickle.dump(mol_ids, f)
@@ -1672,9 +1682,15 @@ def main():
     logger.info(f"有効なテストデータ: {len(test_dataset)}個")
     
     # GPU使用量を最適化するためのバッチサイズ調整
-    # RTX A4500のメモリに適したバッチサイズ
-    batch_size = 16
-    num_workers = min(8, os.cpu_count())  # CPU数に応じて調整
+    # A4500のメモリに適したバッチサイズ - データセットサイズに応じて自動調整
+    if len(train_dataset) > 100000:
+        batch_size = 8  # 非常に大きなデータセット用
+    elif len(train_dataset) > 50000:
+        batch_size = 12  # 大きなデータセット用
+    else:
+        batch_size = 16  # 通常サイズのデータセット用
+        
+    num_workers = min(16, os.cpu_count())  # CPU数に応じて調整
     
     logger.info(f"バッチサイズ: {batch_size}, ワーカー数: {num_workers}")
     
@@ -1716,13 +1732,35 @@ def main():
     sample = train_dataset[0]
     node_features = sample['graph_data'].x.shape[1]
     edge_features = sample['graph_data'].edge_attr.shape[1]
-    # 軽量化モデル用に次元を削減
-    hidden_channels = 32  # メモリ消費を抑えるためにさらに次元を小さくする
+    
+    # データセットサイズに基づいて次元を調整
+    if len(train_dataset) > 100000:
+        hidden_channels = 24  # 非常に大きなデータセット用に縮小
+    else:
+        hidden_channels = 32  # 通常サイズのデータセット用
+        
     out_channels = MAX_MZ
     
-    logger.info(f"ノード特徴量次元: {node_features}")
-    logger.info(f"エッジ特徴量次元: {edge_features}")
-    logger.info(f"隠れ層次元: {hidden_channels}")
+    # 大規模データセット用にキャッシュ管理を強化
+    def limit_memory_usage(percent=85):
+        """GCを実行し、使用済みメモリをチェック。閾値を超えていたらキャッシュをクリア"""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            # GPUメモリ使用率をチェック
+            gpu_memory_allocated_percent = torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory * 100
+            if gpu_memory_allocated_percent > percent:
+                logger.warning(f"GPUメモリ使用率が高い ({gpu_memory_allocated_percent:.1f}%)。メモリ管理を強化します。")
+                # データセットのキャッシュをクリア
+                train_dataset.graph_cache.clear()
+                val_dataset.graph_cache.clear()
+                test_dataset.graph_cache.clear()
+                torch.cuda.empty_cache()
+                return True
+        return False
+    
+    # モデルの初期化前にメモリ確保
+    limit_memory_usage()
     
     # デバイスの設定
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1756,7 +1794,6 @@ def main():
     )
     
     # 学習率スケジューラー（OneCycleLR - 高速収束用）
-    num_epochs = 50  # エポック数も削減
     steps_per_epoch = len(train_loader)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -1768,6 +1805,7 @@ def main():
         final_div_factor=100.0 # 最終学習率 = max_lr/final_div_factor
     )
     
+    logger.info(f"モデルトレーニング設定: エポック数={num_epochs}, 忍耐値={patience}, バッチサイズ={batch_size}")
     logger.info("モデルのトレーニングを開始します...")
     
     # CPU、GPUキャッシュをクリア
@@ -1775,7 +1813,7 @@ def main():
     torch.cuda.empty_cache()
     
     # モデルの訓練（最適化版関数を使用）
-    train_losses, val_losses, val_cosine_similarities, best_cosine = train_model(
+            train_losses, val_losses, val_cosine_similarities, best_cosine = train_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -1785,7 +1823,7 @@ def main():
         device=device,
         num_epochs=num_epochs,
         eval_interval=2,    # 2エポックごとに評価
-        patience=7,         # 早期停止の忍耐回数
+        patience=patience,  # データセットサイズに応じた忍耐回数
         grad_clip=1.0       # 勾配クリッピング値
     )
     
@@ -1839,6 +1877,15 @@ def main():
         plt.grid(alpha=0.3)
         plt.savefig('similarity_distribution.png')
         logger.info("類似度分布を保存しました: similarity_distribution.png")
+        plt.close()
+    except Exception as e:
+        logger.error(f"追加分析エラー: {e}")
+    
+    logger.info("============= 質量スペクトル予測モデルの実行終了 =============")
+    return model, train_losses, val_losses, val_cosine_similarities, test_results
+
+if __name__ == "__main__":
+    main()ました: similarity_distribution.png")
         plt.close()
     except Exception as e:
         logger.error(f"追加分析エラー: {e}")
