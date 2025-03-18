@@ -1813,7 +1813,7 @@ def main():
     torch.cuda.empty_cache()
     
     # モデルの訓練（最適化版関数を使用）
-            train_losses, val_losses, val_cosine_similarities, best_cosine = train_model(
+    train_losses, val_losses, val_cosine_similarities, best_cosine = train_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -1877,15 +1877,6 @@ def main():
         plt.grid(alpha=0.3)
         plt.savefig('similarity_distribution.png')
         logger.info("類似度分布を保存しました: similarity_distribution.png")
-        plt.close()
-    except Exception as e:
-        logger.error(f"追加分析エラー: {e}")
-    
-    logger.info("============= 質量スペクトル予測モデルの実行終了 =============")
-    return model, train_losses, val_losses, val_cosine_similarities, test_results
-
-if __name__ == "__main__":
-    main()ました: similarity_distribution.png")
         plt.close()
     except Exception as e:
         logger.error(f"追加分析エラー: {e}")
