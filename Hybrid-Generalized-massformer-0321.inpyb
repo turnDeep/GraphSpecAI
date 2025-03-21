@@ -692,7 +692,7 @@ class OptimizedMoleculeGraphDataset(Dataset):
         self._preprocess_mol_ids()
         
     def _preprocess_mol_ids(self):
-        """有効な分子IDのみを抽出する（キャッシュ＋並列処理）"""
+        """有効な分子IDのみを抽出する（キャッシュ＋シングルスレッド処理）"""
         # キャッシュファイルのパス
         os.makedirs(self.cache_dir, exist_ok=True)
         cache_file = os.path.join(self.cache_dir, f"preprocessed_data_{hash(str(sorted(self.mol_ids)))}.pkl")
@@ -706,65 +706,24 @@ class OptimizedMoleculeGraphDataset(Dataset):
                 self.fragment_patterns = cached_data['fragment_patterns']
                 return
         
-        logger.info("分子データの前処理を開始します（並列処理）...")
+        logger.info("分子データの前処理を開始します（シングルプロセス処理）...")
         
-        # 小さいデータセットの場合、シングルプロセスで処理
-        if len(self.mol_ids) < 1000:
-            logger.info("小さいデータセット用にシングルプロセス処理を使用します")
-            valid_ids = []
-            fragment_patterns = {}
-            
-            # シングルプロセスでの処理
-            with tqdm(total=len(self.mol_ids), desc="分子の検証") as pbar:
-                process_func = partial(process_mol_id, mol_files_path=self.mol_files_path, msp_data=self.msp_data)
-                for mol_id in self.mol_ids:
-                    mol_id, fragments = process_func(mol_id)
-                    if mol_id is not None:
-                        valid_ids.append(mol_id)
-                        fragment_patterns[mol_id] = fragments
-                    pbar.update(1)
-        else:
-            # ProcessPoolExecutorで並列処理
-            cpu_count = min(os.cpu_count(), 16)  # 最大16コア使用
-            valid_ids = []
-            fragment_patterns = {}
-            
-            # 進捗表示用
-            with tqdm(total=len(self.mol_ids), desc="分子の検証") as pbar:
-                # 処理関数
-                process_func = partial(process_mol_id, mol_files_path=self.mol_files_path, msp_data=self.msp_data)
-                
-                # チャンクサイズを決定（大きなチャンクサイズでオーバーヘッドを削減）
-                chunk_size = max(50, len(self.mol_ids) // (cpu_count * 4))
-                
-                with ProcessPoolExecutor(max_workers=cpu_count) as executor:
-                    # チャンク単位で処理してメモリ効率を改善
-                    for i in range(0, len(self.mol_ids), chunk_size):
-                        chunk = self.mol_ids[i:i+chunk_size]
-                        try:
-                            results = list(executor.map(process_func, chunk))
-                            
-                            # 結果を処理
-                            for mol_id, fragments in results:
-                                if mol_id is not None:
-                                    valid_ids.append(mol_id)
-                                    fragment_patterns[mol_id] = fragments
-                            
-                            # 進捗更新
-                            pbar.update(len(chunk))
-                            
-                        except Exception as e:
-                            logger.error(f"並列処理中にエラーが発生: {str(e)}")
-                            # エラーが発生した場合、残りをシングルプロセスで処理
-                            for mol_id in chunk:
-                                try:
-                                    result = process_func(mol_id)
-                                    if result[0] is not None:  # mol_id, fragments
-                                        valid_ids.append(result[0])
-                                        fragment_patterns[result[0]] = result[1]
-                                except Exception as inner_e:
-                                    logger.warning(f"分子ID {mol_id} の処理中にエラー: {str(inner_e)}")
-                                pbar.update(1)
+        # シングルプロセスでの処理を強制
+        valid_ids = []
+        fragment_patterns = {}
+        
+        # シングルプロセスでの処理
+        with tqdm(total=len(self.mol_ids), desc="分子の検証") as pbar:
+            process_func = partial(process_mol_id, mol_files_path=self.mol_files_path, msp_data=self.msp_data)
+            for mol_id in self.mol_ids:
+                try:
+                    mol_id_result, fragments = process_func(mol_id)
+                    if mol_id_result is not None:
+                        valid_ids.append(mol_id_result)
+                        fragment_patterns[mol_id_result] = fragments
+                except Exception as e:
+                    logger.warning(f"分子ID {mol_id} の処理中にエラー: {str(e)}")
+                pbar.update(1)
         
         self.valid_mol_ids = valid_ids
         self.fragment_patterns = fragment_patterns
