@@ -26,6 +26,9 @@ from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from torch.cuda.amp import autocast, GradScaler
 
+# CUDA割り当てを明示的に制限（メモリ断片化を防ぐ）
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+
 # ロガーの設定
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -35,9 +38,11 @@ DATA_PATH = "data/"
 MOL_FILES_PATH = os.path.join(DATA_PATH, "mol_files/")
 MSP_FILE_PATH = os.path.join(DATA_PATH, "NIST17.MSP")
 CACHE_DIR = os.path.join(DATA_PATH, "cache/")
+CHECKPOINT_DIR = os.path.join(DATA_PATH, "checkpoints/")
 
-# キャッシュディレクトリの作成
+# ディレクトリの作成
 os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 # 最大m/z値の設定
 MAX_MZ = 2000
@@ -1120,7 +1125,7 @@ def cosine_similarity_loss(y_pred, y_true, important_mz=None, important_weight=3
 
 def combined_loss(y_pred, y_true, fragment_pred=None, fragment_true=None, 
                  alpha=0.2, beta=0.6, epsilon=0.2):
-    """高速化された損失関数"""
+    """高速化と安定化した損失関数"""
     # バッチサイズのチェックと調整
     if y_pred.shape[0] != y_true.shape[0]:
         min_batch_size = min(y_pred.shape[0], y_true.shape[0])
@@ -1133,6 +1138,9 @@ def combined_loss(y_pred, y_true, fragment_pred=None, fragment_true=None,
         y_pred = y_pred[:, :min_size]
         y_true = y_true[:, :min_size]
     
+    # 予測値の非常に大きい値をクリップして安定化
+    y_pred = torch.clamp(y_pred, min=0.0, max=1000.0)
+    
     # 1. MSE損失（ピーク重視）
     peak_mask = (y_true > 0).float()
     mse_weights = peak_mask * 10.0 + 1.0
@@ -1144,8 +1152,14 @@ def combined_loss(y_pred, y_true, fragment_pred=None, fragment_true=None,
     
     mse_loss = torch.mean(mse_weights * (y_pred - y_true) ** 2)
     
-    # 2. コサイン類似度損失
+    # 2. コサイン類似度損失 - 安全なバージョン
     cosine_loss = cosine_similarity_loss(y_pred, y_true, important_mz=IMPORTANT_MZ)
+    
+    # NaNをチェックして置き換え
+    if torch.isnan(mse_loss):
+        mse_loss = torch.tensor(0.1, device=y_pred.device)
+    if torch.isnan(cosine_loss):
+        cosine_loss = torch.tensor(0.1, device=y_pred.device)
     
     # 主要な損失関数の組み合わせ
     main_loss = alpha * mse_loss + beta * cosine_loss
@@ -1157,7 +1171,13 @@ def combined_loss(y_pred, y_true, fragment_pred=None, fragment_true=None,
             fragment_pred = fragment_pred[:min_batch_size]
             fragment_true = fragment_true[:min_batch_size]
         
+        # 安全なバージョンのBCE損失
+        fragment_pred = torch.clamp(fragment_pred, min=-88.0, max=88.0)
         fragment_loss = F.binary_cross_entropy_with_logits(fragment_pred, fragment_true)
+        
+        if torch.isnan(fragment_loss):
+            fragment_loss = torch.tensor(0.1, device=y_pred.device)
+            
         return main_loss + epsilon * fragment_loss
     
     return main_loss
@@ -1197,29 +1217,62 @@ def cosine_similarity_score(y_true, y_pred):
 ###############################
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, device, num_epochs,
-               eval_interval=2, patience=10, grad_clip=1.0):
-    """最適化されたモデルのトレーニング"""
+               eval_interval=2, patience=10, grad_clip=0.5, checkpoint_dir=CHECKPOINT_DIR):
+    """最適化されたモデルのトレーニング（チェックポイント機能付き）"""
     train_losses = []
     val_losses = []
     val_cosine_similarities = []
     best_cosine = 0.0
     early_stopping_counter = 0
+    start_epoch = 0
     
-    # Automatic Mixed Precision (AMP)のスケーラー
-    scaler = GradScaler()
+    # チェックポイントディレクトリの作成
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # 既存のチェックポイントがあれば読み込む
+    latest_checkpoint = None
+    for file in os.listdir(checkpoint_dir):
+        if file.startswith("checkpoint_epoch_") and file.endswith(".pth"):
+            epoch_num = int(file.split("_")[2])
+            if latest_checkpoint is None or epoch_num > start_epoch:
+                latest_checkpoint = file
+                start_epoch = epoch_num
+    
+    if latest_checkpoint:
+        checkpoint_path = os.path.join(checkpoint_dir, latest_checkpoint)
+        logger.info(f"チェックポイントを読み込み: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        train_losses = checkpoint['train_losses']
+        val_losses = checkpoint['val_losses']
+        val_cosine_similarities = checkpoint['val_cosine_similarities']
+        best_cosine = checkpoint['best_cosine']
+        early_stopping_counter = checkpoint['early_stopping_counter']
+        start_epoch = checkpoint['epoch'] + 1  # 次のエポックから開始
+        
+        # スケジューラの復元
+        if 'scheduler_state_dict' in checkpoint and scheduler is not None:
+            try:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            except:
+                logger.warning("スケジューラの状態を復元できませんでした")
+    
+    # Automatic Mixed Precision (AMP)のスケーラー - CUDA設定
+    scaler = GradScaler('cuda')
     
     # モデルをデバイスに明示的に転送
     model = model.to(device)
     
     # 合計バッチ数の計算
-    total_steps = len(train_loader) * num_epochs
-    logger.info(f"トレーニング開始: 総ステップ数 = {total_steps}")
+    total_steps = len(train_loader) * (num_epochs - start_epoch)
+    logger.info(f"トレーニング開始: 総ステップ数 = {total_steps}, 開始エポック = {start_epoch + 1}")
     
     # バッチ処理中の定期的なメモリ管理
     memory_check_interval = max(1, len(train_loader) // 10)  # 10回程度チェック
     
     # メモリ管理関数
-    def limit_memory_usage(percent=85):
+    def limit_memory_usage(percent=80):
         """GCを実行し、使用済みメモリをチェック。閾値を超えていたらキャッシュをクリア"""
         gc.collect()
         if torch.cuda.is_available():
@@ -1231,7 +1284,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 return True
         return False
     
-    for epoch in range(num_epochs):
+    # 各エポックでのトレーニング
+    for epoch in range(start_epoch, num_epochs):
         # 訓練モード
         model.train()
         epoch_loss = 0
@@ -1304,6 +1358,23 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 del loss, output, fragment_pred, processed_batch
                 torch.cuda.empty_cache()
                 
+                # バッチチェックポイント（例: 1000バッチごと）
+                if (batch_idx + 1) % 1000 == 0:
+                    batch_checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch+1}_batch_{batch_idx+1}.pth")
+                    torch.save({
+                        'epoch': epoch,
+                        'batch_idx': batch_idx,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+                        'train_losses': train_losses,
+                        'val_losses': val_losses,
+                        'val_cosine_similarities': val_cosine_similarities,
+                        'best_cosine': best_cosine,
+                        'early_stopping_counter': early_stopping_counter
+                    }, batch_checkpoint_path)
+                    logger.info(f"バッチチェックポイントを保存: {batch_checkpoint_path}")
+                
                 # 非常に大規模なデータセットでは定期的にキャッシュをクリア
                 if len(train_loader.dataset) > 100000 and batch_idx % (memory_check_interval * 2) == 0:
                     if hasattr(train_loader.dataset, 'graph_cache'):
@@ -1324,6 +1395,21 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             avg_train_loss = epoch_loss / batch_count
             train_losses.append(avg_train_loss)
             logger.info(f"Epoch {epoch+1}/{num_epochs} - 平均訓練損失: {avg_train_loss:.4f}")
+            
+            # エポックチェックポイントの保存
+            checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pth")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+                'train_losses': train_losses,
+                'val_losses': val_losses,
+                'val_cosine_similarities': val_cosine_similarities,
+                'best_cosine': best_cosine,
+                'early_stopping_counter': early_stopping_counter
+            }, checkpoint_path)
+            logger.info(f"エポックチェックポイントを保存: {checkpoint_path}")
             
             # 定期的な検証（すべてのエポックで行わない）
             if (epoch + 1) % eval_interval == 0 or epoch == num_epochs - 1:
@@ -1346,8 +1432,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 if cosine_sim > best_cosine:
                     best_cosine = cosine_sim
                     early_stopping_counter = 0
-                    torch.save(model.state_dict(), 'best_hybrid_ms_model.pth')
-                    logger.info(f"新しい最良モデル保存: コサイン類似度 = {cosine_sim:.4f}")
+                    best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
+                    torch.save(model.state_dict(), best_model_path)
+                    logger.info(f"新しい最良モデル保存: コサイン類似度 = {cosine_sim:.4f} - {best_model_path}")
                 else:
                     early_stopping_counter += 1
                     logger.info(f"早期停止カウンター: {early_stopping_counter}/{patience}")
@@ -1702,16 +1789,9 @@ def main():
     logger.info(f"有効な検証データ: {len(val_dataset)}個")
     logger.info(f"有効なテストデータ: {len(test_dataset)}個")
     
-    # GPU使用量を最適化するためのバッチサイズ調整
-    # A4500のメモリに適したバッチサイズ - データセットサイズに応じて自動調整
-    if len(train_dataset) > 100000:
-        batch_size = 8  # 非常に大きなデータセット用
-    elif len(train_dataset) > 50000:
-        batch_size = 12  # 大きなデータセット用
-    else:
-        batch_size = 16  # 通常サイズのデータセット用
-        
-    num_workers = min(16, os.cpu_count())  # CPU数に応じて調整
+    # GPU使用量を最適化するためのバッチサイズ調整（A4500向け最適化）
+    batch_size = 6  # A4500のメモリに合わせて小さく設定
+    num_workers = min(8, os.cpu_count())  # ワーカー数も制限
     
     logger.info(f"バッチサイズ: {batch_size}, ワーカー数: {num_workers}")
     
@@ -1728,7 +1808,7 @@ def main():
         prefetch_factor=2 if num_workers > 0 else None  # プリフェッチファクター
     )
     
-    val_loader = DataLoader(
+		val_loader = DataLoader(
         val_dataset, 
         batch_size=batch_size,
         shuffle=False, 
@@ -1750,7 +1830,7 @@ def main():
     )
     
     # 大規模データセット用にキャッシュ管理を強化
-    def limit_memory_usage(percent=85):
+    def limit_memory_usage(percent=80):
         """GCを実行し、使用済みメモリをチェック。閾値を超えていたらキャッシュをクリア"""
         gc.collect()
         if torch.cuda.is_available():
@@ -1778,28 +1858,17 @@ def main():
     node_features = sample['graph_data'].x.shape[1]
     edge_features = sample['graph_data'].edge_attr.shape[1]
     
-    # データセットサイズに基づいて次元を調整
-    if len(train_dataset) > 100000:
-        hidden_channels = 24  # 非常に大きなデータセット用に縮小
-    else:
-        hidden_channels = 32  # 通常サイズのデータセット用
-        
+    # データセットサイズに基づいて次元を調整 (A4500用に小さく設定)
+    hidden_channels = 20  # より小さいモデルサイズで安定性向上
     out_channels = MAX_MZ
     
     logger.info(f"ノード特徴量次元: {node_features}")
     logger.info(f"エッジ特徴量次元: {edge_features}")
     logger.info(f"隠れ層次元: {hidden_channels}")
     
-    # 大規模データセット用に動的なエポック数と早期停止設定
-    if len(train_dataset) > 100000:
-        num_epochs = 30  # 非常に大きなデータセット用に短縮
-        patience = 5     # 忍耐値を縮小
-    elif len(train_dataset) > 50000:
-        num_epochs = 40
-        patience = 6
-    else:
-        num_epochs = 50  # 通常サイズのデータセット用
-        patience = 7
+    # A4500向けに調整されたトレーニングパラメータ
+    num_epochs = 30  # エポック数
+    patience = 5    # 早期停止カウンター
     
     # デバイスの設定
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1827,19 +1896,19 @@ def main():
     criterion = combined_loss
     optimizer = torch.optim.AdamW(
         model.parameters(), 
-        lr=0.001,       # 初期学習率
-        weight_decay=1e-6,  # 重み減衰
+        lr=0.0005,       # 安定性のために学習率を低く設定
+        weight_decay=1e-5,  # 重み減衰を強化
         eps=1e-8        # 数値安定性用
     )
     
-    # 学習率スケジューラー（OneCycleLR - 高速収束用）
+    # 学習率スケジューラー（OneCycleLR - A4500向け最適化）
     steps_per_epoch = len(train_loader)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=0.003,          # 最大学習率
+        max_lr=0.001,          # 最大学習率も低く抑える
         steps_per_epoch=steps_per_epoch,
         epochs=num_epochs,
-        pct_start=0.2,         # 20%の期間でウォームアップ
+        pct_start=0.3,         # ウォームアップ期間を長くする
         div_factor=10.0,       # 初期学習率 = max_lr/div_factor
         final_div_factor=100.0 # 最終学習率 = max_lr/final_div_factor
     )
@@ -1851,7 +1920,7 @@ def main():
     gc.collect()
     torch.cuda.empty_cache()
     
-    # モデルの訓練（最適化版関数を使用）
+    # モデルの訓練（チェックポイント対応の最適化版関数を使用）
     train_losses, val_losses, val_cosine_similarities, best_cosine = train_model(
         model=model,
         train_loader=train_loader,
@@ -1861,9 +1930,10 @@ def main():
         scheduler=scheduler,
         device=device,
         num_epochs=num_epochs,
-        eval_interval=2,    # 2エポックごとに評価
-        patience=patience,  # データセットサイズに応じた忍耐回数
-        grad_clip=1.0       # 勾配クリッピング値
+        eval_interval=1,    # 毎エポック評価して早期停止に備える
+        patience=patience,  # A4500向けに設定した忍耐回数
+        grad_clip=0.5,      # 勾配クリッピング値を低く設定
+        checkpoint_dir=CHECKPOINT_DIR  # チェックポイントディレクトリを指定
     )
     
     logger.info(f"トレーニング完了！ 最良コサイン類似度: {best_cosine:.4f}")
@@ -1874,8 +1944,9 @@ def main():
     
     # 最良モデルを読み込む
     try:
-        model.load_state_dict(torch.load('best_hybrid_ms_model.pth', map_location=device))
-        logger.info("最良モデルを読み込みました")
+        best_model_path = os.path.join(CHECKPOINT_DIR, 'best_model.pth')
+        model.load_state_dict(torch.load(best_model_path, map_location=device))
+        logger.info(f"最良モデルを読み込みました: {best_model_path}")
     except Exception as e:
         logger.error(f"モデル読み込みエラー: {e}")
     
