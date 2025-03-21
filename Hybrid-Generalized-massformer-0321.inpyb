@@ -1808,7 +1808,7 @@ def main():
         prefetch_factor=2 if num_workers > 0 else None  # プリフェッチファクター
     )
     
-		val_loader = DataLoader(
+    val_loader = DataLoader(
         val_dataset, 
         batch_size=batch_size,
         shuffle=False, 
