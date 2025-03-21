@@ -97,8 +97,8 @@ CHECKPOINT_DIR = os.path.join(DATA_PATH, "checkpoints/")
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-# 最大m/z値の設定（メモリ削減のため小さくする）
-MAX_MZ = 1000  # 元の2000から1000に削減
+# 最大m/z値の設定
+MAX_MZ = 2000
 
 # 重要なm/z値のリスト
 IMPORTANT_MZ = [18, 28, 43, 57, 71, 73, 77, 91, 105, 115, 128, 152, 165, 178, 207]
