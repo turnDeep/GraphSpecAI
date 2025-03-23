@@ -12,8 +12,8 @@ import matplotlib.pyplot as plt
 from rdkit import Chem
 from rdkit.Chem import AllChem, Descriptors, MACCSkeys
 # RDKitの警告を抑制
-from rdkit import RDLogger
-RDLogger.DisableLog('rdApp.*')  # RDKitの全ての警告を無効化
+import rdkit.RDLogger as rl
+rl.DisableLog('rdApp.*') 
 
 from tqdm import tqdm
 import logging
@@ -28,6 +28,63 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from torch.cuda.amp import autocast, GradScaler
+from itertools import islice
+
+# ===== CUDA設定 =====
+# CUDA割り当てを明示的に制限（メモリ断片化を防ぐ）
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
+torch.backends.cudnn.benchmark = False  # 安定性重視で無効化
+torch.backends.cudnn.deterministic = True  # 決定論的動作を保証
+
+# メモリ使用状況のプロファイリング用関数
+def check_gpu_memory():
+    """現在のGPUメモリ使用状況を記録"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / (1024**2)
+        reserved = torch.cuda.memory_reserved() / (1024**2)
+        return f"GPU Memory: Allocated {allocated:.1f}MB, Reserved {reserved:.1f}MB"
+    return "GPU not available"
+
+# ===== 強化版メモリ管理関数 =====
+def aggressive_memory_cleanup(train_dataset=None, val_dataset=None, test_dataset=None, 
+                             force_sync=True, percent=70, purge_cache=False):
+    """強化版メモリクリーンアップ関数"""
+    gc.collect()
+    
+    if not torch.cuda.is_available():
+        return False, 0.0
+    
+    # 強制同期してGPUリソースを確実に解放
+    if force_sync:
+        torch.cuda.synchronize()
+    
+    torch.cuda.empty_cache()
+    
+    # メモリ使用率の計算
+    gpu_memory_allocated = torch.cuda.memory_allocated()
+    total_memory = torch.cuda.get_device_properties(0).total_memory
+    gpu_memory_percent = gpu_memory_allocated / total_memory * 100
+    
+    if gpu_memory_percent > percent:
+        logger.warning(f"高いGPUメモリ使用率 ({gpu_memory_percent:.1f}%)。キャッシュをクリアします。")
+        
+        if purge_cache:
+            # データセットキャッシュをクリア
+            for dataset in [train_dataset, val_dataset, test_dataset]:
+                if dataset is not None and hasattr(dataset, 'graph_cache'):
+                    dataset.graph_cache.clear()
+        
+        # もう一度クリーンアップ
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # PyTorchメモリアロケータをリセット（実験的）
+        if hasattr(torch.cuda, 'memory_stats'):
+            torch.cuda.reset_peak_memory_stats()
+        
+        return True, gpu_memory_percent
+    
+    return False, gpu_memory_percent
 
 # ロガーの設定
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -38,9 +95,11 @@ DATA_PATH = "data/"
 MOL_FILES_PATH = os.path.join(DATA_PATH, "mol_files/")
 MSP_FILE_PATH = os.path.join(DATA_PATH, "NIST17.MSP")
 CACHE_DIR = os.path.join(DATA_PATH, "cache/")
+CHECKPOINT_DIR = os.path.join(DATA_PATH, "checkpoints/")
 
-# キャッシュディレクトリの作成
+# ディレクトリの作成
 os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 # 最大m/z値の設定
 MAX_MZ = 2000
@@ -68,47 +127,6 @@ BOND_FEATURES = {
 
 # フラグメントパターンの数（MACCSキー使用）
 NUM_FRAGS = 167  # MACCSキーのビット数
-
-###############################
-# メモリ管理関連の関数
-###############################
-
-def log_gpu_memory():
-    """GPUメモリ使用状況をログに記録"""
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / 1024**3
-        reserved = torch.cuda.memory_reserved() / 1024**3
-        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
-        logger.info(f"GPU Memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB, Max={max_allocated:.2f}GB")
-
-def aggressive_memory_management(train_dataset=None, val_dataset=None, test_dataset=None, force_gc=True, threshold=70):
-    """メモリ不足エラーを防ぐための積極的なメモリ管理"""
-    if torch.cuda.is_available():
-        # PyTorch CUDAキャッシュをクリア
-        torch.cuda.empty_cache()
-        
-        # 現在のGPUメモリ使用率を取得
-        gpu_memory_allocated = torch.cuda.memory_allocated()
-        gpu_memory_total = torch.cuda.get_device_properties(0).total_memory
-        gpu_memory_percent = gpu_memory_allocated / gpu_memory_total * 100
-        
-        # メモリ使用率が閾値を超えているか、force_gcがTrueの場合
-        if gpu_memory_percent > threshold or force_gc:
-            # データセットキャッシュをクリア
-            if train_dataset is not None and hasattr(train_dataset, 'graph_cache'):
-                train_dataset.graph_cache.clear()
-            if val_dataset is not None and hasattr(val_dataset, 'graph_cache'):
-                val_dataset.graph_cache.clear()
-            if test_dataset is not None and hasattr(test_dataset, 'graph_cache'):
-                test_dataset.graph_cache.clear()
-            
-            # ガベージコレクションを強制実行
-            gc.collect()
-            torch.cuda.empty_cache()
-            
-            return True, gpu_memory_percent
-    
-    return False, 0.0
 
 ###############################
 # データ処理関連の関数
@@ -176,7 +194,7 @@ def unprocess_spec(spec, transform):
     return spec
 
 def mask_prediction_by_mass(raw_prediction, prec_mass_idx, prec_mass_offset, mask_value=0.):
-    """前駆体質量によるマスキング"""
+    """前駆体質量によるマスキング（メモリ効率化）"""
     device = raw_prediction.device
     max_idx = raw_prediction.shape[1]
     
@@ -189,15 +207,15 @@ def mask_prediction_by_mass(raw_prediction, prec_mass_idx, prec_mass_offset, mas
         # エラーを回避するために範囲外の値をクリップ
         prec_mass_idx = torch.clamp(prec_mass_idx, max=max_idx-1)
     
-    idx = torch.arange(max_idx, device=device)
-    mask = (
-        idx.unsqueeze(0) <= (
-            prec_mass_idx.unsqueeze(1) +
-            prec_mass_offset)).float()
+    # メモリ効率の良い実装
+    mask = torch.zeros_like(raw_prediction)
+    for i in range(raw_prediction.shape[0]):
+        mask[i, :prec_mass_idx[i] + prec_mass_offset + 1] = 1.0
+        
     return mask * raw_prediction + (1. - mask) * mask_value
 
 def reverse_prediction(raw_prediction, prec_mass_idx, prec_mass_offset):
-    """予測を反転する（双方向予測用）"""
+    """予測を反転する（双方向予測用）- メモリ最適化版"""
     device = raw_prediction.device
     batch_size = raw_prediction.shape[0]
     max_idx = raw_prediction.shape[1]
@@ -211,19 +229,19 @@ def reverse_prediction(raw_prediction, prec_mass_idx, prec_mass_offset):
         # エラーを回避するために範囲外の値をクリップ
         prec_mass_idx = torch.clamp(prec_mass_idx, max=max_idx-1)
     
+    # メモリ効率の良い実装
     rev_prediction = torch.flip(raw_prediction, dims=(1,))
-    offset_idx = torch.minimum(
-        max_idx * torch.ones_like(prec_mass_idx, device=device),
-        prec_mass_idx + prec_mass_offset + 1)
-    shifts = - (max_idx - offset_idx)
-    gather_idx = torch.arange(
-        max_idx,
-        device=device).unsqueeze(0).expand(
-        batch_size,
-        max_idx)
-    gather_idx = (gather_idx - shifts.unsqueeze(1)) % max_idx
-    offset_rev_prediction = torch.gather(rev_prediction, 1, gather_idx)
-    return offset_rev_prediction
+    result = torch.zeros_like(raw_prediction)
+    
+    for i in range(batch_size):
+        offset_idx = min(max_idx, prec_mass_idx[i] + prec_mass_offset + 1)
+        shift = -(max_idx - offset_idx)
+        
+        for j in range(max_idx):
+            idx = (j - shift) % max_idx
+            result[i, j] = rev_prediction[i, idx]
+    
+    return result
 
 def parse_msp_file(msp_file_path, cache_dir=CACHE_DIR):
     """MSPファイルを解析し、ID->マススペクトルのマッピングを返す（キャッシュ対応）"""
@@ -308,36 +326,40 @@ def parse_msp_file(msp_file_path, cache_dir=CACHE_DIR):
     return msp_data
 
 ###############################
-# モデル関連のコンポーネント（最適化版）
+# モデル関連のコンポーネント（GPU最適化版）
 ###############################
 
 class SqueezeExcitation(nn.Module):
-    """Squeeze-and-Excitation ブロック - 最適化版"""
+    """Squeeze-and-Excitation ブロック - 最小化版"""
     def __init__(self, channel, reduction=16):
         super(SqueezeExcitation, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        # GPU向けに隠れ層サイズをさらに小さく
         self.fc = nn.Sequential(
-            nn.Linear(channel, max(channel // reduction, 8), bias=False),
+            nn.Linear(channel, max(channel // reduction, 4), bias=False),
             nn.ReLU(inplace=True),
-            nn.Linear(max(channel // reduction, 8), channel, bias=False),
+            nn.Linear(max(channel // reduction, 4), channel, bias=False),
             nn.Sigmoid()
         )
 
     def forward(self, x):
         b, c = x.size()
-        # 高速化のためのシンプルな実装
-        y = torch.mean(x, dim=0, keepdim=True).expand(b, c)
-        y = self.fc(y).view(b, c)
+        # 超高速化実装
+        y = torch.mean(x, dim=0, keepdim=True)
+        y = self.fc(y).view(1, c).expand(b, c)
         return x * y
 
-class ResidualBlock(nn.Module):
-    """残差ブロック - 最適化版"""
+class LightweightResidualBlock(nn.Module):
+    """超軽量残差ブロック - GPU向け最適化"""
     def __init__(self, in_channels, out_channels, dropout=0.1):
-        super(ResidualBlock, self).__init__()
+        super(LightweightResidualBlock, self).__init__()
         self.conv1 = nn.Linear(in_channels, out_channels)
         self.ln1 = nn.LayerNorm(out_channels)
-        self.conv2 = nn.Linear(out_channels, out_channels)
-        self.ln2 = nn.LayerNorm(out_channels)
+        
+        # メモリ効率化のため2層目を条件付きで
+        self.use_second_layer = (in_channels != out_channels)
+        if self.use_second_layer:
+            self.conv2 = nn.Linear(out_channels, out_channels)
+            self.ln2 = nn.LayerNorm(out_channels)
         
         # 入力と出力のチャネル数が異なる場合の調整用レイヤー
         self.shortcut = nn.Sequential()
@@ -347,91 +369,126 @@ class ResidualBlock(nn.Module):
                 nn.LayerNorm(out_channels)
             )
             
-        # ドロップアウト - 少し小さくして学習加速
-        self.dropout = nn.Dropout(dropout)
+        # ドロップアウト - さらに下げて学習加速
+        self.dropout = nn.Dropout(dropout * 0.8)
         
     def forward(self, x):
         residual = self.shortcut(x)
         
         out = F.leaky_relu(self.ln1(self.conv1(x)))
-        out = self.dropout(out)
-        out = self.ln2(self.conv2(out))
+        
+        if self.use_second_layer:
+            out = self.dropout(out)
+            out = self.ln2(self.conv2(out))
         
         out += residual  # 残差接続
         out = F.leaky_relu(out)
         
         return out
 
-class AttentionBlock(nn.Module):
-    """軽量化グローバルアテンションブロック"""
-    def __init__(self, in_dim, hidden_dim, heads=2):
-        super(AttentionBlock, self).__init__()
+class MinimalAttentionBlock(nn.Module):
+    """超軽量化グローバルアテンションブロック - GPU向け"""
+    def __init__(self, in_dim, hidden_dim, heads=1):
+        super(MinimalAttentionBlock, self).__init__()
+        # ヘッド数削減（メモリ最適化）
         self.heads = heads
         self.head_dim = hidden_dim // heads
         
-        # シンプル化したアテンション
-        self.query = nn.Linear(in_dim, hidden_dim)
-        self.key = nn.Linear(in_dim, hidden_dim)
-        self.value = nn.Linear(in_dim, hidden_dim)
+        # 超シンプルなアテンション機構
+        self.qkv = nn.Linear(in_dim, hidden_dim * 3)
+        self.proj = nn.Linear(hidden_dim, in_dim)
         
-        self.attn_combine = nn.Linear(hidden_dim, hidden_dim)
-        
-        # ゲート付きグローバルアテンション - 簡素化
-        self.gate_nn = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.LeakyReLU(),
-            nn.Linear(hidden_dim, 1)
+        # 最小限のゲート機構
+        self.gate = nn.Sequential(
+            nn.Linear(in_dim, 1),
+            nn.Sigmoid()
         )
         
-        # 出力投影 - 簡素化
-        self.out_proj = nn.Linear(hidden_dim, in_dim)
         self.layer_norm = nn.LayerNorm(in_dim)
-        self.dropout = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(0.05)  # ドロップアウト率低減
         
     def forward(self, x, batch):
-        device = x.device
+        # 入力の型を保存
+        x_type = x.dtype
+        
+        # メモリ効率のためfloat32に変換
+        x = x.float()
+        
+        # ノードのバッチ処理
         batch_size = torch.max(batch).item() + 1
         
-        # マルチヘッドアテンション計算
-        q = self.query(x).view(-1, self.heads, self.head_dim)
-        k = self.key(x).view(-1, self.heads, self.head_dim)
-        v = self.value(x).view(-1, self.heads, self.head_dim)
+        # クエリ、キー、バリューを一度に計算（メモリ効率化）
+        qkv = self.qkv(x).chunk(3, dim=-1)
+        q, k, v = qkv[0], qkv[1], qkv[2]
         
-        # GlobalAttentionを使用
-        global_attention = GlobalAttention(
-            gate_nn=self.gate_nn,
-            nn=nn.Identity()  # 簡素化
-        )
+        # 単純なグローバルアテンション（メモリ効率のため簡素化）
+        global_features = []
+        for b in range(batch_size):
+            # このバッチのノードを取得
+            mask = (batch == b)
+            x_batch = x[mask]
+            
+            # このバッチのゲート値を計算
+            gate_values = self.gate(x_batch)
+            
+            # 重み付き平均でグローバル特徴を計算
+            global_feat = torch.sum(x_batch * gate_values, dim=0) / (torch.sum(gate_values) + 1e-8)
+            global_features.append(global_feat)
         
-        x_global = global_attention(x, batch)
+        # グローバル特徴をテンソルに変換
+        global_features = torch.stack(global_features)
         
-        # 結果の組み合わせ
-        out = self.out_proj(x_global)
-        out = self.layer_norm(out)
+        # 各ノードに対応するグローバル特徴を割り当て
+        out = torch.zeros_like(x)
+        for b in range(batch_size):
+            mask = (batch == b)
+            out[mask] = global_features[b]
+        
+        # 残りの処理
+        out = self.proj(out)
+        out = self.layer_norm(out + x)  # 残差接続
         out = self.dropout(out)
+        
+        # 元の型に戻す
+        out = out.to(x_type)
         
         return out
 
-class TransformerEncoderLayer(nn.Module):
-    """軽量化Transformerエンコーダーレイヤー"""
-    def __init__(self, hidden_dim, nhead, dim_feedforward=None, dropout=0.1):
-        super(TransformerEncoderLayer, self).__init__()
+class LightTransformerEncoderLayer(nn.Module):
+    """超軽量Transformerエンコーダーレイヤー - GPU専用"""
+    def __init__(self, hidden_dim, nhead, dim_feedforward=None, dropout=0.05):
+        super(LightTransformerEncoderLayer, self).__init__()
         if dim_feedforward is None:
             dim_feedforward = hidden_dim * 2
             
-        self.self_attn = nn.MultiheadAttention(hidden_dim, nhead, dropout=dropout, batch_first=True)
+        # 超軽量マルチヘッドアテンション
+        self.self_attn = nn.MultiheadAttention(
+            hidden_dim, 
+            nhead, 
+            dropout=dropout, 
+            batch_first=True
+        )
+        
+        # フィードフォワードネットワーク（さらに単純化）
         self.linear1 = nn.Linear(hidden_dim, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, hidden_dim)
         
+        # 正規化レイヤー
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout * 0.8)  # ドロップアウト率を下げる
+        self.dropout2 = nn.Dropout(dropout * 0.8)  # ドロップアウト率を下げる
         
         self.activation = F.gelu
         
     def forward(self, src):
+        # 入力型を保存
+        src_type = src.dtype
+        
+        # float32に変換（精度と安定性のため）
+        src = src.float()
+        
         # 正規化とセルフアテンション
         src2 = self.norm1(src)
         src2, _ = self.self_attn(src2, src2, src2)
@@ -442,14 +499,17 @@ class TransformerEncoderLayer(nn.Module):
         src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
         src = src + self.dropout2(src2)
         
+        # 元の型に戻す
+        src = src.to(src_type)
+        
         return src
 
 ###############################
-# 最適化されたハイブリッドモデル
+# GPU向け超軽量ハイブリッドモデル
 ###############################
 
 class OptimizedHybridMSModel(nn.Module):
-    """軽量化GNN-Transformerハイブリッドモデル（メモリ最適化版）"""
+    """GPU向け超軽量GNN-Transformerハイブリッドモデル"""
     def __init__(self, node_features, edge_features, hidden_channels, out_channels, num_fragments=NUM_FRAGS,
                  prec_mass_offset=10, bidirectional=True, gate_prediction=True):
         super(OptimizedHybridMSModel, self).__init__()
@@ -459,56 +519,45 @@ class OptimizedHybridMSModel(nn.Module):
         self.gate_prediction = gate_prediction
         self.global_features_dim = 16
         
-        # 大幅に次元を削減して軽量化
+        # 次元をさらに小さくして超軽量化
         self.hidden_channels = hidden_channels
-        self.transformer_dim = 64 if hidden_channels <= 16 else 96  # Transformer次元を大幅縮小
+        self.transformer_dim = 64  # Transformer次元をさらに縮小
         
-        # 勾配チェックポイントを有効化してメモリ効率向上
-        self.use_checkpointing = True
-        
-        # GNNレイヤー - 軽量化
-        self.gat1 = GATv2Conv(node_features, hidden_channels, edge_dim=edge_features, heads=2)
-        self.gat2 = GATv2Conv(hidden_channels*2, hidden_channels, edge_dim=edge_features, heads=2)
-        
-        # 後段のGATレイヤーを削減
-        self.gat3 = GATv2Conv(hidden_channels*2, hidden_channels, edge_dim=edge_features, heads=2)
+        # GNNレイヤー - 超軽量化
+        self.gat1 = GATv2Conv(node_features, hidden_channels, edge_dim=edge_features, heads=1)
+        self.gat2 = GATv2Conv(hidden_channels, hidden_channels, edge_dim=edge_features, heads=1)
         
         # スキップ接続
-        self.skip_connection1 = nn.Linear(hidden_channels*2, hidden_channels*2)
+        self.skip_connection1 = nn.Linear(hidden_channels, hidden_channels)
         
-        # グローバル特徴量処理
+        # グローバル特徴量処理（簡素化）
         self.global_proj = nn.Sequential(
             nn.Linear(self.global_features_dim, hidden_channels),
-            nn.LeakyReLU(),
-            nn.LayerNorm(hidden_channels)
+            nn.LeakyReLU()
         )
         
         # 特徴量の次元をTransformer入力用に変換
-        self.transformer_projection = nn.Linear(hidden_channels*3, self.transformer_dim)
+        self.transformer_projection = nn.Linear(hidden_channels*2, self.transformer_dim)
         
-        # 軽量Transformerエンコーダー - ヘッド数削減
-        self.transformer_encoder = TransformerEncoderLayer(
+        # 超軽量Transformerエンコーダー
+        self.transformer_encoder = LightTransformerEncoderLayer(
             hidden_dim=self.transformer_dim,
-            nhead=2,  # ヘッド数を大幅に削減
+            nhead=2,  # ヘッド数を最小限に
             dim_feedforward=self.transformer_dim*2,
-            dropout=0.1
+            dropout=0.05  # ドロップアウト率も下げる
         )
         
         # Transformer出力を元の次元に戻す
-        self.transformer_unprojection = nn.Linear(self.transformer_dim, hidden_channels*2)
+        self.transformer_unprojection = nn.Linear(self.transformer_dim, hidden_channels)
         
-        # スペクトル予測のための全結合層 - 層を削減
+        # スペクトル予測のための全結合層 - 最小化
         self.fc_layers = nn.ModuleList([
-            ResidualBlock(hidden_channels*2, hidden_channels*2),
-            ResidualBlock(hidden_channels*2, hidden_channels)
+            LightweightResidualBlock(hidden_channels, hidden_channels, dropout=0.05)
         ])
         
-        # マルチタスク学習: フラグメントパターン予測
+        # マルチタスク学習: フラグメントパターン予測（シンプル化）
         self.fragment_pred = nn.Sequential(
-            nn.Linear(hidden_channels, hidden_channels//2),
-            nn.LeakyReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_channels//2, num_fragments),
+            nn.Linear(hidden_channels, num_fragments)
         )
         
         # 双方向予測用レイヤー
@@ -529,10 +578,10 @@ class OptimizedHybridMSModel(nn.Module):
                 )
         
         # レイヤー正規化
-        self.ln1 = nn.LayerNorm(hidden_channels*2)
-        self.ln2 = nn.LayerNorm(hidden_channels)
+        self.ln1 = nn.LayerNorm(hidden_channels)
         
-        self.dropout = nn.Dropout(0.2)
+        # ドロップアウト率下げる
+        self.dropout = nn.Dropout(0.05)
         
         # 重み初期化
         self._init_weights()
@@ -541,14 +590,21 @@ class OptimizedHybridMSModel(nn.Module):
         """重みの初期化（収束を高速化）"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                # 小さな初期値で数値安定性向上
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu', a=0.1)
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+                    nn.init.zeros_(m.bias)
             elif isinstance(m, nn.BatchNorm1d) or isinstance(m, nn.LayerNorm):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+                if hasattr(m, 'weight') and m.weight is not None:
+                    nn.init.ones_(m.weight)
+                if hasattr(m, 'bias') and m.bias is not None:
+                    nn.init.zeros_(m.bias)
     
     def forward(self, data):
+        # グラデーションチェックポイントを使用（メモリ効率化）
+        return torch.utils.checkpoint.checkpoint(self._forward_impl, data)
+    
+    def _forward_impl(self, data):
         device = next(self.parameters()).device
         
         if isinstance(data, dict):  # MassFormer形式の入力
@@ -574,98 +630,58 @@ class OptimizedHybridMSModel(nn.Module):
             else:
                 prec_mz_bin = None
         
-        # 特徴量の型変換（最適化）
-        x = x.float()
-        edge_attr = edge_attr.float()
-        
-        # メモリ使用量削減: 半精度を使用（オプション）
-        if torch.cuda.is_available() and hasattr(torch.cuda, 'amp') and torch.cuda.amp.autocast_mode.is_enabled():
+        # 特徴量の型変換（最適化）- メモリ節約のためfloat16を試す
+        # ただし数値安定性が低下する場合はコメントアウト
+        if torch.cuda.is_available():
             x = x.half()
             edge_attr = edge_attr.half()
         
-        # グローバル属性のリシェイプとバッチサイズ調整（メモリ効率化）
-        if global_attr is not None:
-            if len(global_attr.shape) == 1:
-                num_graphs = batch[-1].item() + 1
-                global_attr = global_attr.view(num_graphs, -1)
-                # 期待する次元にパディング
-                if global_attr.shape[1] != self.global_features_dim:
-                    padded = torch.zeros(num_graphs, self.global_features_dim, device=device)
-                    copy_size = min(global_attr.shape[1], self.global_features_dim)
-                    padded[:, :copy_size] = global_attr[:, :copy_size]
-                    global_attr = padded
+        # GATレイヤーを通す - 段数削減
+        x1 = F.leaky_relu(self.gat1(x, edge_index, edge_attr))
+        x1 = self.dropout(x1)
         
-        # 勾配チェックポイントを使用してGATレイヤーを通す（トレーニング時のみ）
-        if self.use_checkpointing and self.training and hasattr(torch.utils.checkpoint, 'checkpoint'):
-            # GAT層をチェックポイントでラップしてメモリ使用量を削減
-            x1 = torch.utils.checkpoint.checkpoint(
-                lambda x, e_idx, e_attr: F.leaky_relu(self.gat1(x, e_idx, e_attr)),
-                x, edge_index, edge_attr
-            )
-            x1 = self.dropout(x1)
-            
-            x2 = torch.utils.checkpoint.checkpoint(
-                lambda x, e_idx, e_attr: F.leaky_relu(self.gat2(x, e_idx, e_attr)),
-                x1, edge_index, edge_attr
-            )
-            x2 = self.dropout(x2)
-        else:
-            # 通常のGATレイヤー処理
-            x1 = F.leaky_relu(self.gat1(x, edge_index, edge_attr))
-            x1 = self.dropout(x1)
-            
-            x2 = F.leaky_relu(self.gat2(x1, edge_index, edge_attr))
-            x2 = self.dropout(x2)
+        x2 = F.leaky_relu(self.gat2(x1, edge_index, edge_attr))
         
         # スキップ接続1
         x1_transformed = self.skip_connection1(x1)
         x2 = x2 + x1_transformed
         x2 = self.ln1(x2)
         
-        # 最後のGATレイヤー（チェックポイントあり/なし）
-        if self.use_checkpointing and self.training and hasattr(torch.utils.checkpoint, 'checkpoint'):
-            x3 = torch.utils.checkpoint.checkpoint(
-                lambda x, e_idx, e_attr: F.leaky_relu(self.gat3(x, e_idx, e_attr)),
-                x2, edge_index, edge_attr
-            )
-        else:
-            x3 = F.leaky_relu(self.gat3(x2, edge_index, edge_attr))
-        
         # グローバルプーリング - シンプル化
-        x_graph = global_mean_pool(x3, batch)
+        x_graph = global_mean_pool(x2, batch)
         
         # グローバル特徴量の処理
         if global_attr is not None:
+            if len(global_attr.shape) == 1:
+                num_graphs = batch.max().item() + 1
+                global_attr = global_attr.view(num_graphs, -1)
+                # 期待する次元にパディング
+                if global_attr.shape[1] != self.global_features_dim:
+                    padded = torch.zeros(num_graphs, self.global_features_dim, device=device, dtype=x_graph.dtype)
+                    copy_size = min(global_attr.shape[1], self.global_features_dim)
+                    padded[:, :copy_size] = global_attr[:, :copy_size]
+                    global_attr = padded
+            
             global_features = self.global_proj(global_attr)
             # 特徴量の結合
             x_combined = torch.cat([x_graph, global_features], dim=1)
         else:
             # グローバル特徴がない場合はゼロパディング
-            dummy_global_features = torch.zeros(x_graph.size(0), x_graph.size(1)//2, device=device)
+            dummy_global_features = torch.zeros(x_graph.size(0), x_graph.size(1), device=device, dtype=x_graph.dtype)
             x_combined = torch.cat([x_graph, dummy_global_features], dim=1)
         
         # 特徴量の次元をTransformer入力次元に変換
         x_for_transformer = self.transformer_projection(x_combined)
         
-        # Transformerエンコーダー処理（チェックポイントあり/なし）
-        if self.use_checkpointing and self.training and hasattr(torch.utils.checkpoint, 'checkpoint'):
-            x_transformed = torch.utils.checkpoint.checkpoint(
-                self.transformer_encoder, x_for_transformer
-            )
-        else:
-            x_transformed = self.transformer_encoder(x_for_transformer)
+        # Transformerエンコーダー処理
+        x_transformed = self.transformer_encoder(x_for_transformer)
         
         # Transformer出力を元の次元に戻す
         x_combined = self.transformer_unprojection(x_transformed)
         
-        # 残差ブロックを通した特徴抽出（メモリ効率向上のためチェックポイント使用）
+        # 残差ブロックを通した特徴抽出
         for i, fc_layer in enumerate(self.fc_layers):
-            if self.use_checkpointing and self.training and hasattr(torch.utils.checkpoint, 'checkpoint'):
-                x_combined = torch.utils.checkpoint.checkpoint(fc_layer, x_combined)
-            else:
-                x_combined = fc_layer(x_combined)
-            if i < len(self.fc_layers) - 1:
-                x_combined = self.dropout(x_combined)
+            x_combined = fc_layer(x_combined)
         
         # マルチタスク学習: フラグメントパターン予測
         fragment_pred = self.fragment_pred(x_combined)
@@ -704,57 +720,43 @@ class OptimizedHybridMSModel(nn.Module):
         return output, fragment_pred
 
 ###############################
-# 最適化データセット
+# GPU向け最適化データセット
 ###############################
 
 def process_mol_id(mol_id, mol_files_path, msp_data):
-    """単一分子IDの処理（並列処理用）"""
+    """単一分子IDの処理（並列処理用）- メモリ効率向上"""
     # RDKitの警告を抑制
-    with RDLogger.DisableLog():
-        mol_file = os.path.join(mol_files_path, f"ID{mol_id}.MOL")
-        try:
-            # 分子ファイルが読み込めるか確認
-            mol = Chem.MolFromMolFile(mol_file, sanitize=False)
-            if mol is None:
-                return None, None
-            
-            # 分子の基本的なサニタイズを試みる
-            try:
-                # プロパティキャッシュを更新
-                for atom in mol.GetAtoms():
-                    atom.UpdatePropertyCache(strict=False)
-                
-                # 部分的なサニタイズ
-                Chem.SanitizeMol(mol, 
-                               sanitizeOps=Chem.SanitizeFlags.SANITIZE_FINDRADICALS|
-                                          Chem.SanitizeFlags.SANITIZE_KEKULIZE|
-                                          Chem.SanitizeFlags.SANITIZE_SETAROMATICITY|
-                                          Chem.SanitizeFlags.SANITIZE_SETCONJUGATION|
-                                          Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION|
-                                          Chem.SanitizeFlags.SANITIZE_SYMMRINGS,
-                               catchErrors=True)
-            except Exception:
-                return None, None
-            
-            # MACCSフィンガープリントを計算
-            try:
-                maccs = MACCSkeys.GenMACCSKeys(mol)
-                fragments = np.zeros(NUM_FRAGS)
-                for i in range(NUM_FRAGS):
-                    if maccs.GetBit(i):
-                        fragments[i] = 1.0
-            except Exception:
-                fragments = np.zeros(NUM_FRAGS)
-                
-            # この分子のスペクトルがあるか確認
-            if mol_id not in msp_data:
-                return None, None
-                
-            return mol_id, fragments
-        except Exception:
+    import rdkit.RDLogger as rl
+    rl.DisableLog('rdApp.*')
+    
+    mol_file = os.path.join(mol_files_path, f"ID{mol_id}.MOL")
+    try:
+        # 分子ファイルが読み込めるか確認
+        mol = Chem.MolFromMolFile(mol_file, sanitize=False)
+        if mol is None:
             return None, None
+        
+        # 軽量処理（極限まで単純化）
+        try:
+            # シンプルなMACCSキー計算
+            maccs = MACCSkeys.GenMACCSKeys(mol)
+            fragments = np.zeros(NUM_FRAGS, dtype=np.float32)  # 明示的にfloat32型に
+            for i in range(NUM_FRAGS):
+                if maccs.GetBit(i):
+                    fragments[i] = 1.0
+        except Exception:
+            fragments = np.zeros(NUM_FRAGS, dtype=np.float32)
+            
+        # この分子のスペクトルがあるか確認
+        if mol_id not in msp_data:
+            return None, None
+            
+        return mol_id, fragments
+    except Exception:
+        return None, None
 
 class OptimizedMoleculeGraphDataset(Dataset):
+    """GPU向け超最適化分子グラフデータセット"""
     def __init__(self, mol_ids, mol_files_path, msp_data, transform="log10over3", 
                 normalization="l1", augment=False, cache_dir=CACHE_DIR, max_cache_size=2000):
         self.mol_ids = mol_ids
@@ -774,14 +776,16 @@ class OptimizedMoleculeGraphDataset(Dataset):
         # 前処理で有効な分子IDを抽出（キャッシュ使用）
         self._preprocess_mol_ids()
         
-    def _manage_cache(self):
-        """メモリ不足防止のためのキャッシュサイズ管理"""
+    def _check_cache_size(self):
+        """キャッシュサイズを制限する関数"""
         if len(self.graph_cache) > self.max_cache_size:
-            # 最も古いアイテムを削除（単純LRU戦略）
-            remove_count = len(self.graph_cache) - self.max_cache_size
-            keys_to_remove = list(self.graph_cache.keys())[:remove_count]
+            # 最大サイズの80%まで減らす
+            items_to_remove = int(self.max_cache_size * 0.2)
+            keys_to_remove = random.sample(list(self.graph_cache.keys()), items_to_remove)
             for key in keys_to_remove:
                 del self.graph_cache[key]
+            gc.collect()
+            logger.debug(f"グラフキャッシュを削減: {items_to_remove}個のアイテムを削除")
     
     def get_cache_stats(self):
         """キャッシュヒット/ミス統計の取得"""
@@ -795,7 +799,7 @@ class OptimizedMoleculeGraphDataset(Dataset):
         }
         
     def _preprocess_mol_ids(self):
-        """有効な分子IDのみを抽出する（キャッシュ＋並列処理）"""
+        """有効な分子IDのみを抽出する（キャッシュ＋シングルスレッド処理）"""
         # キャッシュファイルのパス
         os.makedirs(self.cache_dir, exist_ok=True)
         cache_file = os.path.join(self.cache_dir, f"preprocessed_data_{hash(str(sorted(self.mol_ids)))}.pkl")
@@ -809,35 +813,28 @@ class OptimizedMoleculeGraphDataset(Dataset):
                 self.fragment_patterns = cached_data['fragment_patterns']
                 return
         
-        logger.info("分子データの前処理を開始します（並列処理）...")
+        logger.info("分子データの前処理を開始します（シングルプロセス処理）...")
         
-        # ProcessPoolExecutorで並列処理
-        cpu_count = min(os.cpu_count(), 16)  # 最大16コア使用
+        # シングルプロセスでの処理を強制
         valid_ids = []
         fragment_patterns = {}
         
-        # 進捗表示用
+        # シングルプロセスでの処理
         with tqdm(total=len(self.mol_ids), desc="分子の検証") as pbar:
-            # 処理関数
             process_func = partial(process_mol_id, mol_files_path=self.mol_files_path, msp_data=self.msp_data)
-            
-            # チャンクサイズを決定（大きなチャンクサイズでオーバーヘッドを削減）
-            chunk_size = max(100, len(self.mol_ids) // (cpu_count * 4))
-            
-            with ProcessPoolExecutor(max_workers=cpu_count) as executor:
-                # チャンク単位で処理してメモリ効率を改善
-                for i in range(0, len(self.mol_ids), chunk_size):
-                    chunk = self.mol_ids[i:i+chunk_size]
-                    results = list(executor.map(process_func, chunk))
-                    
-                    # 結果を処理
-                    for mol_id, fragments in results:
-                        if mol_id is not None:
-                            valid_ids.append(mol_id)
-                            fragment_patterns[mol_id] = fragments
-                    
-                    # 進捗更新
-                    pbar.update(len(chunk))
+            for mol_id in self.mol_ids:
+                try:
+                    mol_id_result, fragments = process_func(mol_id)
+                    if mol_id_result is not None:
+                        valid_ids.append(mol_id_result)
+                        fragment_patterns[mol_id_result] = fragments
+                        
+                        # 定期的にガベージコレクト
+                        if len(valid_ids) % 1000 == 0:
+                            gc.collect()
+                except Exception as e:
+                    logger.warning(f"分子ID {mol_id} の処理中にエラー: {str(e)}")
+                pbar.update(1)
         
         self.valid_mol_ids = valid_ids
         self.fragment_patterns = fragment_patterns
@@ -853,13 +850,16 @@ class OptimizedMoleculeGraphDataset(Dataset):
         logger.info(f"有効な分子: {len(valid_ids)}個 / 全体: {len(self.mol_ids)}個")
         
     def _mol_to_graph(self, mol_file):
-        """分子をグラフに変換（キャッシュ対応）"""
-        # メモリキャッシュをチェック
+        """分子をグラフに変換（キャッシュ対応・メモリ最適化）"""
+        # キャッシュをチェック
         if mol_file in self.graph_cache:
             self.cache_hits += 1
             return self.graph_cache[mol_file]
         
         self.cache_misses += 1
+        
+        # キャッシュサイズ確認
+        self._check_cache_size()
         
         # キャッシュファイルのパス
         cache_file = os.path.join(self.cache_dir, f"graph_cache_{os.path.basename(mol_file)}.pkl")
@@ -871,249 +871,244 @@ class OptimizedMoleculeGraphDataset(Dataset):
                     graph_data = pickle.load(f)
                     # メモリキャッシュに追加
                     self.graph_cache[mol_file] = graph_data
-                    self._manage_cache()  # キャッシュサイズ管理
                     return graph_data
             except Exception:
                 # キャッシュが壊れている場合は再計算
                 pass
         
         # RDKitの警告を抑制
-        with RDLogger.DisableLog():
-            # RDKitでMOLファイルを読み込む
-            mol = Chem.MolFromMolFile(mol_file, sanitize=False)
-            if mol is None:
-                raise ValueError(f"Could not read molecule from {mol_file}")
-            
-            try:
-                # プロパティキャッシュを更新して暗黙的な原子価を計算
-                for atom in mol.GetAtoms():
-                    atom.UpdatePropertyCache(strict=False)
-                
-                # 部分的なサニタイズ
-                Chem.SanitizeMol(mol, 
-                               sanitizeOps=Chem.SanitizeFlags.SANITIZE_FINDRADICALS|
-                                          Chem.SanitizeFlags.SANITIZE_KEKULIZE|
-                                          Chem.SanitizeFlags.SANITIZE_SETAROMATICITY|
-                                          Chem.SanitizeFlags.SANITIZE_SETCONJUGATION|
-                                          Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION|
-                                          Chem.SanitizeFlags.SANITIZE_SYMMRINGS,
-                               catchErrors=True)
-                
-                # 明示的な水素を追加（安全モード）
-                try:
-                    mol = Chem.AddHs(mol)
-                except:
-                    pass
-            except Exception:
-                # エラーを無視して処理を続行
-                pass
-            
-            # 原子情報を取得
-            num_atoms = mol.GetNumAtoms()
-            x = []
-            
-            # 環情報の取得
-            ring_info = mol.GetRingInfo()
-            rings = []
-            try:
-                rings = ring_info.AtomRings()
-            except:
-                # 環情報取得に失敗した場合は空リストを使う
-                pass
-            
+        import rdkit.RDLogger as rl
+        rl.DisableLog('rdApp.*')
+        
+        # RDKitでMOLファイルを読み込む
+        mol = Chem.MolFromMolFile(mol_file, sanitize=False)
+        if mol is None:
+            raise ValueError(f"Could not read molecule from {mol_file}")
+        
+        try:
+            # プロパティキャッシュを更新して暗黙的な原子価を計算
             for atom in mol.GetAtoms():
-                atom_symbol = atom.GetSymbol()
-                atom_feature_idx = ATOM_FEATURES.get(atom_symbol, ATOM_FEATURES['OTHER'])
+                atom.UpdatePropertyCache(strict=False)
+            
+            # 部分的なサニタイズ
+            Chem.SanitizeMol(mol, 
+                           sanitizeOps=Chem.SanitizeFlags.SANITIZE_FINDRADICALS|
+                                      Chem.SanitizeFlags.SANITIZE_KEKULIZE|
+                                      Chem.SanitizeFlags.SANITIZE_SETAROMATICITY|
+                                      Chem.SanitizeFlags.SANITIZE_SETCONJUGATION|
+                                      Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION|
+                                      Chem.SanitizeFlags.SANITIZE_SYMMRINGS,
+                           catchErrors=True)
+        except Exception:
+            # エラーを無視して処理を続行
+            pass
+        
+        # 原子情報を取得
+        num_atoms = mol.GetNumAtoms()
+        x = []
+        
+        # 環情報の取得（エラーハンドリング改善）
+        rings = []
+        try:
+            ring_info = mol.GetRingInfo()
+            if ring_info is not None:
+                rings = ring_info.AtomRings()
+        except:
+            # 環情報取得に失敗した場合は空リストを使う
+            pass
+        
+        for atom in mol.GetAtoms():
+            atom_symbol = atom.GetSymbol()
+            atom_feature_idx = ATOM_FEATURES.get(atom_symbol, ATOM_FEATURES['OTHER'])
+            
+            # 基本的な原子タイプの特徴
+            atom_feature = [0] * len(ATOM_FEATURES)
+            atom_feature[atom_feature_idx] = 1
+            
+            # 安全なメソッド呼び出し
+            try:
+                degree = atom.GetDegree() / 8.0
+            except:
+                degree = 0.0
                 
-                # 基本的な原子タイプの特徴
-                atom_feature = [0] * len(ATOM_FEATURES)
-                atom_feature[atom_feature_idx] = 1
+            try:
+                formal_charge = atom.GetFormalCharge() / 8.0
+            except:
+                formal_charge = 0.0
                 
-                # 安全なメソッド呼び出し
+            try:
+                radical_electrons = atom.GetNumRadicalElectrons() / 4.0
+            except:
+                radical_electrons = 0.0
+                
+            try:
+                is_aromatic = atom.GetIsAromatic() * 1.0
+            except:
+                is_aromatic = 0.0
+                
+            try:
+                atom_mass = atom.GetMass() / 200.0
+            except:
+                atom_mass = 0.0
+                
+            try:
+                is_in_ring = atom.IsInRing() * 1.0
+            except:
+                is_in_ring = 0.0
+                
+            try:
+                hybridization = int(atom.GetHybridization()) / 8.0
+            except:
+                hybridization = 0.0
+                
+            try:
+                explicit_valence = atom.GetExplicitValence() / 8.0
+            except:
+                explicit_valence = 0.0
+                
+            try:
+                implicit_valence = atom.GetImplicitValence() / 8.0
+            except:
+                implicit_valence = 0.0
+                
+            # 環特徴量
+            try:
+                is_in_aromatic_ring = (atom.GetIsAromatic() and atom.IsInRing()) * 1.0
+            except:
+                is_in_aromatic_ring = 0.0
+                
+            try:
+                ring_size = 0
+                atom_idx = atom.GetIdx()
+                for ring in rings:
+                    if atom_idx in ring:
+                        ring_size = max(ring_size, len(ring))
+                ring_size = ring_size / 8.0
+            except:
+                ring_size = 0.0
+                
+            try:
+                num_h = atom.GetTotalNumHs() / 8.0
+            except:
+                num_h = 0.0
+            
+            # 簡素化した特徴リスト - 計算効率を向上
+            additional_features = [
+                degree, formal_charge, radical_electrons, is_aromatic,
+                atom_mass, is_in_ring, hybridization, explicit_valence, 
+                implicit_valence, is_in_aromatic_ring, ring_size, num_h
+            ]
+            
+            # すべての特徴を結合
+            atom_feature.extend(additional_features)
+            x.append(atom_feature)
+        
+        # 結合情報を取得
+        edge_indices = []
+        edge_attrs = []
+        for bond in mol.GetBonds():
+            try:
+                i = bond.GetBeginAtomIdx()
+                j = bond.GetEndAtomIdx()
+                
+                # 結合タイプ
                 try:
-                    degree = atom.GetDegree() / 8.0
+                    bond_type = BOND_FEATURES.get(bond.GetBondType(), BOND_FEATURES[Chem.rdchem.BondType.SINGLE])
                 except:
-                    degree = 0.0
-                    
+                    bond_type = BOND_FEATURES[Chem.rdchem.BondType.SINGLE]
+                
+                # 双方向のエッジを追加
+                edge_indices.append([i, j])
+                edge_indices.append([j, i])
+                
+                # 簡素化したボンド特徴量
+                bond_feature = [0] * len(BOND_FEATURES)
+                bond_feature[bond_type] = 1
+                
+                # 安全な追加ボンド特徴量の取得
                 try:
-                    formal_charge = atom.GetFormalCharge() / 8.0
-                except:
-                    formal_charge = 0.0
-                    
-                try:
-                    radical_electrons = atom.GetNumRadicalElectrons() / 4.0
-                except:
-                    radical_electrons = 0.0
-                    
-                try:
-                    is_aromatic = atom.GetIsAromatic() * 1.0
-                except:
-                    is_aromatic = 0.0
-                    
-                try:
-                    atom_mass = atom.GetMass() / 200.0
-                except:
-                    atom_mass = 0.0
-                    
-                try:
-                    is_in_ring = atom.IsInRing() * 1.0
+                    is_in_ring = bond.IsInRing() * 1.0
                 except:
                     is_in_ring = 0.0
                     
                 try:
-                    hybridization = int(atom.GetHybridization()) / 8.0
+                    is_conjugated = bond.GetIsConjugated() * 1.0
                 except:
-                    hybridization = 0.0
+                    is_conjugated = 0.0
                     
                 try:
-                    explicit_valence = atom.GetExplicitValence() / 8.0
+                    is_aromatic = bond.GetIsAromatic() * 1.0
                 except:
-                    explicit_valence = 0.0
-                    
-                try:
-                    implicit_valence = atom.GetImplicitValence() / 8.0
-                except:
-                    implicit_valence = 0.0
-                    
-                # 追加の環境特徴量
-                try:
-                    is_in_aromatic_ring = (atom.GetIsAromatic() and atom.IsInRing()) * 1.0
-                except:
-                    is_in_aromatic_ring = 0.0
-                    
-                try:
-                    ring_size = 0
-                    atom_idx = atom.GetIdx()
-                    for ring in rings:
-                        if atom_idx in ring:
-                            ring_size = max(ring_size, len(ring))
-                    ring_size = ring_size / 8.0
-                except:
-                    ring_size = 0.0
-                    
-                try:
-                    num_h = atom.GetTotalNumHs() / 8.0
-                except:
-                    num_h = 0.0
+                    is_aromatic = 0.0
                 
-                # 簡素化した特徴リスト - 計算効率を向上
-                additional_features = [
-                    degree, formal_charge, radical_electrons, is_aromatic,
-                    atom_mass, is_in_ring, hybridization, explicit_valence, 
-                    implicit_valence, is_in_aromatic_ring, ring_size, num_h
-                ]
+                additional_bond_features = [is_in_ring, is_conjugated, is_aromatic]
                 
-                # すべての特徴を結合
-                atom_feature.extend(additional_features)
-                x.append(atom_feature)
-            
-            # 結合情報を取得
-            edge_indices = []
-            edge_attrs = []
-            for bond in mol.GetBonds():
-                try:
-                    i = bond.GetBeginAtomIdx()
-                    j = bond.GetEndAtomIdx()
-                    
-                    # 結合タイプ
-                    try:
-                        bond_type = BOND_FEATURES.get(bond.GetBondType(), BOND_FEATURES[Chem.rdchem.BondType.SINGLE])
-                    except:
-                        bond_type = BOND_FEATURES[Chem.rdchem.BondType.SINGLE]
-                    
-                    # 双方向のエッジを追加
-                    edge_indices.append([i, j])
-                    edge_indices.append([j, i])
-                    
-                    # 簡素化したボンド特徴量
-                    bond_feature = [0] * len(BOND_FEATURES)
-                    bond_feature[bond_type] = 1
-                    
-                    # 安全な追加ボンド特徴量の取得
-                    try:
-                        is_in_ring = bond.IsInRing() * 1.0
-                    except:
-                        is_in_ring = 0.0
-                        
-                    try:
-                        is_conjugated = bond.GetIsConjugated() * 1.0
-                    except:
-                        is_conjugated = 0.0
-                        
-                    try:
-                        is_aromatic = bond.GetIsAromatic() * 1.0
-                    except:
-                        is_aromatic = 0.0
-                    
-                    additional_bond_features = [is_in_ring, is_conjugated, is_aromatic]
-                    
-                    bond_feature.extend(additional_bond_features)
-                    edge_attrs.append(bond_feature)
-                    edge_attrs.append(bond_feature)  # 双方向なので同じ属性
-                except Exception:
-                    continue
-            
-            # 分子全体の特徴量 - 簡素化
-            mol_features = [0.0] * 16
-            
-            try:
-                mol_features[0] = Descriptors.MolWt(mol) / 1000.0  # 分子量
-            except:
-                pass
-                
-            try:
-                mol_features[1] = Descriptors.NumHAcceptors(mol) / 20.0  # 水素結合アクセプター数
-            except:
-                pass
-                
-            try:
-                mol_features[2] = Descriptors.NumHDonors(mol) / 10.0  # 水素結合ドナー数
-            except:
-                pass
-                
-            try:
-                mol_features[3] = Descriptors.TPSA(mol) / 200.0  # トポロジカル極性表面積
-            except:
-                pass
-            
-            # エッジが存在するか確認
-            if not edge_indices:
-                # 単一原子分子の場合や結合情報が取得できない場合、セルフループを追加
-                for i in range(num_atoms):
-                    edge_indices.append([i, i])
-                    
-                    bond_feature = [0] * len(BOND_FEATURES)
-                    bond_feature[BOND_FEATURES[Chem.rdchem.BondType.SINGLE]] = 1
-                    
-                    # ダミーの追加特徴量
-                    additional_bond_features = [0.0, 0.0, 0.0]
-                    bond_feature.extend(additional_bond_features)
-                    edge_attrs.append(bond_feature)
-            
-            # PyTorch Geometricのデータ形式に変換
-            x = torch.FloatTensor(x)
-            edge_index = torch.LongTensor(edge_indices).t().contiguous()
-            edge_attr = torch.FloatTensor(edge_attrs)
-            global_attr = torch.FloatTensor(mol_features)
-            
-            # グラフデータを作成
-            graph_data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, global_attr=global_attr)
-            
-            # キャッシュに保存
-            self.graph_cache[mol_file] = graph_data
-            self._manage_cache()  # キャッシュサイズ管理
-            
-            # ディスクキャッシュにも保存
-            try:
-                with open(cache_file, 'wb') as f:
-                    pickle.dump(graph_data, f)
+                bond_feature.extend(additional_bond_features)
+                edge_attrs.append(bond_feature)
+                edge_attrs.append(bond_feature)  # 双方向なので同じ属性
             except Exception:
-                pass
+                continue
+        
+        # 分子全体の特徴量 - 簡素化
+        mol_features = [0.0] * 16
+        
+        try:
+            mol_features[0] = Descriptors.MolWt(mol) / 1000.0  # 分子量
+        except:
+            pass
             
-            return graph_data
+        try:
+            mol_features[1] = Descriptors.NumHAcceptors(mol) / 20.0  # 水素結合アクセプター数
+        except:
+            pass
+            
+        try:
+            mol_features[2] = Descriptors.NumHDonors(mol) / 10.0  # 水素結合ドナー数
+        except:
+            pass
+            
+        try:
+            mol_features[3] = Descriptors.TPSA(mol) / 200.0  # トポロジカル極性表面積
+        except:
+            pass
+        
+        # エッジが存在するか確認
+        if not edge_indices:
+            # 単一原子分子の場合や結合情報が取得できない場合、セルフループを追加
+            for i in range(num_atoms):
+                edge_indices.append([i, i])
+                
+                bond_feature = [0] * len(BOND_FEATURES)
+                bond_feature[BOND_FEATURES[Chem.rdchem.BondType.SINGLE]] = 1
+                
+                # ダミーの追加特徴量
+                additional_bond_features = [0.0, 0.0, 0.0]
+                bond_feature.extend(additional_bond_features)
+                edge_attrs.append(bond_feature)
+        
+        # PyTorch Geometricのデータ形式に変換
+        x = torch.FloatTensor(x)
+        edge_index = torch.LongTensor(edge_indices).t().contiguous()
+        edge_attr = torch.FloatTensor(edge_attrs)
+        global_attr = torch.FloatTensor(mol_features)
+        
+        # グラフデータを作成
+        graph_data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, global_attr=global_attr)
+        
+        # キャッシュに保存
+        self.graph_cache[mol_file] = graph_data
+        
+        # ディスクキャッシュにも保存
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(graph_data, f)
+        except Exception:
+            pass
+        
+        return graph_data
     
     def _preprocess_spectrum(self, spectrum):
-        """スペクトルの前処理"""
+        """スペクトルの前処理 - メモリ効率向上"""
         # スペクトルをPyTorchテンソルに変換
         spec_tensor = torch.FloatTensor(spectrum)
         
@@ -1129,50 +1124,49 @@ class OptimizedMoleculeGraphDataset(Dataset):
         mol_id = self.valid_mol_ids[idx]
         mol_file = os.path.join(self.mol_files_path, f"ID{mol_id}.MOL")
         
-        # モル変換とグラフ取得中はRDKitの警告を抑制
-        with RDLogger.DisableLog():
-            # 例外処理を強化
-            try:
-                # MOLファイルからグラフ表現を生成
-                graph_data = self._mol_to_graph(mol_file)
-                
-                # MSPデータからマススペクトルを取得
-                mass_spectrum = self.msp_data.get(mol_id, np.zeros(MAX_MZ))
-                mass_spectrum = self._preprocess_spectrum(mass_spectrum)
-                
-                # フラグメントパターンを取得
-                fragment_pattern = self.fragment_patterns.get(mol_id, np.zeros(NUM_FRAGS))
-                
-                # 前駆体m/zの計算
-                peaks = np.nonzero(mass_spectrum)[0]
-                if len(peaks) > 0:
-                    prec_mz = np.max(peaks)
-                else:
-                    prec_mz = 0
-                    
-                prec_mz_bin = prec_mz
-                
-                # データ拡張（トレーニング時のみ）
-                if self.augment and np.random.random() < 0.2:
-                    # ノイズ追加
-                    noise_amplitude = 0.01
-                    graph_data.x = graph_data.x + torch.randn_like(graph_data.x) * noise_amplitude
-                    graph_data.edge_attr = graph_data.edge_attr + torch.randn_like(graph_data.edge_attr) * noise_amplitude
+        # RDKitの警告を抑制
+        import rdkit.RDLogger as rl
+        rl.DisableLog('rdApp.*')
+        
+        # MOLファイルからグラフ表現を生成
+        try:
+            graph_data = self._mol_to_graph(mol_file)
             
-            except Exception as e:
-                # エラーが発生した場合はデフォルト値を返す
-                logger.warning(f"データロード中にエラーが発生しました（ID: {mol_id}）: {str(e)}")
-                # ダミーデータを生成
-                dummy_x = torch.zeros((1, len(ATOM_FEATURES) + 12), dtype=torch.float)
-                dummy_edge_index = torch.tensor([[0], [0]], dtype=torch.long)
-                dummy_edge_attr = torch.zeros((1, len(BOND_FEATURES) + 3), dtype=torch.float)
-                dummy_global_attr = torch.zeros(16, dtype=torch.float)
-                graph_data = Data(x=dummy_x, edge_index=dummy_edge_index, edge_attr=dummy_edge_attr,
-                                 global_attr=dummy_global_attr)
-                mass_spectrum = np.zeros(MAX_MZ)
-                fragment_pattern = np.zeros(NUM_FRAGS)
+            # MSPデータからマススペクトルを取得
+            mass_spectrum = self.msp_data.get(mol_id, np.zeros(MAX_MZ))
+            mass_spectrum = self._preprocess_spectrum(mass_spectrum)
+            
+            # フラグメントパターンを取得
+            fragment_pattern = self.fragment_patterns.get(mol_id, np.zeros(NUM_FRAGS))
+            
+            # 前駆体m/zの計算
+            peaks = np.nonzero(mass_spectrum)[0]
+            if len(peaks) > 0:
+                prec_mz = np.max(peaks)
+            else:
                 prec_mz = 0
-                prec_mz_bin = 0
+                
+            prec_mz_bin = prec_mz
+            
+            # データ拡張（トレーニング時のみ）- 確率半減
+            if self.augment and np.random.random() < 0.1:
+                # ノイズ追加（軽微なものに）
+                noise_amplitude = 0.005
+                graph_data.x = graph_data.x + torch.randn_like(graph_data.x) * noise_amplitude
+                graph_data.edge_attr = graph_data.edge_attr + torch.randn_like(graph_data.edge_attr) * noise_amplitude
+        except Exception as e:
+            logger.warning(f"分子ID {mol_id} の処理中にエラー: {str(e)}")
+            # エラーが発生した場合は代替データを返す（最小限のグラフ）
+            x = torch.zeros((1, len(ATOM_FEATURES)+12), dtype=torch.float)  # 基本的な原子特徴+追加特徴
+            edge_index = torch.tensor([[0], [0]], dtype=torch.long)  # 自己ループ
+            edge_attr = torch.zeros((1, len(BOND_FEATURES)+3), dtype=torch.float)  # 基本的な結合特徴+追加特徴
+            global_attr = torch.zeros(16, dtype=torch.float)  # グローバル属性
+            
+            graph_data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, global_attr=global_attr)
+            mass_spectrum = np.zeros(MAX_MZ)
+            fragment_pattern = np.zeros(NUM_FRAGS)
+            prec_mz = 0
+            prec_mz_bin = 0
         
         return {
             'graph_data': graph_data, 
@@ -1184,64 +1178,82 @@ class OptimizedMoleculeGraphDataset(Dataset):
         }
 
 def optimized_collate_fn(batch):
-    """最適化されたバッチ内のデータ結合"""
-    # 例外処理を追加して堅牢性向上
+    """GPU向け最適化バッチコレート関数"""
+    # エラー処理強化
+    valid_items = []
+    for item in batch:
+        if all(key in item for key in ['graph_data', 'mass_spectrum', 'fragment_pattern', 'mol_id', 'prec_mz', 'prec_mz_bin']):
+            valid_items.append(item)
+    
+    # 有効な項目がない場合はダミー返す
+    if not valid_items:
+        dummy_graph = Data(
+            x=torch.zeros((1, len(ATOM_FEATURES)+12), dtype=torch.float),
+            edge_index=torch.tensor([[0], [0]], dtype=torch.long),
+            edge_attr=torch.zeros((1, len(BOND_FEATURES)+3), dtype=torch.float),
+            global_attr=torch.zeros(16, dtype=torch.float),
+            batch=torch.tensor([0], dtype=torch.long)
+        )
+        return {
+            'graph': Batch.from_data_list([dummy_graph]),
+            'spec': torch.zeros((1, MAX_MZ), dtype=torch.float),
+            'fragment_pattern': torch.zeros((1, NUM_FRAGS), dtype=torch.float),
+            'mol_id': [0],
+            'prec_mz': torch.tensor([0.0], dtype=torch.float32),
+            'prec_mz_bin': torch.tensor([0], dtype=torch.long)
+        }
+    
+    # 有効なデータのみで処理
+    graph_data = [item['graph_data'] for item in valid_items]
+    mass_spectrum = torch.stack([item['mass_spectrum'] for item in valid_items])
+    fragment_pattern = torch.stack([item['fragment_pattern'] for item in valid_items])
+    mol_id = [item['mol_id'] for item in valid_items]
+    prec_mz = torch.tensor([item['prec_mz'] for item in valid_items], dtype=torch.float32)
+    prec_mz_bin = torch.tensor([item['prec_mz_bin'] for item in valid_items], dtype=torch.long)
+    
+    # バッチ作成
     try:
-        graph_data = [item['graph_data'] for item in batch]
-        mass_spectrum = torch.stack([item['mass_spectrum'] for item in batch])
-        fragment_pattern = torch.stack([item['fragment_pattern'] for item in batch])
-        mol_id = [item['mol_id'] for item in batch]
-        prec_mz = torch.tensor([item['prec_mz'] for item in batch], dtype=torch.float32)
-        prec_mz_bin = torch.tensor([item['prec_mz_bin'] for item in batch], dtype=torch.long)
-        
-        # バッチ作成を効率化
         batched_graphs = Batch.from_data_list(graph_data)
-        
-        return {
-            'graph': batched_graphs,
-            'spec': mass_spectrum,
-            'fragment_pattern': fragment_pattern,
-            'mol_id': mol_id,
-            'prec_mz': prec_mz,
-            'prec_mz_bin': prec_mz_bin
-        }
-    except Exception as e:
-        # バッチ処理中のエラーをキャッチして詳細をログ
-        logger.error(f"Collate関数でエラーが発生: {str(e)}")
-        # ダミーデータでバッチを構成（訓練継続のため）
-        batch_size = len(batch)
-        dummy_x = torch.zeros((batch_size, 1, len(ATOM_FEATURES) + 12), dtype=torch.float)
-        dummy_edge_index = torch.tensor([[i, i] for i in range(batch_size)]).t().contiguous()
-        dummy_edge_attr = torch.zeros((batch_size, len(BOND_FEATURES) + 3), dtype=torch.float)
-        dummy_batch = torch.arange(batch_size)
-        dummy_global_attr = torch.zeros((batch_size, 16), dtype=torch.float)
-        
-        dummy_graphs = Data(x=dummy_x, edge_index=dummy_edge_index, edge_attr=dummy_edge_attr,
-                           batch=dummy_batch, global_attr=dummy_global_attr)
-        dummy_spectrum = torch.zeros((batch_size, MAX_MZ), dtype=torch.float)
-        dummy_fragment = torch.zeros((batch_size, NUM_FRAGS), dtype=torch.float)
-        dummy_mol_ids = [item.get('mol_id', -1) for item in batch]
-        dummy_prec_mz = torch.zeros(batch_size, dtype=torch.float)
-        dummy_prec_mz_bin = torch.zeros(batch_size, dtype=torch.long)
-        
-        return {
-            'graph': dummy_graphs,
-            'spec': dummy_spectrum,
-            'fragment_pattern': dummy_fragment,
-            'mol_id': dummy_mol_ids,
-            'prec_mz': dummy_prec_mz,
-            'prec_mz_bin': dummy_prec_mz_bin
-        }
+    except RuntimeError as e:
+        logger.warning(f"バッチグラフ作成エラー: {str(e)}")
+        # フォールバック: 最小限のグラフを作成
+        dummy_graph = Data(
+            x=torch.zeros((len(valid_items), len(ATOM_FEATURES)+12), dtype=torch.float),
+            edge_index=torch.tensor([[i, i] for i in range(len(valid_items))]).t().contiguous(),
+            edge_attr=torch.zeros((len(valid_items), len(BOND_FEATURES)+3), dtype=torch.float),
+            global_attr=torch.zeros((len(valid_items), 16), dtype=torch.float),
+            batch=torch.tensor(list(range(len(valid_items))), dtype=torch.long)
+        )
+        batched_graphs = dummy_graph
+    
+    return {
+        'graph': batched_graphs,
+        'spec': mass_spectrum,
+        'fragment_pattern': fragment_pattern,
+        'mol_id': mol_id,
+        'prec_mz': prec_mz,
+        'prec_mz_bin': prec_mz_bin
+    }
 
 ###############################
 # 損失関数と類似度計算（最適化）
 ###############################
 
 def cosine_similarity_loss(y_pred, y_true, important_mz=None, important_weight=3.0):
-    """ピークと重要なm/z値を重視したコサイン類似度損失関数"""
+    """ピークと重要なm/z値を重視したコサイン類似度損失関数 - GPU最適化"""
+    # 数値安定性のためのイプシロン
+    eps = 1e-8
+    
+    # 入力の型を保存
+    input_type = y_pred.dtype
+    
+    # 計算用にfloat32に変換
+    y_pred = y_pred.float()
+    y_true = y_true.float()
+    
     # 正規化
-    y_pred_norm = F.normalize(y_pred, p=2, dim=1)
-    y_true_norm = F.normalize(y_true, p=2, dim=1)
+    y_pred_norm = F.normalize(y_pred, p=2, dim=1, eps=eps)
+    y_true_norm = F.normalize(y_true, p=2, dim=1, eps=eps)
     
     # 特徴的なm/zの重み付け
     if important_mz is not None:
@@ -1254,20 +1266,36 @@ def cosine_similarity_loss(y_pred, y_true, important_mz=None, important_weight=3
         y_pred_weighted = y_pred * weights
         y_true_weighted = y_true * weights
         
-        y_pred_norm = F.normalize(y_pred_weighted, p=2, dim=1)
-        y_true_norm = F.normalize(y_true_weighted, p=2, dim=1)
+        y_pred_norm = F.normalize(y_pred_weighted, p=2, dim=1, eps=eps)
+        y_true_norm = F.normalize(y_true_weighted, p=2, dim=1, eps=eps)
     
     # コサイン類似度（-1〜1の範囲）
     cosine = torch.sum(y_pred_norm * y_true_norm, dim=1)
     
+    # マスク: NaNやInfをチェック
+    valid_mask = ~torch.isnan(cosine) & ~torch.isinf(cosine)
+    if not torch.all(valid_mask):
+        logger.warning(f"コサイン類似度で{(~valid_mask).sum().item()}個の無効値を検出")
+    
     # 損失を1 - cosineにして、0〜2の範囲に
     loss = 1.0 - cosine
     
-    return loss.mean()
+    # 有効な値のみで平均
+    if torch.any(valid_mask):
+        result = loss[valid_mask].mean()
+    else:
+        # すべて無効な場合はダミー値
+        result = torch.tensor(1.0, device=loss.device, dtype=loss.dtype)
+    
+    # 元の型に戻す
+    return result.to(input_type)
 
 def combined_loss(y_pred, y_true, fragment_pred=None, fragment_true=None, 
                  alpha=0.2, beta=0.6, epsilon=0.2):
-    """高速化された損失関数"""
+    """GPU向け高速化と安定化した損失関数"""
+    # 数値安定性のためのイプシロン
+    eps = 1e-8
+    
     # バッチサイズのチェックと調整
     if y_pred.shape[0] != y_true.shape[0]:
         min_batch_size = min(y_pred.shape[0], y_true.shape[0])
@@ -1280,6 +1308,16 @@ def combined_loss(y_pred, y_true, fragment_pred=None, fragment_true=None,
         y_pred = y_pred[:, :min_size]
         y_true = y_true[:, :min_size]
     
+    # 型保存
+    input_type = y_pred.dtype
+    
+    # 計算用にfloat32に変換
+    y_pred = y_pred.float()
+    y_true = y_true.float()
+    
+    # 予測値の非常に大きい値をクリップして安定化
+    y_pred = torch.clamp(y_pred, min=0.0, max=1000.0)
+    
     # 1. MSE損失（ピーク重視）
     peak_mask = (y_true > 0).float()
     mse_weights = peak_mask * 10.0 + 1.0
@@ -1291,23 +1329,88 @@ def combined_loss(y_pred, y_true, fragment_pred=None, fragment_true=None,
     
     mse_loss = torch.mean(mse_weights * (y_pred - y_true) ** 2)
     
-    # 2. コサイン類似度損失
+    # 2. コサイン類似度損失 - 安全なバージョン
     cosine_loss = cosine_similarity_loss(y_pred, y_true, important_mz=IMPORTANT_MZ)
+    
+    # NaNをチェックして置き換え
+    if torch.isnan(mse_loss) or torch.isinf(mse_loss):
+        logger.warning("MSE損失でNaNまたはInfを検出")
+        mse_loss = torch.tensor(0.1, device=y_pred.device, dtype=y_pred.dtype)
+    if torch.isnan(cosine_loss) or torch.isinf(cosine_loss):
+        logger.warning("コサイン類似度損失でNaNまたはInfを検出")
+        cosine_loss = torch.tensor(0.1, device=y_pred.device, dtype=y_pred.dtype)
     
     # 主要な損失関数の組み合わせ
     main_loss = alpha * mse_loss + beta * cosine_loss
     
     # フラグメントパターン予測がある場合
     if fragment_pred is not None and fragment_true is not None:
+        # 型変換
+        fragment_pred = fragment_pred.float()
+        fragment_true = fragment_true.float()
+        
         if fragment_pred.shape[0] != fragment_true.shape[0]:
             min_batch_size = min(fragment_pred.shape[0], fragment_true.shape[0])
             fragment_pred = fragment_pred[:min_batch_size]
             fragment_true = fragment_true[:min_batch_size]
         
+        # 安全なバージョンのBCE損失
+        fragment_pred = torch.clamp(fragment_pred, min=-20.0, max=20.0)  # より控えめなクリッピング
         fragment_loss = F.binary_cross_entropy_with_logits(fragment_pred, fragment_true)
-        return main_loss + epsilon * fragment_loss
+        
+        if torch.isnan(fragment_loss) or torch.isinf(fragment_loss):
+            logger.warning("フラグメント損失でNaNまたはInfを検出")
+            fragment_loss = torch.tensor(0.1, device=y_pred.device, dtype=y_pred.dtype)
+            
+        combined_loss = main_loss + epsilon * fragment_loss
+    else:
+        combined_loss = main_loss
     
-    return main_loss
+    # 元の型に戻す
+    return combined_loss.to(input_type)
+
+###############################
+# トレーニングとモデル評価（最適化）
+###############################
+
+def dynamic_batch_adjust(loader, loss_value, threshold=0.3, min_batch=2, max_batch=8):
+    """損失値に基づいてバッチサイズを動的に調整"""
+    current_batch = loader.batch_size
+    
+    # 損失が大きすぎる（トレーニングが不安定）場合はバッチサイズを下げる
+    if loss_value > threshold:
+        new_batch = max(min_batch, current_batch - 1)
+        if new_batch != current_batch:
+            logger.info(f"損失値が高すぎます ({loss_value:.4f}). バッチサイズを {current_batch} → {new_batch} に変更")
+            return DataLoader(
+                loader.dataset,
+                batch_size=new_batch,
+                shuffle=True,
+                collate_fn=loader.collate_fn,
+                num_workers=loader.num_workers,
+                pin_memory=loader.pin_memory,
+                drop_last=loader.drop_last,
+                prefetch_factor=2 if loader.num_workers > 0 else None
+            )
+    
+    # トレーニングが安定している場合、バッチサイズを上げてみる
+    elif loss_value < threshold * 0.7 and current_batch < max_batch:
+        new_batch = min(max_batch, current_batch + 1)
+        if new_batch != current_batch:
+            logger.info(f"トレーニングが安定しています ({loss_value:.4f}). バッチサイズを {current_batch} → {new_batch} に変更")
+            return DataLoader(
+                loader.dataset,
+                batch_size=new_batch,
+                shuffle=True,
+                collate_fn=loader.collate_fn,
+                num_workers=loader.num_workers,
+                pin_memory=loader.pin_memory,
+                drop_last=loader.drop_last,
+                prefetch_factor=2 if loader.num_workers > 0 else None
+            )
+    
+    # 変更なし
+    return loader
 
 def cosine_similarity_score(y_true, y_pred):
     """コサイン類似度スコア計算（最適化）"""
@@ -1316,45 +1419,95 @@ def cosine_similarity_score(y_true, y_pred):
     y_true = y_true[:min_batch]
     y_pred = y_pred[:min_batch]
     
-    # NumPy配列に変換
-    y_true_np = y_true.cpu().numpy() if isinstance(y_true, torch.Tensor) else y_true
-    y_pred_np = y_pred.cpu().numpy() if isinstance(y_pred, torch.Tensor) else y_pred
+    # メモリを削減するためにminibatchで計算
+    batch_size = min_batch
+    max_minibatch_size = 32  # GPUメモリに合わせて調整
     
-    y_true_flat = y_true_np.reshape(y_true_np.shape[0], -1)
-    y_pred_flat = y_pred_np.reshape(y_pred_np.shape[0], -1)
-    
-    # 効率的なバッチ計算
-    dot_products = np.sum(y_true_flat * y_pred_flat, axis=1)
-    true_norms = np.sqrt(np.sum(y_true_flat**2, axis=1))
-    pred_norms = np.sqrt(np.sum(y_pred_flat**2, axis=1))
-    
-    # ゼロ除算を防ぐ
-    true_norms = np.maximum(true_norms, 1e-10)
-    pred_norms = np.maximum(pred_norms, 1e-10)
-    
-    similarities = dot_products / (true_norms * pred_norms)
-    
-    # NaNや無限大の値を修正
-    similarities = np.nan_to_num(similarities, nan=0.0, posinf=1.0, neginf=-1.0)
-    
-    return np.mean(similarities)
-
-###############################
-# トレーニングとモデル評価（最適化）
-###############################
+    if batch_size <= max_minibatch_size:
+        # 一度に計算できる場合
+        # NumPy配列に変換
+        y_true_np = y_true.cpu().numpy() if isinstance(y_true, torch.Tensor) else y_true
+        y_pred_np = y_pred.cpu().numpy() if isinstance(y_pred, torch.Tensor) else y_pred
+        
+        y_true_flat = y_true_np.reshape(y_true_np.shape[0], -1)
+        y_pred_flat = y_pred_np.reshape(y_pred_np.shape[0], -1)
+        
+        # 効率的なバッチ計算
+        dot_products = np.sum(y_true_flat * y_pred_flat, axis=1)
+        true_norms = np.sqrt(np.sum(y_true_flat**2, axis=1))
+        pred_norms = np.sqrt(np.sum(y_pred_flat**2, axis=1))
+        
+        # ゼロ除算を防ぐ
+        true_norms = np.maximum(true_norms, 1e-10)
+        pred_norms = np.maximum(pred_norms, 1e-10)
+        
+        similarities = dot_products / (true_norms * pred_norms)
+        
+        # NaNや無限大の値を修正
+        similarities = np.nan_to_num(similarities, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        return np.mean(similarities)
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, device, num_epochs,
-               eval_interval=2, patience=10, grad_clip=1.0, checkpoint_dir="checkpoints/", 
+               eval_interval=2, patience=10, grad_clip=0.5, checkpoint_dir=CHECKPOINT_DIR,
                train_dataset=None, val_dataset=None, test_dataset=None, start_epoch=0):
-    """最適化されたモデルのトレーニング"""
-    # チェックポイントディレクトリの作成
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
+    """最適化されたモデルのトレーニング（チェックポイント機能付き）"""
     train_losses = []
     val_losses = []
     val_cosine_similarities = []
     best_cosine = 0.0
     early_stopping_counter = 0
+    
+    # チェックポイントディレクトリの作成
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # 既存のチェックポイントがあれば読み込む
+    latest_checkpoint = None
+    if start_epoch == 0:  # 明示的に指定されていない場合のみ自動検出
+        for file in os.listdir(checkpoint_dir):
+            if file.startswith("checkpoint_epoch_") and file.endswith(".pth"):
+                try:
+                    epoch_num = int(file.split("_")[2])
+                    if latest_checkpoint is None or epoch_num > start_epoch:
+                        latest_checkpoint = file
+                        start_epoch = epoch_num
+                except:
+                    continue
+    
+    if latest_checkpoint:
+        checkpoint_path = os.path.join(checkpoint_dir, latest_checkpoint)
+        logger.info(f"チェックポイントを読み込み: {checkpoint_path}")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            # 最適化情報を明示的にデバイスに移動
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
+            
+            train_losses = checkpoint.get('train_losses', [])
+            val_losses = checkpoint.get('val_losses', [])
+            val_cosine_similarities = checkpoint.get('val_cosine_similarities', [])
+            best_cosine = checkpoint.get('best_cosine', 0.0)
+            early_stopping_counter = checkpoint.get('early_stopping_counter', 0)
+            start_epoch = checkpoint['epoch'] + 1  # 次のエポックから開始
+            
+            # スケジューラの復元
+            if 'scheduler_state_dict' in checkpoint and scheduler is not None:
+                try:
+                    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                except:
+                    logger.warning("スケジューラの状態を復元できませんでした")
+                    
+            # メモリクリーンアップ
+            del checkpoint
+            aggressive_memory_cleanup(train_dataset, val_dataset, test_dataset, force_sync=True, purge_cache=True)
+        except Exception as e:
+            logger.error(f"チェックポイント読み込みエラー: {e}")
+            start_epoch = 0
     
     # Automatic Mixed Precision (AMP)のスケーラー
     scaler = GradScaler()
@@ -1364,23 +1517,78 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     
     # 合計バッチ数の計算
     total_steps = len(train_loader) * (num_epochs - start_epoch)
-    logger.info(f"トレーニング開始: 総ステップ数 = {total_steps}")
+    logger.info(f"トレーニング開始: 総ステップ数 = {total_steps}, 開始エポック = {start_epoch + 1}")
     
     # バッチ処理中の定期的なメモリ管理
-    total_batches = len(train_loader)
-    memory_check_interval = max(1, total_batches // 10)  # 10回程度チェック
+    memory_check_interval = max(1, len(train_loader) // 5)  # 5回程度チェック
     
-    # エポック間のタイムアウト設定
-    epoch_timeout = 7200  # 2時間 (秒単位)
-    batch_timeout = 300   # 5分 (秒単位)
-    
-    for epoch in range(start_epoch, num_epochs):
-        # エポック開始前にメモリをクリア
-        aggressive_memory_management(train_dataset, val_dataset, test_dataset, force_gc=True)
-        log_gpu_memory()
+    # メモリ管理ヘルパー関数
+    def _memory_checkpoint(force_reload=False):
+        """メモリ中間チェックポイント - オプティマイザを一時的に再構築"""
+        aggressive_memory_cleanup(train_dataset, val_dataset, test_dataset, force_sync=True, purge_cache=True)
         
-        # エポック開始時間を記録
-        epoch_start_time = time.time()
+        if force_reload:
+            # モデルを再初期化
+            nonlocal model, optimizer
+            
+            # モデルと最適化器の状態を保存
+            model_state = model.state_dict()
+            optimizer_state = optimizer.state_dict()
+            
+            # オブジェクトを削除
+            del model
+            del optimizer
+            
+            # GPUメモリを強制クリア
+            torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+            # モデルと最適化器を再構築 (注意: この例ではモデルの再構築は疑似コード)
+            model = OptimizedHybridMSModel(
+                node_features=model.gat1.in_channels,
+                edge_features=model.gat1.edge_dim,
+                hidden_channels=model.hidden_channels,
+                out_channels=model.forw_out_layer.out_features if hasattr(model, 'forw_out_layer') else model.out_layer.out_features,
+                num_fragments=NUM_FRAGS,
+                prec_mass_offset=model.prec_mass_offset,
+                bidirectional=model.bidirectional,
+                gate_prediction=model.gate_prediction
+            ).to(device)
+            
+            # 状態を復元
+            model.load_state_dict(model_state)
+            
+            optimizer = torch.optim.AdamW(
+                model.parameters(), 
+                lr=0.0005,
+                weight_decay=1e-5,
+                eps=1e-8
+            )
+            
+            optimizer.load_state_dict(optimizer_state)
+            
+            # 最適化情報を明示的にデバイスに移動
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
+            
+            # ガベージコレクション
+            del model_state
+            del optimizer_state
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+            logger.info("モデルとオプティマイザを再構築して再ロードしました")
+    
+    # 各エポックでのトレーニング
+    for epoch in range(start_epoch, num_epochs):
+        # エポック開始時にメモリをクリーンアップ
+        aggressive_memory_cleanup(train_dataset, val_dataset, test_dataset, force_sync=True, purge_cache=True)
+        if epoch > start_epoch and epoch % 3 == 0:
+            # 3エポックごとにモデルとオプティマイザを再構築
+            _memory_checkpoint(force_reload=True)
         
         # 訓練モード
         model.train()
@@ -1390,34 +1598,14 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         # プログレスバーで進捗管理
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", position=0, leave=True)
         
+        # バッチサイズ動的調整用の損失トラッカー
+        last_loss_values = []
+        
         for batch_idx, batch in enumerate(train_pbar):
-            # エポックが長すぎる場合はチェックポイントを保存して次のエポックへ
-            if time.time() - epoch_start_time > epoch_timeout:
-                logger.warning(f"エポックが時間制限（{epoch_timeout/3600:.1f}時間）を超えました。チェックポイントを保存して次のエポックへ進みます。")
-                # 緊急チェックポイントを保存
-                checkpoint_path = os.path.join(checkpoint_dir, f"emergency_checkpoint_epoch{epoch}.pt")
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'batch_idx': batch_idx,
-                    'train_losses': train_losses,
-                    'val_losses': val_losses,
-                    'val_cosine_similarities': val_cosine_similarities,
-                    'best_cosine': best_cosine
-                }, checkpoint_path)
-                logger.info(f"緊急チェックポイントを保存: {checkpoint_path}")
-                break
-            
-            # バッチ処理開始時間
-            batch_start_time = time.time()
-            
             try:
                 # 定期的なメモリチェック
                 if batch_idx % memory_check_interval == 0:
-                    memory_cleared, mem_percent = aggressive_memory_management(train_dataset, threshold=80)
-                    if memory_cleared and batch_idx > 0:
-                        logger.info(f"メモリ使用量を削減しました（使用率: {mem_percent:.1f}%）")
+                    aggressive_memory_cleanup(train_dataset, val_dataset, test_dataset, purge_cache=(batch_idx > 0))
                 
                 # データをGPUに転送（効率化）
                 processed_batch = {}
@@ -1436,13 +1624,6 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                     else:
                         processed_batch[k] = v
                 
-                # バッチがタイムアウトしそうかチェック
-                if time.time() - batch_start_time > batch_timeout * 0.5:  # 半分の時間でチェック
-                    logger.warning(f"バッチ {batch_idx} の処理に時間がかかっています。メモリを解放してスキップします。")
-                    del processed_batch
-                    torch.cuda.empty_cache()
-                    continue
-                
                 # 勾配をゼロに初期化
                 optimizer.zero_grad(set_to_none=True)  # メモリ効率のためNoneに設定
                 
@@ -1450,6 +1631,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 with autocast():
                     output, fragment_pred = model(processed_batch)
                     loss = criterion(output, processed_batch['spec'], fragment_pred, processed_batch['fragment_pattern'])
+                
+                # 損失値が異常に大きくないかチェック
+                if torch.isnan(loss).any() or torch.isinf(loss).any() or loss.item() > 10.0:
+                    logger.warning(f"異常な損失値: {loss.item()}")
+                    # このバッチをスキップ
+                    continue
                 
                 # AMP逆伝播
                 scaler.scale(loss).backward()
@@ -1471,35 +1658,84 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 epoch_loss += current_loss
                 batch_count += 1
                 
+                # 直近の損失値を記録（動的バッチサイズ調整用）
+                last_loss_values.append(current_loss)
+                if len(last_loss_values) > 10:
+                    last_loss_values.pop(0)
+                
                 # プログレスバーの更新
                 train_pbar.set_postfix({
                     'loss': f"{current_loss:.4f}",
                     'avg_loss': f"{epoch_loss/batch_count:.4f}",
-                    'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
+                    'lr': f"{optimizer.param_groups[0]['lr']:.6f}",
+                    'mem': f"{torch.cuda.memory_allocated()/1024**2:.0f}MB" if torch.cuda.is_available() else "N/A"
                 })
                 
-                # バッチごとにメモリ解放
+                # バッチごとにテンソルを明示的に解放
                 del loss, output, fragment_pred, processed_batch
                 torch.cuda.empty_cache()
                 
-                # バッチがタイムアウトするかチェック
-                if time.time() - batch_start_time > batch_timeout:
-                    logger.warning(f"バッチ {batch_idx} がタイムアウトしました（>{batch_timeout}秒）。次のバッチに進みます。")
-                    # 強制的にメモリをクリア
-                    aggressive_memory_management(train_dataset, val_dataset, test_dataset, force_gc=True, threshold=0)
+                # 動的バッチサイズ調整 - 10バッチごとに
+                if len(last_loss_values) >= 5 and batch_idx % 10 == 0 and batch_idx > 0:
+                    avg_loss = sum(last_loss_values) / len(last_loss_values)
+                    new_loader = dynamic_batch_adjust(train_loader, avg_loss, threshold=0.3)
+                    if new_loader != train_loader:
+                        train_loader = new_loader
+                        train_pbar.close()
+                        remaining_batches = len(train_loader) - batch_idx
+                        train_pbar = tqdm(islice(train_loader, remaining_batches), 
+                                        desc=f"Epoch {epoch+1}/{num_epochs}", position=0, leave=True)
                 
+                # バッチチェックポイント（より少なく - 1000バッチごと）
+                if (batch_idx + 1) % 1000 == 0:
+                    # チェックポイント前にメモリクリーンアップ
+                    aggressive_memory_cleanup(train_dataset, val_dataset, test_dataset)
+                    
+                    batch_checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch+1}_batch_{batch_idx+1}.pth")
+                    torch.save({
+                        'epoch': epoch,
+                        'batch_idx': batch_idx,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+                        'train_losses': train_losses,
+                        'val_losses': val_losses,
+                        'val_cosine_similarities': val_cosine_similarities,
+                        'best_cosine': best_cosine,
+                        'early_stopping_counter': early_stopping_counter
+                    }, batch_checkpoint_path)
+                    logger.info(f"バッチチェックポイントを保存: {batch_checkpoint_path}")
+            
             except RuntimeError as e:
                 if "CUDA out of memory" in str(e):
-                    logger.error(f"バッチ {batch_idx} でCUDAメモリ不足エラー発生")
-                    # 強制的にメモリをクリア
-                    aggressive_memory_management(train_dataset, val_dataset, test_dataset, force_gc=True, threshold=0)
-                    continue
+                    logger.error(f"CUDAメモリ不足: {str(e)}")
+                    # 緊急メモリクリーンアップ
+                    aggressive_memory_cleanup(train_dataset, val_dataset, test_dataset, force_sync=True, purge_cache=True)
+                    
+                    # バッチサイズを減らす
+                    if train_loader.batch_size > 2:
+                        new_batch_size = max(2, train_loader.batch_size - 2)
+                        logger.info(f"メモリ不足のためバッチサイズを {train_loader.batch_size} → {new_batch_size} に削減")
+                        train_loader = DataLoader(
+                            train_loader.dataset, 
+                            batch_size=new_batch_size,
+                            shuffle=True, 
+                            collate_fn=optimized_collate_fn,
+                            num_workers=train_loader.num_workers,
+                            pin_memory=train_loader.pin_memory,
+                            drop_last=True,
+                            prefetch_factor=2 if train_loader.num_workers > 0 else None
+                        )
+                        train_pbar.close()
+                        remaining_batches = len(train_loader) - batch_idx
+                        train_pbar = tqdm(islice(train_loader, remaining_batches), 
+                                        desc=f"Epoch {epoch+1}/{num_epochs} (reduced)", position=0, leave=True)
                 else:
                     logger.error(f"バッチ処理エラー: {str(e)}")
-                    # スタックトレースを出力（デバッグに役立つ）
+                    # エラーが深刻な場合はトレースバック表示
                     import traceback
                     traceback.print_exc()
-                    continue
+                continue
         
         # エポック終了時の評価
         if batch_count > 0:
@@ -1507,11 +1743,36 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             train_losses.append(avg_train_loss)
             logger.info(f"Epoch {epoch+1}/{num_epochs} - 平均訓練損失: {avg_train_loss:.4f}")
             
-            # 定期的な検証（すべてのエポックで行わない）
-            if (epoch + 1) % eval_interval == 0 or epoch == num_epochs - 1:
+            # エポック前のメモリクリーンアップ
+            aggressive_memory_cleanup(train_dataset, val_dataset, test_dataset)
+            
+            # エポックチェックポイントの保存
+            checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pth")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+                'train_losses': train_losses,
+                'val_losses': val_losses,
+                'val_cosine_similarities': val_cosine_similarities,
+                'best_cosine': best_cosine,
+                'early_stopping_counter': early_stopping_counter
+            }, checkpoint_path)
+            logger.info(f"エポックチェックポイントを保存: {checkpoint_path}")
+            
+            # ReduceLROnPlateauスケジューラーの更新（OneCycleLRでない場合）
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(avg_train_loss)
+            
+            # 定期的な検証
+            if (epoch + 1) % eval_interval == 0 or epoch == num_epochs - 1 or epoch == 0:
+                # 評価用にメモリを解放
+                aggressive_memory_cleanup(train_dataset, val_dataset, test_dataset)
+                
                 # 評価モードで検証
-                val_metrics = evaluate_model(model, val_loader, criterion, device, 
-                                          use_amp=True, val_dataset=val_dataset)
+                val_metrics = evaluate_model(model, val_loader, criterion, device, use_amp=True, 
+                                         val_dataset=val_dataset)
                 val_loss = val_metrics['loss']
                 cosine_sim = val_metrics['cosine_similarity']
                 
@@ -1521,18 +1782,15 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 logger.info(f"Epoch {epoch+1}/{num_epochs} - 検証損失: {val_loss:.4f}, "
                             f"コサイン類似度: {cosine_sim:.4f}")
                 
-                # ReduceLROnPlateauスケジューラーの更新
-                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    scheduler.step(val_loss)
-                
                 # 最良モデルの保存
                 if cosine_sim > best_cosine:
                     best_cosine = cosine_sim
                     early_stopping_counter = 0
-                    # 最良モデルを保存
-                    best_model_path = os.path.join(checkpoint_dir, 'best_hybrid_ms_model.pth')
+                    best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
+                    # 保存前にメモリクリーンアップ
+                    aggressive_memory_cleanup(train_dataset, val_dataset, test_dataset)
                     torch.save(model.state_dict(), best_model_path)
-                    logger.info(f"新しい最良モデル保存: コサイン類似度 = {cosine_sim:.4f}, パス: {best_model_path}")
+                    logger.info(f"新しい最良モデル保存: コサイン類似度 = {cosine_sim:.4f} - {best_model_path}")
                 else:
                     early_stopping_counter += 1
                     logger.info(f"早期停止カウンター: {early_stopping_counter}/{patience}")
@@ -1542,24 +1800,13 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                     logger.info(f"早期停止: {epoch+1}エポック後")
                     break
             
-            # エポックごとのチェックポイント保存
-            checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch{epoch+1}.pt")
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'train_losses': train_losses,
-                'val_losses': val_losses,
-                'val_cosine_similarities': val_cosine_similarities,
-                'best_cosine': best_cosine
-            }, checkpoint_path)
-            
-            # 学習中の損失推移をプロットして保存（5エポックごと）
-            if (epoch + 1) % 5 == 0 or epoch == num_epochs - 1:
+            # 学習中の損失推移をプロット（省メモリ化、5エポックごと）
+            if (epoch + 1) % 5 == 0:
                 try:
-                    plot_path = os.path.join(checkpoint_dir, f"learning_curves_epoch{epoch+1}.png")
-                    _plot_training_progress(train_losses, val_losses, val_cosine_similarities, best_cosine, plot_path)
-                    logger.info(f"学習曲線を保存: {plot_path}")
+                    # プロット生成前にメモリクリーンアップ
+                    aggressive_memory_cleanup(train_dataset, val_dataset, test_dataset)
+                    _plot_training_progress(train_losses, val_losses, val_cosine_similarities, best_cosine,
+                                         os.path.join(checkpoint_dir, f"learning_curves_epoch{epoch+1}.png"))
                 except Exception as e:
                     logger.error(f"プロット作成エラー: {str(e)}")
         else:
@@ -1568,58 +1815,66 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             
     # 最終的な学習曲線の保存
     try:
-        final_plot_path = os.path.join(checkpoint_dir, "final_learning_curves.png")
-        _plot_training_progress(train_losses, val_losses, val_cosine_similarities, best_cosine, final_plot_path)
-        logger.info(f"最終学習曲線を保存: {final_plot_path}")
+        # プロット生成前にメモリクリーンアップ
+        aggressive_memory_cleanup(train_dataset, val_dataset, test_dataset)
+        _plot_training_progress(train_losses, val_losses, val_cosine_similarities, best_cosine,
+                             os.path.join(checkpoint_dir, "final_learning_curves.png"))
     except Exception as e:
         logger.error(f"最終プロット作成エラー: {str(e)}")
     
     return train_losses, val_losses, val_cosine_similarities, best_cosine
 
-def _plot_training_progress(train_losses, val_losses, val_cosine_similarities, best_cosine, save_path="hybrid_learning_curves.png"):
-    """トレーニング進捗の可視化"""
+def _plot_training_progress(train_losses, val_losses, val_cosine_similarities, best_cosine, save_path="learning_curves.png"):
+    """トレーニング進捗の可視化（省メモリ版）"""
     plt.figure(figsize=(12, 5))
     
     plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label='訓練損失')
+    plt.plot(train_losses, label='Training Loss')
     if val_losses:  # 検証損失が存在する場合
         # エポック間隔を調整
         val_epochs = np.linspace(0, len(train_losses)-1, len(val_losses))
-        plt.plot(val_epochs, val_losses, label='検証損失')
-    plt.xlabel('エポック')
-    plt.ylabel('損失')
+        plt.plot(val_epochs, val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
     plt.legend()
-    plt.title('損失曲線')
-    plt.grid(alpha=0.3)
+    plt.title('Loss Curves')
     
     plt.subplot(1, 2, 2)
     if val_cosine_similarities:  # コサイン類似度が存在する場合
         val_epochs = np.linspace(0, len(train_losses)-1, len(val_cosine_similarities))
-        plt.plot(val_epochs, val_cosine_similarities, label='検証コサイン類似度')
-        plt.axhline(y=best_cosine, color='r', linestyle='--', label=f'最良: {best_cosine:.4f}')
-    plt.xlabel('エポック')
-    plt.ylabel('コサイン類似度')
+        plt.plot(val_epochs, val_cosine_similarities, label='Validation Cosine Similarity')
+        plt.axhline(y=best_cosine, color='r', linestyle='--', label=f'Best: {best_cosine:.4f}')
+    plt.xlabel('Epoch')
+    plt.ylabel('Cosine Similarity')
     plt.legend()
-    plt.title('コサイン類似度')
-    plt.grid(alpha=0.3)
+    plt.title('Cosine Similarity')
     
     plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
+    plt.savefig(save_path, dpi=100)  # DPI下げてファイル小さく
+    plt.close()  # メモリ解放
 
-def evaluate_model(model, data_loader, criterion, device, use_amp=False, val_dataset=None):
-    """モデル評価用の関数"""
+def evaluate_model(model, data_loader, criterion, device, use_amp=False, max_batches=None,
+                val_dataset=None, test_dataset=None):
+    """GPU向け最適化されたモデル評価関数"""
+    # 評価前にメモリクリーンアップ
+    aggressive_memory_cleanup(val_dataset=val_dataset, test_dataset=test_dataset, force_sync=True, purge_cache=True)
+    
     model.eval()
     total_loss = 0
     batch_count = 0
-    y_true = []
-    y_pred = []
     
-    # メモリをクリア
-    aggressive_memory_management(val_dataset=val_dataset, force_gc=True)
+    # メモリ効率のためにPyTorchからNumPyへの変換をバッチ処理
+    y_true_list = []
+    y_pred_list = []
+    
+    pbar = tqdm(data_loader, desc="Evaluating", leave=False)
+    
+    # バッチ数を制限する場合
+    if max_batches is not None:
+        pbar = islice(pbar, max_batches)
     
     with torch.no_grad():
-        for batch in tqdm(data_loader, desc="評価中", leave=False):
+        for batch in pbar:
             try:
                 # データをGPUに転送
                 processed_batch = {}
@@ -1649,39 +1904,71 @@ def evaluate_model(model, data_loader, criterion, device, use_amp=False, val_dat
                     loss = criterion(output, processed_batch['spec'], 
                                      fragment_pred, processed_batch['fragment_pattern'])
                 
+                # NaNや無限値をチェック
+                if torch.isnan(loss) or torch.isinf(loss):
+                    logger.warning("評価中にNaNまたはInfの損失を検出")
+                    continue
+                
                 total_loss += loss.item()
                 batch_count += 1
                 
-                # 類似度計算用に結果を保存
-                y_true.append(processed_batch['spec'].cpu())
-                y_pred.append(output.cpu())
+                # 類似度計算用に結果をCPUに移動してNumPy配列に変換
+                y_true_list.append(processed_batch['spec'].cpu().numpy())
+                y_pred_list.append(output.cpu().numpy())
                 
-                # メモリ解放
-                del output, fragment_pred, processed_batch, loss
+                # メモリ効率化: バッチごとにキャッシュクリア
+                del output, fragment_pred, loss, processed_batch
+                if batch_count % 10 == 0:  # 10バッチごとにGPUメモリクリア
+                    torch.cuda.empty_cache()
                 
             except RuntimeError as e:
-                if "CUDA out of memory" in str(e):
-                    logger.error("評価中にCUDAメモリ不足エラー発生")
-                    # 強制的にメモリをクリア
-                    aggressive_memory_management(val_dataset=val_dataset, force_gc=True, threshold=0)
-                    torch.cuda.empty_cache()
-                else:
-                    logger.error(f"評価中にエラー発生: {str(e)}")
+                logger.error(f"評価中にエラー発生: {str(e)}")
                 continue
-    
-    # メモリをクリア
-    torch.cuda.empty_cache()
     
     # 結果を集計
     if batch_count > 0:
         avg_loss = total_loss / batch_count
         
-        # コサイン類似度を計算
-        if y_true and y_pred:
+        # コサイン類似度を計算（メモリ効率化）
+        if y_true_list and y_pred_list:
             try:
-                all_true = torch.cat(y_true, dim=0)
-                all_pred = torch.cat(y_pred, dim=0)
-                cosine_sim = cosine_similarity_score(all_true, all_pred)
+                # NumPy配列を直接連結（メモリ効率のため）
+                similarities = []
+                
+                # ミニバッチに分けて類似度計算（メモリ使用量を抑制）
+                mini_batch_size = 32
+                for i in range(0, len(y_true_list), mini_batch_size):
+                    end_idx = min(i + mini_batch_size, len(y_true_list))
+                    batch_y_true = np.concatenate(y_true_list[i:end_idx], axis=0)
+                    batch_y_pred = np.concatenate(y_pred_list[i:end_idx], axis=0)
+                    
+                    # 各サンプルごとの類似度を計算
+                    for j in range(len(batch_y_true)):
+                        true_vec = batch_y_true[j].reshape(1, -1)
+                        pred_vec = batch_y_pred[j].reshape(1, -1)
+                        
+                        # L2正規化
+                        true_norm = np.sqrt(np.sum(true_vec**2)) + 1e-10
+                        pred_norm = np.sqrt(np.sum(pred_vec**2)) + 1e-10
+                        true_vec = true_vec / true_norm
+                        pred_vec = pred_vec / pred_norm
+                        
+                        # コサイン類似度
+                        sim = np.sum(true_vec * pred_vec)
+                        
+                        # 有効範囲内にクリップ
+                        sim = max(-1.0, min(1.0, sim))
+                        similarities.append(sim)
+                    
+                    # メモリ解放
+                    del batch_y_true, batch_y_pred
+                    gc.collect()
+                
+                cosine_sim = np.mean(similarities) if similarities else 0.0
+                
+                # メモリ解放
+                del y_true_list, y_pred_list, similarities
+                gc.collect()
             except Exception as e:
                 logger.error(f"類似度計算エラー: {str(e)}")
                 cosine_sim = 0.0
@@ -1698,21 +1985,30 @@ def evaluate_model(model, data_loader, criterion, device, use_amp=False, val_dat
             'cosine_similarity': 0.0
         }
 
-def eval_model(model, test_loader, device, use_amp=True, test_dataset=None):
-    """テスト用の評価関数"""
+def test_model(model, test_loader, device, use_amp=True, max_batches=None, test_dataset=None):
+    """GPU向け最適化されたテスト用評価関数"""
+    # テスト前にメモリクリーンアップ
+    aggressive_memory_cleanup(test_dataset=test_dataset, force_sync=True, purge_cache=True)
+    
     model = model.to(device)
     model.eval()
+    
+    # メモリ効率のためデータを小さなバッチで管理
     y_true = []
     y_pred = []
     fragment_true = []
     fragment_pred = []
     mol_ids = []
     
-    # メモリをクリア
-    aggressive_memory_management(test_dataset=test_dataset, force_gc=True)
+    # プログレスバー設定
+    pbar = tqdm(test_loader, desc="Testing")
+    
+    # バッチ数を制限する場合
+    if max_batches is not None:
+        pbar = islice(pbar, max_batches)
     
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc="テスト中"):
+        for batch_idx, batch in enumerate(pbar):
             try:
                 # データをGPUに転送
                 processed_batch = {}
@@ -1738,37 +2034,75 @@ def eval_model(model, test_loader, device, use_amp=True, test_dataset=None):
                 else:
                     output, frag_pred = model(processed_batch)
                 
-                # 結果を保存
-                y_true.append(processed_batch['spec'].cpu())
-                y_pred.append(output.cpu())
-                fragment_true.append(processed_batch['fragment_pattern'].cpu())
-                fragment_pred.append(frag_pred.cpu())
+                # NumPyに変換して結果を保存
+                y_true.append(processed_batch['spec'].cpu().numpy())
+                y_pred.append(output.cpu().numpy())
+                fragment_true.append(processed_batch['fragment_pattern'].cpu().numpy())
+                fragment_pred.append(frag_pred.cpu().numpy())
                 mol_ids.extend(processed_batch['mol_id'])
                 
                 # バッチごとにメモリ解放
                 del output, frag_pred, processed_batch
-                torch.cuda.empty_cache()
+                
+                # 定期的なメモリクリーンアップ
+                if batch_idx % 10 == 0:
+                    torch.cuda.empty_cache()
+                    
+                # 定期的な重度メモリクリーンアップ
+                if batch_idx % 50 == 0 and batch_idx > 0:
+                    aggressive_memory_cleanup(test_dataset=test_dataset)
                 
             except RuntimeError as e:
-                if "CUDA out of memory" in str(e):
-                    logger.error("テスト中にCUDAメモリ不足エラー発生")
-                    # 強制的にメモリをクリア
-                    aggressive_memory_management(test_dataset=test_dataset, force_gc=True, threshold=0)
-                    torch.cuda.empty_cache()
-                else:
-                    logger.error(f"テスト中にエラー発生: {str(e)}")
-                    import traceback
-                    traceback.print_exc()
+                logger.error(f"テスト中にエラー発生: {str(e)}")
                 continue
     
-    # 結果を連結
-    all_true = torch.cat(y_true, dim=0)
-    all_pred = torch.cat(y_pred, dim=0)
-    all_fragment_true = torch.cat(fragment_true, dim=0)
-    all_fragment_pred = torch.cat(fragment_pred, dim=0)
+    # メモリ効率的なやり方で結果を連結
+    # NumPy配列を直接連結
+    all_true = np.concatenate(y_true, axis=0)
+    all_pred = np.concatenate(y_pred, axis=0)
+    all_fragment_true = np.concatenate(fragment_true, axis=0)
+    all_fragment_pred = np.concatenate(fragment_pred, axis=0)
     
-    # スコア計算
-    cosine_sim = cosine_similarity_score(all_true, all_pred)
+    # メモリ解放（元のデータ）
+    del y_true, y_pred, fragment_true, fragment_pred
+    gc.collect()
+    
+    # スコア計算（バッチ処理で）
+    try:
+        similarities = []
+        batch_size = 32  # メモリ効率のため小さいバッチで処理
+        for i in range(0, len(all_true), batch_size):
+            end_idx = min(i + batch_size, len(all_true))
+            
+            batch_true = all_true[i:end_idx]
+            batch_pred = all_pred[i:end_idx]
+            
+            # サンプルごとに処理
+            for j in range(len(batch_true)):
+                true_vec = batch_true[j].reshape(1, -1)
+                pred_vec = batch_pred[j].reshape(1, -1)
+                
+                # L2正規化
+                true_norm = np.sqrt(np.sum(true_vec**2)) + 1e-10
+                pred_norm = np.sqrt(np.sum(pred_vec**2)) + 1e-10
+                true_vec = true_vec / true_norm
+                pred_vec = pred_vec / pred_norm
+                
+                # コサイン類似度
+                sim = np.sum(true_vec * pred_vec)
+                
+                # 有効範囲内にクリップ
+                sim = max(-1.0, min(1.0, sim))
+                similarities.append(sim)
+            
+            # 中間のバッチ処理後にメモリ解放
+            del batch_true, batch_pred
+            gc.collect()
+        
+        cosine_sim = np.mean(similarities)
+    except Exception as e:
+        logger.error(f"類似度計算エラー: {str(e)}")
+        cosine_sim = 0.0
     
     return {
         'cosine_similarity': cosine_sim,
@@ -1779,8 +2113,14 @@ def eval_model(model, test_loader, device, use_amp=True, test_dataset=None):
         'mol_ids': mol_ids
     }
 
-def visualize_results(test_results, num_samples=10, save_path="hybrid_prediction_visualization.png"):
-    """予測結果の可視化"""
+def visualize_results(test_results, num_samples=5, save_path="prediction_visualization.png"):
+    """GPU向け省メモリ結果可視化関数"""
+    # 可視化前にメモリクリーンアップ
+    gc.collect()
+    
+    # 少ないサンプル数でメモリ使用量を抑制
+    num_samples = min(num_samples, 5)
+    
     plt.figure(figsize=(15, num_samples*4))
     
     # サンプルのインデックスをランダムに選択
@@ -1796,30 +2136,40 @@ def visualize_results(test_results, num_samples=10, save_path="hybrid_prediction
     
     for i, idx in enumerate(sample_indices):
         # 類似度を計算
-        true_vector = test_results['y_true'][idx].reshape(1, -1).cpu().numpy()
-        pred_vector = test_results['y_pred'][idx].reshape(1, -1).cpu().numpy()
-        sim = cosine_similarity(true_vector, pred_vector)[0][0]
+        true_vector = test_results['y_true'][idx].reshape(1, -1)
+        pred_vector = test_results['y_pred'][idx].reshape(1, -1)
+        
+        # 正規化
+        true_norm = np.sqrt(np.sum(true_vector**2)) + 1e-10
+        pred_norm = np.sqrt(np.sum(pred_vector**2)) + 1e-10
+        true_vector_norm = true_vector / true_norm
+        pred_vector_norm = pred_vector / pred_norm
+        
+        sim = np.sum(true_vector_norm * pred_vector_norm)
+        sim = max(-1.0, min(1.0, sim))  # 範囲内にクリップ
         
         # 真のスペクトル
         plt.subplot(num_samples, 2, 2*i + 1)
-        true_spec = test_results['y_true'][idx].numpy()
+        true_spec = test_results['y_true'][idx]
         
         # 非ゼロの位置を強調
         nonzero_indices = np.nonzero(true_spec)[0]
         if len(nonzero_indices) > 0:
+            # 少ない点数で高速化
             plt.stem(nonzero_indices, true_spec[nonzero_indices], markerfmt=" ", basefmt="b-")
         else:
+            # yが全て0の場合
             plt.plot(range(len(true_spec)), true_spec, 'b-')
             
         # タイトルの設定
-        mol_id_str = f" - 分子ID {test_results['mol_ids'][idx]}" if 'mol_ids' in test_results else ""
-        plt.title(f"実測スペクトル{mol_id_str}")
+        mol_id_str = f" - ID: {test_results['mol_ids'][idx]}" if 'mol_ids' in test_results else ""
+        plt.title(f"Measured Spectrum{mol_id_str}")
         plt.xlabel("m/z")
-        plt.ylabel("強度")
+        plt.ylabel("Intensity")
         
         # 予測スペクトル
         plt.subplot(num_samples, 2, 2*i + 2)
-        pred_spec = test_results['y_pred'][idx].numpy()
+        pred_spec = test_results['y_pred'][idx]
         
         # 非ゼロの位置を強調
         nonzero_indices = np.nonzero(pred_spec)[0]
@@ -1828,13 +2178,16 @@ def visualize_results(test_results, num_samples=10, save_path="hybrid_prediction
         else:
             plt.plot(range(len(pred_spec)), pred_spec, 'r-')
             
-        plt.title(f"予測スペクトル - コサイン類似度: {sim:.4f}")
+        plt.title(f"Predicted Spectrum - Sim: {sim:.4f}")
         plt.xlabel("m/z")
-        plt.ylabel("強度")
+        plt.ylabel("Intensity")
     
     plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
+    plt.savefig(save_path, dpi=100)  # DPI下げてファイル小さく
+    plt.close()  # メモリ解放
+
+    # メモリクリーンアップ
+    gc.collect()
 
 ###############################
 # 段階的トレーニング関数
@@ -1951,7 +2304,7 @@ def tiered_training(model, train_ids, val_loader, criterion, optimizer, schedule
             num_epochs=tier_epochs[tier_idx],
             eval_interval=1,  # 毎エポック評価
             patience=tier_patience,
-            grad_clip=1.0,
+            grad_clip=0.5,
             checkpoint_dir=os.path.join(checkpoint_dir, f"tier{tier_idx+1}"),
             train_dataset=tier_dataset,
             val_dataset=None
@@ -1966,7 +2319,7 @@ def tiered_training(model, train_ids, val_loader, criterion, optimizer, schedule
         all_val_cosine_similarities.extend(val_cosine_similarities)
         
         # ティア間でキャッシュをクリア
-        aggressive_memory_management(tier_dataset, None, None, force_gc=True)
+        aggressive_memory_cleanup(tier_dataset, None, None, force_sync=True, purge_cache=True)
         del tier_dataset, tier_loader
         torch.cuda.empty_cache()
         
@@ -2053,7 +2406,7 @@ def main(args=None):
     logger.info(f"MOLファイルとMSPデータが揃っている化合物: {len(mol_ids)}個")
     
     # 引数で最大化合物数が指定されている場合は制限（デバッグ用）
-    if args and args.max_compounds and len(mol_ids) > args.max_compounds:
+    if args and hasattr(args, 'max_compounds') and args.max_compounds and len(mol_ids) > args.max_compounds:
         logger.info(f"引数で指定された最大化合物数 {args.max_compounds} に制限します")
         mol_ids = mol_ids[:args.max_compounds]
     
@@ -2070,7 +2423,7 @@ def main(args=None):
     normalization = "l1"      # 正規化タイプ
     
     # デバッグモードの場合は小さいデータセットを使用
-    if args and args.debug:
+    if args and hasattr(args, 'debug') and args.debug:
         logger.setLevel(logging.DEBUG)
         # 小さなサンプルサイズを使用して迅速にデバッグ
         logger.info("デバッグモード: 小さなサンプルサイズを使用")
@@ -2098,7 +2451,7 @@ def main(args=None):
     )
     
     # 訓練データセットは段階的トレーニングで作成するか、または通常トレーニングの場合のみ作成
-    if not (args and args.tiered):
+    if not (args and hasattr(args, 'tiered') and args.tiered):
         train_dataset = OptimizedMoleculeGraphDataset(
             train_ids, MOL_FILES_PATH, msp_data, 
             transform=transform, normalization=normalization,
@@ -2114,8 +2467,8 @@ def main(args=None):
     logger.info(f"有効なテストデータ: {len(test_dataset)}個")
     
     # GPU使用量を最適化するためのバッチサイズ調整
-    # A4500のメモリに適したバッチサイズ - データセットサイズに応じて自動調整
-    if args and args.batch_size:
+    # GPUメモリに適したバッチサイズ - データセットサイズに応じて自動調整
+    if args and hasattr(args, 'batch_size') and args.batch_size:
         batch_size = args.batch_size
         logger.info(f"指定されたバッチサイズを使用: {batch_size}")
     else:
@@ -2134,7 +2487,7 @@ def main(args=None):
     logger.info(f"バッチサイズ: {batch_size}, ワーカー数: {num_workers}")
     
     # 段階的トレーニングを使用しない場合のみデータローダを作成
-    if not (args and args.tiered):
+    if not (args and hasattr(args, 'tiered') and args.tiered):
         # プリフェッチファクターを調整
         prefetch_factor = 1 if len(train_ids) > 100000 else 2
         
@@ -2195,7 +2548,7 @@ def main(args=None):
     out_channels = MAX_MZ
     
     # メモリをクリア
-    aggressive_memory_management(train_dataset, val_dataset, test_dataset, force_gc=True)
+    aggressive_memory_cleanup(train_dataset, val_dataset, test_dataset, force_sync=True, purge_cache=True)
     
     # デバイスの設定
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -2221,7 +2574,7 @@ def main(args=None):
     
     # チェックポイントから再開
     start_epoch = 0
-    if args and args.resume:
+    if args and hasattr(args, 'resume') and args.resume:
         if os.path.exists(args.resume):
             logger.info(f"チェックポイントから再開: {args.resume}")
             checkpoint = torch.load(args.resume, map_location=device)
@@ -2251,12 +2604,12 @@ def main(args=None):
     )
     
     # エポック数とスケジューラーの設定
-    num_epochs = args.epochs if args and args.epochs else 25
+    num_epochs = args.epochs if args and hasattr(args, 'epochs') and args.epochs else 25
     patience = max(5, num_epochs // 5)  # エポック数に応じた忍耐回数を設定
     
     # 学習率スケジューラー（OneCycleLR - 高速収束用）
     # 段階的トレーニングの場合は各ティアで個別に設定
-    if not (args and args.tiered):
+    if not (args and hasattr(args, 'tiered') and args.tiered):
         steps_per_epoch = len(train_loader)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
@@ -2279,7 +2632,7 @@ def main(args=None):
     torch.cuda.empty_cache()
     
     # トレーニング開始（段階的または通常）
-    if args and args.tiered:
+    if args and hasattr(args, 'tiered') and args.tiered:
         # 段階的トレーニング
         logger.info("段階的トレーニングを使用")
         train_losses, val_losses, val_cosine_similarities, best_cosine = tiered_training(
@@ -2312,7 +2665,7 @@ def main(args=None):
             num_epochs=num_epochs,
             eval_interval=2,    # 2エポックごとに評価
             patience=patience,  # データセットサイズに応じた忍耐回数
-            grad_clip=1.0,      # 勾配クリッピング値
+            grad_clip=0.5,      # 勾配クリッピング値
             checkpoint_dir=checkpoint_dir,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
@@ -2327,7 +2680,7 @@ def main(args=None):
     torch.cuda.empty_cache()
     
     # 最良モデルを読み込む
-    best_model_path = os.path.join(checkpoint_dir, 'best_hybrid_ms_model.pth')
+    best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
     try:
         model.load_state_dict(torch.load(best_model_path, map_location=device))
         logger.info(f"最良モデルを読み込みました: {best_model_path}")
@@ -2337,26 +2690,38 @@ def main(args=None):
     # テストデータでの評価
     try:
         logger.info("テストデータでの評価を開始します...")
-        test_results = eval_model(model, test_loader, device, use_amp=True, test_dataset=test_dataset)
+        test_results = test_model(model, test_loader, device, use_amp=True, 
+                               test_dataset=test_dataset)
         logger.info(f"テストデータ平均コサイン類似度: {test_results['cosine_similarity']:.4f}")
         
         # 予測結果の可視化
-        viz_path = os.path.join(checkpoint_dir, "hybrid_prediction_visualization.png")
+        viz_path = os.path.join(checkpoint_dir, "prediction_visualization.png")
         visualize_results(test_results, num_samples=10, save_path=viz_path)
         logger.info(f"予測結果の可視化を保存しました: {viz_path}")
         
         # 類似度分布のヒストグラム
         similarities = []
         for i in range(len(test_results['y_true'])):
-            true_vector = test_results['y_true'][i].reshape(1, -1).cpu().numpy()
-            pred_vector = test_results['y_pred'][i].reshape(1, -1).cpu().numpy()
-            sim = cosine_similarity(true_vector, pred_vector)[0][0]
+            true_vector = test_results['y_true'][i].reshape(1, -1)
+            pred_vector = test_results['y_pred'][i].reshape(1, -1)
+            
+            # L2正規化
+            true_norm = np.sqrt(np.sum(true_vector**2)) + 1e-10
+            pred_norm = np.sqrt(np.sum(pred_vector**2)) + 1e-10
+            true_vector = true_vector / true_norm
+            pred_vector = pred_vector / pred_norm
+            
+            # コサイン類似度
+            sim = np.sum(true_vector * pred_vector)
+            
+            # 有効範囲内にクリップ
+            sim = max(-1.0, min(1.0, sim))
             similarities.append(sim)
         
         plt.figure(figsize=(10, 6))
         plt.hist(similarities, bins=20, alpha=0.7)
         plt.axvline(x=test_results['cosine_similarity'], color='r', linestyle='--', 
-                    label=f'平均: {test_results["cosine_similarity"]:.4f}')
+                   label=f'平均: {test_results["cosine_similarity"]:.4f}')
         plt.xlabel('コサイン類似度')
         plt.ylabel('サンプル数')
         plt.title('テストデータのコサイン類似度分布')
@@ -2408,3 +2773,38 @@ if __name__ == "__main__":
         current, peak = tracemalloc.get_traced_memory()
         logger.info(f"現在のメモリ使用量: {current / 10**6:.2f} MB; ピーク: {peak / 10**6:.2f} MB")
         tracemalloc.stop()
+    else:
+        # ミニバッチに分割して計算
+        similarities = []
+        
+        for i in range(0, batch_size, max_minibatch_size):
+            end_idx = min(i + max_minibatch_size, batch_size)
+            
+            # ミニバッチを抽出
+            y_true_mini = y_true[i:end_idx]
+            y_pred_mini = y_pred[i:end_idx]
+            
+            # NumPy配列に変換
+            y_true_np = y_true_mini.cpu().numpy() if isinstance(y_true_mini, torch.Tensor) else y_true_mini
+            y_pred_np = y_pred_mini.cpu().numpy() if isinstance(y_pred_mini, torch.Tensor) else y_pred_mini
+            
+            y_true_flat = y_true_np.reshape(y_true_np.shape[0], -1)
+            y_pred_flat = y_pred_np.reshape(y_pred_np.shape[0], -1)
+            
+            # ミニバッチの類似度を計算
+            dot_products = np.sum(y_true_flat * y_pred_flat, axis=1)
+            true_norms = np.sqrt(np.sum(y_true_flat**2, axis=1))
+            pred_norms = np.sqrt(np.sum(y_pred_flat**2, axis=1))
+            
+            # ゼロ除算を防ぐ
+            true_norms = np.maximum(true_norms, 1e-10)
+            pred_norms = np.maximum(pred_norms, 1e-10)
+            
+            mini_similarities = dot_products / (true_norms * pred_norms)
+            
+            # NaNや無限大の値を修正
+            mini_similarities = np.nan_to_num(mini_similarities, nan=0.0, posinf=1.0, neginf=-1.0)
+            
+            similarities.extend(mini_similarities)
+        
+return np.mean(similarities)
