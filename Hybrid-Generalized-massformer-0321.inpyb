@@ -1645,7 +1645,7 @@ def a4500_train_model(model, train_loader, val_loader, criterion, optimizer, sch
                 optimizer.zero_grad(set_to_none=True)  # メモリ効率のためNoneに設定
                 
                 # Automatic Mixed Precision (AMP)を使用した順伝播
-                with autocast():
+                with autocast('cuda'):
                     output, fragment_pred = model(processed_batch)
                     loss = criterion(output, processed_batch['spec'], fragment_pred, processed_batch['fragment_pattern'])
                 
