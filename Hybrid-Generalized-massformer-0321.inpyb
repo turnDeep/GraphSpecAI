@@ -24,7 +24,7 @@ import gc
 import pickle
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 # ===== A4500向け最適化：CUDA設定 =====
 # CUDA割り当てを明示的に制限（メモリ断片化を防ぐ）
@@ -598,7 +598,10 @@ class A4500OptimizedHybridMSModel(nn.Module):
     
     def forward(self, data):
         # グラデーションチェックポイントを使用（メモリ効率化）
-        return torch.utils.checkpoint.checkpoint(self._forward_impl, data)
+        # return torch.utils.checkpoint.checkpoint(self._forward_impl, data)
+
+        # 直接実装を使用
+        return self._forward_impl(data)
     
     def _forward_impl(self, data):
         device = next(self.parameters()).device
@@ -629,8 +632,8 @@ class A4500OptimizedHybridMSModel(nn.Module):
         # 特徴量の型変換（最適化）- メモリ節約のためfloat16を試す
         # ただし数値安定性が低下する場合はコメントアウト
         if torch.cuda.is_available():
-            x = x.half()
-            edge_attr = edge_attr.half()
+            x = x.to(device, dtype=torch.float16, non_blocking=True)
+            edge_attr = edge_attr.to(device, dtype=torch.float16, non_blocking=True)
         
         # GATレイヤーを通す - 段数削減
         x1 = F.leaky_relu(self.gat1(x, edge_index, edge_attr))
@@ -1524,7 +1527,7 @@ def a4500_train_model(model, train_loader, val_loader, criterion, optimizer, sch
             start_epoch = 0
     
     # Automatic Mixed Precision (AMP)のスケーラー
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
     
     # モデルをデバイスに明示的に転送
     model = model.to(device)
@@ -1905,7 +1908,7 @@ def a4500_evaluate_model(model, data_loader, criterion, device, use_amp=False, m
                 
                 # AMP使用時は混合精度で予測
                 if use_amp:
-                    with autocast():
+                    with autocast('cuda'):
                         output, fragment_pred = model(processed_batch)
                         loss = criterion(output, processed_batch['spec'], 
                                          fragment_pred, processed_batch['fragment_pattern'])
@@ -2041,7 +2044,7 @@ def a4500_test_model(model, test_loader, device, use_amp=True, max_batches=None)
                 
                 # 予測（混合精度使用時）
                 if use_amp:
-                    with autocast():
+                    with autocast('cuda'):
                         output, frag_pred = model(processed_batch)
                 else:
                     output, frag_pred = model(processed_batch)
