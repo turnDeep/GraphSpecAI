@@ -2416,7 +2416,7 @@ def a4500_main():
         epochs=num_epochs,
         pct_start=0.4,         # ウォームアップ期間を長く
         div_factor=10.0,       # 初期学習率 = max_lr/div_factor
-        final_div_factor=50.0  # 最終学習率 = max_lr/final_div_factor
+        final_div_factor=50.0,  # 最終学習率 = max_lr/final_div_factor
         verbose=False  # 追加
     )
     
