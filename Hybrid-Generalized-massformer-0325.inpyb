@@ -2672,7 +2672,7 @@ def a4500_main(args=None):
     # 最良モデルを読み込む
     try:
         best_model_path = os.path.join(CHECKPOINT_DIR, 'best_model.pth')
-        model.load_state_dict(torch.load(best_model_path, map_location=device))
+        model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
         logger.info(f"最良モデルを読み込みました: {best_model_path}")
     except Exception as e:
         logger.error(f"モデル読み込みエラー: {e}")
