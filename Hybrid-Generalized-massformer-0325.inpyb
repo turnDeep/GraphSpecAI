@@ -1672,9 +1672,13 @@ def a4500_train_model(model, train_loader, val_loader, criterion, optimizer, sch
                 scaler.step(optimizer)
                 scaler.update()
                 
-                # OneCycleLRスケジューラーの更新
+                # OneCycleLRスケジューラーの更新（ステップ数チェック付き）
                 if isinstance(scheduler, torch.optim.lr_scheduler.OneCycleLR):
-                    scheduler.step()
+                    # 総ステップ数を超えないようにチェック
+                    if scheduler.last_epoch < scheduler.total_steps - 1:
+                        scheduler.step()
+                    else:
+                        logger.warning(f"スケジューラーの最大ステップ数に達しました: {scheduler.total_steps}")
                 
                 # 損失を追跡
                 current_loss = loss.item()
@@ -2296,15 +2300,21 @@ def a4500_tiered_training(model, train_ids, val_loader, criterion, optimizer, sc
         # このティアの忍耐値を計算（前半のティアは早く次に進む）
         tier_patience = max(2, patience // 2) if tier_idx < len(train_tiers) - 1 else patience
         
-        # このティア用のスケジューラを作成（OneCycleLR）
+        # このティア用のスケジューラを作成（OneCycleLR）- 安全マージン付き
+        steps_per_epoch = len(tier_loader)
+        total_steps = steps_per_epoch * tier_epochs[tier_idx]
+        # 安全マージンとして5%追加
+        safe_total_steps = int(total_steps * 1.05)
+        
         tier_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=0.001 if tier_idx == 0 else 0.0008 * (0.8 ** tier_idx),
-            steps_per_epoch=len(tier_loader),
+            steps_per_epoch=steps_per_epoch,
             epochs=tier_epochs[tier_idx],
             pct_start=0.3,
             div_factor=10.0,
-            final_div_factor=100.0
+            final_div_factor=100.0,
+            total_steps=safe_total_steps  # 安全マージンを持った総ステップ数を指定
         )
         
         # 指定されたエポック数でこのティアをトレーニング
