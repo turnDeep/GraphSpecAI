@@ -1542,31 +1542,34 @@ def a4500_train_model(model, train_loader, val_loader, criterion, optimizer, sch
     # メモリ管理ヘルパー関数
     def _memory_checkpoint(force_reload=False):
         """メモリ中間チェックポイント - オプティマイザを一時的に再構築"""
-        aggressive_memory_cleanup(force_sync=True, purge_cache=True)
+        # モデル再構築に必要な変数を参照
+        nonlocal model, optimizer, device
         
+        # 必要なパラメータをモデルから取得
         if force_reload:
-            # モデルを再初期化
-            nonlocal model, optimizer
+            # モデルパラメータを取得
+            curr_node_features = model.gat1.in_channels
+            curr_edge_features = model.gat1.edge_dim
+            curr_hidden_channels = model.hidden_channels
+            curr_out_channels = model.forw_out_layer.out_features
             
-            # モデルと最適化器の状態を保存
+            # 残りのコードは同じ
             model_state = model.state_dict()
             optimizer_state = optimizer.state_dict()
             
-            # オブジェクトを削除
             del model
             del optimizer
             
-            # GPUメモリを強制クリア
             torch.cuda.empty_cache()
             gc.collect()
             torch.cuda.empty_cache()
             
-            # モデルと最適化器を再構築
+            # モデルと最適化器を再構築（取得したパラメータを使用）
             model = A4500OptimizedHybridMSModel(
-                node_features=node_features,
-                edge_features=edge_features,
-                hidden_channels=hidden_channels,
-                out_channels=out_channels,
+                node_features=curr_node_features,
+                edge_features=curr_edge_features,
+                hidden_channels=curr_hidden_channels,
+                out_channels=curr_out_channels,
                 num_fragments=NUM_FRAGS,
                 prec_mass_offset=10,
                 bidirectional=True,
