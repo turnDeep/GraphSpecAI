@@ -2695,5 +2695,14 @@ def a4500_main(args=None):
     return model, train_losses, val_losses, val_cosine_similarities, test_results
 
 if __name__ == "__main__":
-    args = parse_args()
+    # JupyterLabでの実行の場合は、コマンドライン引数の代わりに直接オプションを設定
+    class Args:
+        def __init__(self):
+            self.tiered = True  # 段階的トレーニングを使用するか
+            self.max_compounds = None  # 最大化合物数（制限したい場合は数値を設定）
+            self.batch_size = 4  # バッチサイズ
+            self.epochs = 15  # エポック数
+            self.resume = None  # チェックポイントファイルのパス（再開したい場合は設定）
+    
+    args = Args()
     a4500_main(args)
