@@ -1699,9 +1699,11 @@ def a4500_train_model(model, train_loader, val_loader, criterion, optimizer, sch
                     if new_loader != train_loader:
                         train_loader = new_loader
                         train_pbar.close()
-                        remaining_batches = len(train_loader) - batch_idx
-                        train_pbar = tqdm(islice(train_loader, remaining_batches), 
-                                        desc=f"Epoch {epoch+1}/{num_epochs}", position=0, leave=True)
+                        # 新しいローダーの全データを使用し、バッチカウンタを更新
+                        train_pbar = tqdm(train_loader, 
+                                       desc=f"Epoch {epoch+1}/{num_epochs} (調整済み)", position=0, leave=True)
+                        # エポック途中でバッチサイズ変更した場合はエポックを最初から再開
+                        break  # 現在のループを抜けて次のエポックに進む
                 
                 # バッチチェックポイント（より少なく - 1000バッチごと）
                 if (batch_idx + 1) % 1000 == 0:
