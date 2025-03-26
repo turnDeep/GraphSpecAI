@@ -1347,7 +1347,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             try:
                 # 定期的なメモリチェック
                 if batch_idx % memory_check_interval == 0:
-                    memory_cleared = limit_memory_usage(80)
+                    memory_cleared = aggressive_memory_cleanup(percent=80)
                     if memory_cleared and batch_idx > 0:
                         logger.info("メモリ使用量を削減しました")
                 
