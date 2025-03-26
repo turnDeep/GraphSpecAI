@@ -1408,11 +1408,11 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 torch.cuda.empty_cache()
                 
                 # 非常に大規模なデータセットでは定期的にキャッシュをクリア
-                if len(train_dataset) > 100000 and batch_idx % (memory_check_interval * 2) == 0:
-                    if hasattr(train_dataset, 'graph_cache'):
+                if len(train_loader.dataset) > 100000 and batch_idx % (memory_check_interval * 2) == 0:
+                    if hasattr(train_loader.dataset, 'graph_cache'):
                         # キャッシュサイズが大きくなりすぎたらクリア
-                        if len(train_dataset.graph_cache) > 5000:
-                            train_dataset.graph_cache.clear()
+                        if len(train_loader.dataset.graph_cache) > 5000:
+                            train_loader.dataset.graph_cache.clear()
                             gc.collect()
                 
                 # バッチチェックポイント（1000バッチごと）
