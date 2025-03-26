@@ -81,9 +81,11 @@ DATA_PATH = "data/"
 MOL_FILES_PATH = os.path.join(DATA_PATH, "mol_files/")
 MSP_FILE_PATH = os.path.join(DATA_PATH, "NIST17.MSP")
 CACHE_DIR = os.path.join(DATA_PATH, "cache/")
+CHECKPOINT_DIR = os.path.join(CACHE_DIR, "checkpoints/")
 
-# キャッシュディレクトリの作成
+# ディレクトリの作成
 os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 # 最大m/z値の設定
 MAX_MZ = 2000
