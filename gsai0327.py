@@ -25,6 +25,8 @@ import pickle
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from torch.cuda.amp import autocast, GradScaler
+import time
+import datetime
 
 # ===== メモリ管理関連の関数 =====
 def aggressive_memory_cleanup(force_sync=True, percent=70, purge_cache=False):
@@ -1525,25 +1527,25 @@ def _plot_training_progress(train_losses, val_losses, val_cosine_similarities, b
     plt.figure(figsize=(12, 5))
     
     plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label='訓練損失')
+    plt.plot(train_losses, label='Training Loss')
     if val_losses:  # 検証損失が存在する場合
         # エポック間隔を調整
         val_epochs = np.linspace(0, len(train_losses)-1, len(val_losses))
-        plt.plot(val_epochs, val_losses, label='検証損失')
-    plt.xlabel('エポック')
-    plt.ylabel('損失')
+        plt.plot(val_epochs, val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
     plt.legend()
-    plt.title('損失曲線')
+    plt.title('Loss Curves')
     
     plt.subplot(1, 2, 2)
     if val_cosine_similarities:  # コサイン類似度が存在する場合
         val_epochs = np.linspace(0, len(train_losses)-1, len(val_cosine_similarities))
-        plt.plot(val_epochs, val_cosine_similarities, label='検証コサイン類似度')
-        plt.axhline(y=best_cosine, color='r', linestyle='--', label=f'最良: {best_cosine:.4f}')
-    plt.xlabel('エポック')
-    plt.ylabel('コサイン類似度')
+        plt.plot(val_epochs, val_cosine_similarities, label='Validation Cosine Similarity')
+        plt.axhline(y=best_cosine, color='r', linestyle='--', label=f'Best: {best_cosine:.4f}')
+    plt.xlabel('Epoch')
+    plt.ylabel('Cosine Similarity')
     plt.legend()
-    plt.title('コサイン類似度')
+    plt.title('Cosine Similarity')
     
     plt.tight_layout()
     plt.savefig('hybrid_learning_curves.png')
