@@ -1523,7 +1523,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     return train_losses, val_losses, val_cosine_similarities, best_cosine
 
 def _plot_training_progress(train_losses, val_losses, val_cosine_similarities, best_cosine):
-    """トレーニング進捗の可視化"""
+    """Training progress visualization"""
     plt.figure(figsize=(12, 5))
     
     plt.subplot(1, 2, 1)
@@ -1550,7 +1550,7 @@ def _plot_training_progress(train_losses, val_losses, val_cosine_similarities, b
     plt.tight_layout()
     plt.savefig('hybrid_learning_curves.png')
     plt.close()
-
+    
 def evaluate_model(model, data_loader, criterion, device, use_amp=False):
     """モデル評価用の関数"""
     model.eval()
@@ -1849,7 +1849,7 @@ def tiered_training(model, train_ids, val_loader, criterion, optimizer, schedule
     return all_train_losses, all_val_losses, all_val_cosine_similarities, best_cosine
 
 def visualize_results(test_results, num_samples=10):
-    """予測結果の可視化"""
+    """Prediction result visualization"""
     plt.figure(figsize=(15, num_samples*4))
     
     # サンプルのインデックスをランダムに選択
@@ -1881,10 +1881,10 @@ def visualize_results(test_results, num_samples=10):
             plt.plot(range(len(true_spec)), true_spec, 'b-')
             
         # タイトルの設定
-        mol_id_str = f" - 分子ID {test_results['mol_ids'][idx]}" if 'mol_ids' in test_results else ""
-        plt.title(f"実測スペクトル{mol_id_str}")
+        mol_id_str = f" - ID: {test_results['mol_ids'][idx]}" if 'mol_ids' in test_results else ""
+        plt.title(f"Measured Spectrum{mol_id_str}")
         plt.xlabel("m/z")
-        plt.ylabel("強度")
+        plt.ylabel("Intensity")
         
         # 予測スペクトル
         plt.subplot(num_samples, 2, 2*i + 2)
@@ -1897,9 +1897,9 @@ def visualize_results(test_results, num_samples=10):
         else:
             plt.plot(range(len(pred_spec)), pred_spec, 'r-')
             
-        plt.title(f"予測スペクトル - コサイン類似度: {sim:.4f}")
+        plt.title(f"Predicted Spectrum - Similarity: {sim:.4f}")
         plt.xlabel("m/z")
-        plt.ylabel("強度")
+        plt.ylabel("Intensity")
     
     plt.tight_layout()
     plt.savefig('hybrid_prediction_visualization.png')
@@ -2178,17 +2178,17 @@ def main():
         plt.figure(figsize=(10, 6))
         plt.hist(similarities, bins=20, alpha=0.7)
         plt.axvline(x=test_results['cosine_similarity'], color='r', linestyle='--', 
-                    label=f'平均: {test_results["cosine_similarity"]:.4f}')
-        plt.xlabel('コサイン類似度')
-        plt.ylabel('サンプル数')
-        plt.title('テストデータのコサイン類似度分布')
+                    label=f'Mean: {test_results["cosine_similarity"]:.4f}')
+        plt.xlabel('Cosine Similarity')
+        plt.ylabel('Number of Samples')
+        plt.title('Cosine Similarity Distribution of Test Data')
         plt.legend()
         plt.grid(alpha=0.3)
         plt.savefig('similarity_distribution.png')
-        logger.info("類似度分布を保存しました: similarity_distribution.png")
+        logger.info("Similarity distribution saved: similarity_distribution.png")
         plt.close()
     except Exception as e:
-        logger.error(f"追加分析エラー: {e}")
+        logger.error(f"Error in additional analysis: {e}")
     
     logger.info("============= 質量スペクトル予測モデルの実行終了 =============")
     return model, train_losses, val_losses, val_cosine_similarities, test_results
