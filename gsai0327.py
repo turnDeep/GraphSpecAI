@@ -2141,7 +2141,7 @@ def main():
                 # 最後のティアモデルを使用
                 best_model_path = os.path.join(CACHE_DIR, "checkpoints", tier_models[-1])
         
-        model.load_state_dict(torch.load(best_model_path, map_location=device))
+        model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
         logger.info(f"最良モデルを読み込みました: {best_model_path}")
     except Exception as e:
         logger.error(f"モデル読み込みエラー: {e}")
