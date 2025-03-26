@@ -25,12 +25,8 @@ import pickle
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from torch.cuda.amp import autocast, GradScaler
-import time
-import datetime
-import argparse
-import os
 
-# ===== 強化版メモリ管理関数 =====
+# ===== メモリ管理関連の関数 =====
 def aggressive_memory_cleanup(force_sync=True, percent=70, purge_cache=False):
     """強化版メモリクリーンアップ関数"""
     gc.collect()
@@ -54,22 +50,27 @@ def aggressive_memory_cleanup(force_sync=True, percent=70, purge_cache=False):
         
         if purge_cache:
             # データセットキャッシュが存在する場合はクリア
-            for obj_name in list(globals()):
-                obj = globals()[obj_name]
-                if hasattr(obj, 'graph_cache') and isinstance(obj.graph_cache, dict):
-                    obj.graph_cache.clear()
+            for obj_name in ['train_dataset', 'val_dataset', 'test_dataset']:
+                if obj_name in globals():
+                    obj = globals()[obj_name]
+                    if hasattr(obj, 'graph_cache') and isinstance(obj.graph_cache, dict):
+                        obj.graph_cache.clear()
+                        logger.info(f"{obj_name}のグラフキャッシュをクリア")
         
         # もう一度クリーンアップ
         gc.collect()
         torch.cuda.empty_cache()
         
-        # PyTorchメモリアロケータをリセット（実験的）
+        # PyTorchメモリアロケータをリセット
         if hasattr(torch.cuda, 'memory_stats'):
             torch.cuda.reset_peak_memory_stats()
         
         return True
     
     return False
+
+# CUDA割り当てを明示的に制限（メモリ断片化を防ぐ）
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
 
 # ロガーの設定
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -80,11 +81,9 @@ DATA_PATH = "data/"
 MOL_FILES_PATH = os.path.join(DATA_PATH, "mol_files/")
 MSP_FILE_PATH = os.path.join(DATA_PATH, "NIST17.MSP")
 CACHE_DIR = os.path.join(DATA_PATH, "cache/")
-CHECKPOINT_DIR = os.path.join(DATA_PATH, "checkpoints/")  # 追加
 
 # キャッシュディレクトリの作成
 os.makedirs(CACHE_DIR, exist_ok=True)
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)  # 追加
 
 # 最大m/z値の設定
 MAX_MZ = 2000
@@ -1235,7 +1234,7 @@ def cosine_similarity_score(y_true, y_pred):
 ###############################
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, device, num_epochs,
-               eval_interval=2, patience=10, grad_clip=1.0, checkpoint_dir=CHECKPOINT_DIR):
+               eval_interval=2, patience=10, grad_clip=1.0, checkpoint_dir=CACHE_DIR):
     """最適化されたモデルのトレーニング（チェックポイント機能付き）"""
     train_losses = []
     val_losses = []
@@ -1289,8 +1288,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                     
             # メモリクリーンアップ
             del checkpoint
-            gc.collect()
-            torch.cuda.empty_cache()
+            aggressive_memory_cleanup()
         except Exception as e:
             logger.error(f"チェックポイント読み込みエラー: {e}")
             start_epoch = 0
@@ -1310,9 +1308,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     memory_check_interval = max(1, total_batches // 10)  # 10回程度チェック
     
     for epoch in range(start_epoch, num_epochs):
-        # 4エポックごとに強化版メモリクリーンアップを実行
+        # 4エポックごとに強力なメモリクリーンアップを実行
         if epoch % 4 == 0:
-            logger.info(f"エポック {epoch+1}: 定期的なメモリクリーンアップを実行")
+            logger.info(f"Epoch {epoch+1}/{num_epochs} - 定期的なメモリクリーンアップを実行")
             aggressive_memory_cleanup(force_sync=True, purge_cache=True)
         
         # 訓練モード
@@ -1395,15 +1393,35 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                             train_dataset.graph_cache.clear()
                             gc.collect()
                 
+                # バッチチェックポイント（1000バッチごと）
+                if (batch_idx + 1) % 1000 == 0:
+                    batch_checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch+1}_batch_{batch_idx+1}.pth")
+                    torch.save({
+                        'epoch': epoch,
+                        'batch_idx': batch_idx,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+                        'train_losses': train_losses,
+                        'val_losses': val_losses,
+                        'val_cosine_similarities': val_cosine_similarities,
+                        'best_cosine': best_cosine,
+                        'early_stopping_counter': early_stopping_counter
+                    }, batch_checkpoint_path)
+                    logger.info(f"バッチチェックポイントを保存: {batch_checkpoint_path}")
+            
             except RuntimeError as e:
-                logger.error(f"バッチ処理エラー: {str(e)}")
                 if "CUDA out of memory" in str(e):
-                    logger.error("CUDAメモリ不足を検出、強制的にメモリクリーンアップを実行")
+                    logger.error(f"CUDAメモリ不足: {str(e)}")
+                    # 緊急メモリクリーンアップ
                     aggressive_memory_cleanup(force_sync=True, purge_cache=True)
-                # スタックトレースを出力（デバッグに役立つ）
-                import traceback
-                traceback.print_exc()
-                continue
+                    continue
+                else:
+                    print(f"バッチ処理エラー: {str(e)}")
+                    # スタックトレースを出力（デバッグに役立つ）
+                    import traceback
+                    traceback.print_exc()
+                    continue
         
         # エポック終了時の評価
         if batch_count > 0:
@@ -1428,6 +1446,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             
             # 定期的な検証（すべてのエポックで行わない）
             if (epoch + 1) % eval_interval == 0 or epoch == num_epochs - 1:
+                # 評価前にメモリクリーンアップ
+                aggressive_memory_cleanup()
+                
                 # 評価モードで検証
                 val_metrics = evaluate_model(model, val_loader, criterion, device, use_amp=True)
                 val_loss = val_metrics['loss']
@@ -1449,7 +1470,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                     early_stopping_counter = 0
                     best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
                     torch.save(model.state_dict(), best_model_path)
-                    logger.info(f"新しい最良モデル保存: コサイン類似度 = {cosine_sim:.4f} - {best_model_path}")
+                    logger.info(f"新しい最良モデル保存: コサイン類似度 = {cosine_sim:.4f}")
                 else:
                     early_stopping_counter += 1
                     logger.info(f"早期停止カウンター: {early_stopping_counter}/{patience}")
@@ -1653,6 +1674,157 @@ def eval_model(model, test_loader, device, use_amp=True):
         'mol_ids': mol_ids
     }
 
+def tiered_training(model, train_ids, val_loader, criterion, optimizer, scheduler, device, 
+                  mol_files_path, msp_data, transform, normalization, cache_dir, 
+                  checkpoint_dir=CACHE_DIR, num_workers=4, patience=5):
+    """段階的トレーニング（大規模データセット用）"""
+    logger.info("段階的トレーニングを開始")
+    
+    # データセットサイズに基づくティア定義
+    if len(train_ids) > 100000:
+        train_tiers = [
+            train_ids[:10000],    # 1万サンプルから開始
+            train_ids[:30000],    # 次に3万
+            train_ids[:60000],    # 次に6万
+            train_ids[:100000],   # 次に10万
+            train_ids             # 最後に全データ
+        ]
+        tier_epochs = [3, 3, 4, 5, 15]  # ティアごとのエポック数
+    elif len(train_ids) > 50000:
+        train_tiers = [
+            train_ids[:10000], 
+            train_ids[:30000],
+            train_ids
+        ]
+        tier_epochs = [3, 4, 23]
+    else:
+        # 小さなデータセットは段階を少なく
+        train_tiers = [
+            train_ids[:5000] if len(train_ids) > 5000 else train_ids[:len(train_ids)//2],
+            train_ids
+        ]
+        tier_epochs = [5, 25]
+    
+    best_cosine = 0.0
+    all_train_losses = []
+    all_val_losses = []
+    all_val_cosine_similarities = []
+    
+    # 進行状況を表示するために各ティアにプレフィックスを追加
+    tier_prefixes = [f"Tier {i+1}/{len(train_tiers)}" for i in range(len(train_tiers))]
+    
+    # 各ティアを処理
+    for tier_idx, (tier_ids, tier_prefix) in enumerate(zip(train_tiers, tier_prefixes)):
+        tier_name = f"{tier_prefix} ({len(tier_ids)} サンプル)"
+        logger.info(f"=== {tier_name} のトレーニングを開始 ===")
+        
+        # ティア間でメモリクリーンアップ
+        aggressive_memory_cleanup(force_sync=True, purge_cache=True)
+        
+        # このティア用のデータセット作成
+        tier_dataset = OptimizedMoleculeGraphDataset(
+            tier_ids, mol_files_path, msp_data, 
+            transform=transform, normalization=normalization,
+            augment=True, cache_dir=cache_dir
+        )
+        
+        # ティアサイズに基づいてバッチサイズを調整
+        if len(tier_ids) <= 10000:
+            tier_batch_size = 16  # 小さいティアでは大きいバッチサイズ
+        elif len(tier_ids) <= 30000:
+            tier_batch_size = 12  # 中間ティア
+        elif len(tier_ids) <= 60000:
+            tier_batch_size = 8   # 大きいティア
+        else:
+            tier_batch_size = 6   # 非常に大きいティア
+        
+        logger.info(f"ティア {tier_idx+1} のバッチサイズ: {tier_batch_size}")
+        
+        # このティア用のデータローダを作成
+        tier_loader = DataLoader(
+            tier_dataset, 
+            batch_size=tier_batch_size,
+            shuffle=True, 
+            collate_fn=optimized_collate_fn,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=True if num_workers > 0 else False,
+            drop_last=True,
+            prefetch_factor=2 if num_workers > 0 else None
+        )
+        
+        # オプティマイザの学習率を調整
+        for param_group in optimizer.param_groups:
+            if tier_idx == 0:
+                param_group['lr'] = 0.001  # 小さいデータセット用に高い学習率
+            else:
+                param_group['lr'] = 0.0008 * (0.8 ** tier_idx)  # 大きいティア向けに学習率を減少
+        
+        # このティアの忍耐値を計算（前半のティアは早く次に進む）
+        tier_patience = max(2, patience // 2) if tier_idx < len(train_tiers) - 1 else patience
+        
+        # このティア用のスケジューラを作成（OneCycleLR）
+        steps_per_epoch = len(tier_loader)
+        tier_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=0.001 if tier_idx == 0 else 0.0008 * (0.8 ** tier_idx),
+            steps_per_epoch=steps_per_epoch,
+            epochs=tier_epochs[tier_idx],
+            pct_start=0.3,
+            div_factor=10.0,
+            final_div_factor=100.0
+        )
+        
+        # 指定されたエポック数でこのティアをトレーニング
+        train_losses, val_losses, val_cosine_similarities, tier_best_cosine = train_model(
+            model=model,
+            train_loader=tier_loader,
+            val_loader=val_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            scheduler=tier_scheduler,
+            device=device,
+            num_epochs=tier_epochs[tier_idx],
+            eval_interval=1,  # 毎エポック評価
+            patience=tier_patience,
+            grad_clip=1.0,
+            checkpoint_dir=os.path.join(checkpoint_dir, f"tier{tier_idx+1}")
+        )
+        
+        # 全体の最良性能を更新
+        best_cosine = max(best_cosine, tier_best_cosine)
+        
+        # 損失と類似度を記録
+        all_train_losses.extend(train_losses)
+        all_val_losses.extend(val_losses)
+        all_val_cosine_similarities.extend(val_cosine_similarities)
+        
+        # ティア間でキャッシュをクリア
+        aggressive_memory_cleanup(force_sync=True, purge_cache=True)
+        del tier_dataset, tier_loader
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # ティアチェックポイントを保存
+        tier_checkpoint_path = os.path.join(checkpoint_dir, f"tier{tier_idx+1}_model.pth")
+        torch.save(model.state_dict(), tier_checkpoint_path)
+        logger.info(f"ティア {tier_idx+1} チェックポイント保存: {tier_checkpoint_path}")
+        
+        # ティア間でシステムのメモリを安定化
+        logger.info(f"ティア {tier_idx+1} 完了、次のティアの前にメモリを安定化")
+        time.sleep(5)  # 短い休憩を入れてシステムを安定化
+    
+    # 全ティアの学習曲線を保存
+    try:
+        final_plot_path = os.path.join(checkpoint_dir, "tiered_learning_curves.png")
+        _plot_training_progress(all_train_losses, all_val_losses, all_val_cosine_similarities, 
+                              best_cosine)
+        logger.info(f"段階的トレーニングの学習曲線を保存: {final_plot_path}")
+    except Exception as e:
+        logger.error(f"プロット作成エラー: {str(e)}")
+    
+    return all_train_losses, all_val_losses, all_val_cosine_similarities, best_cosine
+
 def visualize_results(test_results, num_samples=10):
     """予測結果の可視化"""
     plt.figure(figsize=(15, num_samples*4))
@@ -1710,171 +1882,11 @@ def visualize_results(test_results, num_samples=10):
     plt.savefig('hybrid_prediction_visualization.png')
     plt.close()
 
-def tiered_training(model, train_ids, val_loader, criterion, optimizer, scheduler, device, 
-                  mol_files_path, msp_data, transform, normalization, cache_dir, 
-                  checkpoint_dir=CHECKPOINT_DIR, num_workers=4, patience=10):
-    """段階的トレーニング（大規模データセット用）"""
-    logger.info("段階的トレーニングを開始")
-    
-    # ティア定義（徐々に大きなサブセット）
-    if len(train_ids) > 100000:
-        train_tiers = [
-            train_ids[:10000],    # 1万サンプルから開始
-            train_ids[:30000],    # 次に3万
-            train_ids[:60000],    # 次に6万
-            train_ids[:100000],   # 次に10万
-            train_ids             # 最後に全データ
-        ]
-        tier_epochs = [5, 5, 5, 5, 10]  # ティアごとのエポック数
-    elif len(train_ids) > 50000:
-        train_tiers = [
-            train_ids[:10000], 
-            train_ids[:30000],
-            train_ids
-        ]
-        tier_epochs = [6, 8, 16]
-    else:
-        # 小さなデータセットは段階を少なく
-        train_tiers = [
-            train_ids[:5000] if len(train_ids) > 5000 else train_ids[:len(train_ids)//2],
-            train_ids
-        ]
-        tier_epochs = [10, 20]
-    
-    best_cosine = 0.0
-    all_train_losses = []
-    all_val_losses = []
-    all_val_cosine_similarities = []
-    
-    # 進行状況を表示するために各ティアにプレフィックスを追加
-    tier_prefixes = [f"Tier {i+1}/{len(train_tiers)}" for i in range(len(train_tiers))]
-    
-    # 各ティアを処理
-    for tier_idx, (tier_ids, tier_prefix) in enumerate(zip(train_tiers, tier_prefixes)):
-        tier_name = f"{tier_prefix} ({len(tier_ids)} サンプル)"
-        logger.info(f"=== {tier_name} のトレーニングを開始 ===")
-        
-        # このティア用のデータセット作成
-        tier_dataset = OptimizedMoleculeGraphDataset(
-            tier_ids, mol_files_path, msp_data, 
-            transform=transform, normalization=normalization,
-            augment=True, cache_dir=cache_dir
-        )
-        
-        # ティアサイズに基づいてバッチサイズを調整
-        if len(tier_ids) <= 10000:
-            tier_batch_size = 16  # 小さいティアでは大きいバッチサイズ
-        elif len(tier_ids) <= 30000:
-            tier_batch_size = 12   # 中間ティア
-        elif len(tier_ids) <= 60000:
-            tier_batch_size = 8   # 大きいティア
-        else:
-            tier_batch_size = 4   # 非常に大きいティア
-        
-        logger.info(f"ティア {tier_idx+1} のバッチサイズ: {tier_batch_size}")
-        
-        # このティア用のデータローダを作成
-        tier_loader = DataLoader(
-            tier_dataset, 
-            batch_size=tier_batch_size,
-            shuffle=True, 
-            collate_fn=optimized_collate_fn,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=True if num_workers > 0 else False,
-            drop_last=True,
-            prefetch_factor=2 if num_workers > 0 else None
-        )
-        
-        # オプティマイザの学習率を調整
-        for param_group in optimizer.param_groups:
-            if tier_idx == 0:
-                param_group['lr'] = 0.001  # 小さいデータセット用に高い学習率
-            else:
-                param_group['lr'] = 0.0008 * (0.8 ** tier_idx)  # 大きいティア向けに学習率を減少
-        
-        # このティアの忍耐値を計算（前半のティアは早く次に進む）
-        tier_patience = max(3, patience // 2) if tier_idx < len(train_tiers) - 1 else patience
-        
-        # このティア用のスケジューラを作成（OneCycleLR）
-        steps_per_epoch = len(tier_loader)
-        tier_scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=0.001 if tier_idx == 0 else 0.0008 * (0.8 ** tier_idx),
-            steps_per_epoch=steps_per_epoch,
-            epochs=tier_epochs[tier_idx],
-            pct_start=0.3,
-            div_factor=10.0,
-            final_div_factor=100.0
-        )
-        
-        # 指定されたエポック数でこのティアをトレーニング
-        train_losses, val_losses, val_cosine_similarities, tier_best_cosine = train_model(
-            model=model,
-            train_loader=tier_loader,
-            val_loader=val_loader,
-            criterion=criterion,
-            optimizer=optimizer,
-            scheduler=tier_scheduler,
-            device=device,
-            num_epochs=tier_epochs[tier_idx],
-            eval_interval=1,  # 毎エポック評価
-            patience=tier_patience,
-            grad_clip=1.0,
-            checkpoint_dir=os.path.join(checkpoint_dir, f"tier{tier_idx+1}")
-        )
-        
-        # 全体の最良性能を更新
-        best_cosine = max(best_cosine, tier_best_cosine)
-        
-        # 損失と類似度を記録
-        all_train_losses.extend(train_losses)
-        all_val_losses.extend(val_losses)
-        all_val_cosine_similarities.extend(val_cosine_similarities)
-        
-        # ティア間でキャッシュをクリア
-        aggressive_memory_cleanup(force_sync=True, purge_cache=True)
-        del tier_dataset, tier_loader
-        torch.cuda.empty_cache()
-        
-        # ティアチェックポイントを保存
-        tier_checkpoint_path = os.path.join(checkpoint_dir, f"tier{tier_idx+1}_model.pth")
-        torch.save(model.state_dict(), tier_checkpoint_path)
-        logger.info(f"ティア {tier_idx+1} チェックポイント保存: {tier_checkpoint_path}")
-        
-        # ティア間でシステムのメモリを安定化
-        logger.info(f"ティア {tier_idx+1} 完了、次のティアの前にメモリを安定化")
-        time.sleep(5)
-    
-    # 全ティアの学習曲線を保存
-    try:
-        _plot_training_progress(all_train_losses, all_val_losses, all_val_cosine_similarities, 
-                              best_cosine)
-        logger.info(f"段階的トレーニングの学習曲線を保存")
-    except Exception as e:
-        logger.error(f"プロット作成エラー: {str(e)}")
-    
-    return all_train_losses, all_val_losses, all_val_cosine_similarities, best_cosine
-
-def parse_args():
-    """コマンドライン引数をパース"""
-    parser = argparse.ArgumentParser(description="質量スペクトル予測モデルのトレーニング")
-    parser.add_argument("--tiered", action="store_true", help="段階的トレーニングを使用")
-    parser.add_argument("--max-compounds", type=int, default=None, help="最大化合物数")
-    parser.add_argument("--batch-size", type=int, default=None, help="バッチサイズの指定")
-    parser.add_argument("--epochs", type=int, default=30, help="トレーニングエポック数")
-    parser.add_argument("--resume", type=str, default=None, help="チェックポイントファイルからの再開")
-    return parser.parse_args()
-
 ###############################
 # メイン関数（最適化）
 ###############################
 
-def main(args=None):
-    # コマンドライン引数の処理
-    if args is None:
-        args = parse_args()
-    
+def main():
     # 開始メッセージ
     logger.info("============= 質量スペクトル予測モデルの実行開始 =============")
     
@@ -1929,11 +1941,6 @@ def main(args=None):
     
     logger.info(f"MOLファイルとMSPデータが揃っている化合物: {len(mol_ids)}個")
     
-    # 引数で最大化合物数が指定されている場合は制限
-    if hasattr(args, 'max_compounds') and args.max_compounds and len(mol_ids) > args.max_compounds:
-        logger.info(f"引数で指定された最大化合物数 {args.max_compounds} に制限します")
-        mol_ids = mol_ids[:args.max_compounds]
-    
     # データ分割 (訓練:検証:テスト = 80:10:10)
     train_ids, test_ids = train_test_split(mol_ids, test_size=0.2, random_state=42)
     val_ids, test_ids = train_test_split(test_ids, test_size=0.5, random_state=42)
@@ -1946,17 +1953,7 @@ def main(args=None):
     transform = "log10over3"  # スペクトル変換タイプ
     normalization = "l1"      # 正規化タイプ
     
-    # データセット作成（最適化版）
-    # 段階的トレーニングでは訓練データセットは各ティアで作成
-    if not hasattr(args, 'tiered') or not args.tiered:
-        train_dataset = OptimizedMoleculeGraphDataset(
-            train_ids, MOL_FILES_PATH, msp_data, 
-            transform=transform, normalization=normalization,
-            augment=True, cache_dir=CACHE_DIR
-        )
-    else:
-        train_dataset = None  # 段階的トレーニングでは後で作成
-    
+    # データセット作成 - 段階的トレーニングを使用するため訓練データセットは後で作成
     val_dataset = OptimizedMoleculeGraphDataset(
         val_ids, MOL_FILES_PATH, msp_data,
         transform=transform, normalization=normalization,
@@ -1969,47 +1966,23 @@ def main(args=None):
         augment=False, cache_dir=CACHE_DIR
     )
     
-    if train_dataset:
-        logger.info(f"有効な訓練データ: {len(train_dataset)}個")
-    else:
-        logger.info("段階的トレーニングを使用するため、訓練データセットは後で作成されます")
     logger.info(f"有効な検証データ: {len(val_dataset)}個")
     logger.info(f"有効なテストデータ: {len(test_dataset)}個")
     
     # GPU使用量を最適化するためのバッチサイズ調整
-    # バッチサイズの指定がある場合はそれを使用
-    if hasattr(args, 'batch_size') and args.batch_size:
-        batch_size = args.batch_size
+    # A4500のメモリに適したバッチサイズ - データセットサイズに応じて自動調整
+    if len(train_ids) > 100000:
+        batch_size = 8  # 非常に大きなデータセット用
+    elif len(train_ids) > 50000:
+        batch_size = 12  # 大きなデータセット用
     else:
-        # A4500のメモリに適したバッチサイズ - データセットサイズに応じて自動調整
-        if len(train_ids) > 100000:
-            batch_size = 8  # 非常に大きなデータセット用
-        elif len(train_ids) > 50000:
-            batch_size = 12  # 大きなデータセット用
-        else:
-            batch_size = 16  # 通常サイズのデータセット用
+        batch_size = 16  # 通常サイズのデータセット用
         
-    num_workers = min(4, os.cpu_count())  # CPU数に応じて調整
+    num_workers = min(16, os.cpu_count())  # CPU数に応じて調整
     
     logger.info(f"バッチサイズ: {batch_size}, ワーカー数: {num_workers}")
     
-    # データローダー作成 - 最適化設定
-    # 段階的トレーニングの場合は訓練データローダーを作成しない
-    if not hasattr(args, 'tiered') or not args.tiered:
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=batch_size,
-            shuffle=True, 
-            collate_fn=optimized_collate_fn,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=True if num_workers > 0 else False,
-            drop_last=True,
-            prefetch_factor=2 if num_workers > 0 else None
-        )
-    else:
-        train_loader = None  # 段階的トレーニングでは各ティアで作成
-    
+    # データローダー作成 - 段階的トレーニングのため訓練ローダーは作成しない
     val_loader = DataLoader(
         val_dataset, 
         batch_size=batch_size,
@@ -2055,18 +2028,16 @@ def main(args=None):
             if gpu_memory_allocated_percent > percent:
                 logger.warning(f"GPUメモリ使用率が高い ({gpu_memory_allocated_percent:.1f}%)。メモリ管理を強化します。")
                 # データセットのキャッシュをクリア
-                if train_dataset and hasattr(train_dataset, 'graph_cache'):
-                    train_dataset.graph_cache.clear()
-                if hasattr(val_dataset, 'graph_cache'):
+                if 'val_dataset' in globals() and hasattr(val_dataset, 'graph_cache'):
                     val_dataset.graph_cache.clear()
-                if hasattr(test_dataset, 'graph_cache'):
+                if 'test_dataset' in globals() and hasattr(test_dataset, 'graph_cache'):
                     test_dataset.graph_cache.clear()
                 torch.cuda.empty_cache()
                 return True
         return False
     
     # モデルの初期化前にメモリ確保
-    limit_memory_usage()
+    aggressive_memory_cleanup(force_sync=True, purge_cache=True)
     
     # デバイスの設定
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -2090,22 +2061,6 @@ def main(args=None):
     logger.info(f"総パラメータ数: {total_params:,}")
     logger.info(f"学習可能パラメータ数: {trainable_params:,}")
     
-    # チェックポイントから再開
-    if hasattr(args, 'resume') and args.resume:
-        if os.path.exists(args.resume):
-            logger.info(f"チェックポイントから再開: {args.resume}")
-            try:
-                checkpoint = torch.load(args.resume, map_location=device)
-                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                    model.load_state_dict(checkpoint['model_state_dict'])
-                else:
-                    model.load_state_dict(checkpoint)
-                logger.info("モデルの重みを正常に読み込みました")
-            except Exception as e:
-                logger.error(f"チェックポイント読み込みエラー: {e}")
-        else:
-            logger.error(f"チェックポイントファイルが見つかりません: {args.resume}")
-    
     # 損失関数、オプティマイザー、スケジューラーの設定
     criterion = combined_loss
     optimizer = torch.optim.AdamW(
@@ -2115,87 +2070,64 @@ def main(args=None):
         eps=1e-8        # 数値安定性用
     )
     
-    # エポック数設定
-    num_epochs = args.epochs if hasattr(args, 'epochs') else 30
-    patience = 10  # 早期停止の閾値
+    # ダミースケジューラー（段階的トレーニングでは各ティアで再定義）
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
     
-    # 段階的トレーニングか通常のトレーニングか
-    if hasattr(args, 'tiered') and args.tiered:
-        # 段階的トレーニングはダミースケジューラで開始
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
-        logger.info(f"段階的トレーニング設定: {len(train_ids)}個のサンプルを複数段階で訓練")
-    else:
-        # 通常のトレーニング用のスケジューラ
-        steps_per_epoch = len(train_loader)
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=0.003,          # 最大学習率
-            steps_per_epoch=steps_per_epoch,
-            epochs=num_epochs,
-            pct_start=0.2,         # 20%の期間でウォームアップ
-            div_factor=10.0,       # 初期学習率 = max_lr/div_factor
-            final_div_factor=100.0 # 最終学習率 = max_lr/final_div_factor
-        )
-        logger.info(f"モデルトレーニング設定: エポック数={num_epochs}, 忍耐値={patience}, バッチサイズ={batch_size}")
+    # エポック数とその他のトレーニングパラメータ
+    num_epochs = 30  # 30エポックに増加
+    patience = 7     # 忍耐値
     
-    logger.info("モデルのトレーニングを開始します...")
+    logger.info(f"モデルトレーニング設定: エポック数={num_epochs}, 忍耐値={patience}, バッチサイズ={batch_size}")
+    logger.info("段階的トレーニングを使用してモデルのトレーニングを開始します...")
     
     # CPU、GPUキャッシュをクリア
-    gc.collect()
-    torch.cuda.empty_cache()
+    aggressive_memory_cleanup(force_sync=True, purge_cache=True)
     
-    # モデルのトレーニング開始
-    if hasattr(args, 'tiered') and args.tiered:
-        # 段階的トレーニング
-        train_losses, val_losses, val_cosine_similarities, best_cosine = tiered_training(
-            model=model,
-            train_ids=train_ids,
-            val_loader=val_loader,
-            criterion=criterion,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            device=device,
-            mol_files_path=MOL_FILES_PATH,
-            msp_data=msp_data,
-            transform=transform,
-            normalization=normalization,
-            cache_dir=CACHE_DIR,
-            checkpoint_dir=CHECKPOINT_DIR,
-            num_workers=num_workers,
-            patience=patience
-        )
-    else:
-        # 通常のトレーニング
-        train_losses, val_losses, val_cosine_similarities, best_cosine = train_model(
-            model=model,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            criterion=criterion,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            device=device,
-            num_epochs=num_epochs,
-            eval_interval=2,    # 2エポックごとに評価
-            patience=patience,  # データセットサイズに応じた忍耐回数
-            grad_clip=1.0       # 勾配クリッピング値
-        )
+    # 段階的トレーニングを使用
+    train_losses, val_losses, val_cosine_similarities, best_cosine = tiered_training(
+        model=model,
+        train_ids=train_ids,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        mol_files_path=MOL_FILES_PATH,
+        msp_data=msp_data,
+        transform=transform,
+        normalization=normalization,
+        cache_dir=CACHE_DIR,
+        checkpoint_dir=os.path.join(CACHE_DIR, "checkpoints"),
+        num_workers=num_workers,
+        patience=patience
+    )
     
     logger.info(f"トレーニング完了！ 最良コサイン類似度: {best_cosine:.4f}")
     
     # キャッシュクリア
-    gc.collect()
-    torch.cuda.empty_cache()
+    aggressive_memory_cleanup(force_sync=True, purge_cache=True)
     
     # 最良モデルを読み込む
     try:
-        best_model_path = os.path.join(CHECKPOINT_DIR, 'best_model.pth') 
+        best_model_path = os.path.join(CACHE_DIR, "checkpoints", 'best_model.pth')
+        if not os.path.exists(best_model_path):
+            # ティアごとの最良モデルを探す
+            tier_models = [f for f in os.listdir(os.path.join(CACHE_DIR, "checkpoints")) 
+                         if f.startswith("tier") and f.endswith("_model.pth")]
+            if tier_models:
+                # 最後のティアモデルを使用
+                best_model_path = os.path.join(CACHE_DIR, "checkpoints", tier_models[-1])
+        
         model.load_state_dict(torch.load(best_model_path, map_location=device))
-        logger.info("最良モデルを読み込みました")
+        logger.info(f"最良モデルを読み込みました: {best_model_path}")
     except Exception as e:
         logger.error(f"モデル読み込みエラー: {e}")
     
     # テストデータでの評価
     try:
+        # テスト前にメモリ解放
+        aggressive_memory_cleanup(force_sync=True, purge_cache=True)
+        
         logger.info("テストデータでの評価を開始します...")
         test_results = eval_model(model, test_loader, device, use_amp=True)
         logger.info(f"テストデータ平均コサイン類似度: {test_results['cosine_similarity']:.4f}")
