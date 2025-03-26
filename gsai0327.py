@@ -24,7 +24,7 @@ import gc
 import pickle
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import time
 import datetime
 
@@ -1318,7 +1318,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             start_epoch = 0
     
     # Automatic Mixed Precision (AMP)のスケーラー
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
     
     # モデルをデバイスに明示的に転送
     model = model.to(device)
@@ -1374,7 +1374,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 optimizer.zero_grad(set_to_none=True)  # メモリ効率のためNoneに設定
                 
                 # Automatic Mixed Precision (AMP)を使用した順伝播
-                with autocast():
+                with autocast('cuda'):
                     output, fragment_pred = model(processed_batch)
                     loss = criterion(output, processed_batch['spec'], fragment_pred, processed_batch['fragment_pattern'])
                 
@@ -1581,7 +1581,7 @@ def evaluate_model(model, data_loader, criterion, device, use_amp=False):
                 
                 # AMP使用時は混合精度で予測
                 if use_amp:
-                    with autocast():
+                    with autocast('cuda'):
                         output, fragment_pred = model(processed_batch)
                         loss = criterion(output, processed_batch['spec'], 
                                          fragment_pred, processed_batch['fragment_pattern'])
@@ -1659,7 +1659,7 @@ def eval_model(model, test_loader, device, use_amp=True):
                 
                 # 予測（混合精度使用時）
                 if use_amp:
-                    with autocast():
+                    with autocast('cuda'):
                         output, frag_pred = model(processed_batch)
                 else:
                     output, frag_pred = model(processed_batch)
