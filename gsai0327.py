@@ -674,51 +674,53 @@ class OptimizedHybridMSModel(nn.Module):
 ###############################
 
 def process_mol_id(mol_id, mol_files_path, msp_data):
-    """単一分子IDの処理（並列処理用）"""
+    """単一分子IDの処理（シングルプロセス用）"""
     # RDKitの警告を抑制
-    with RDLogger.DisableLog():
-        mol_file = os.path.join(mol_files_path, f"ID{mol_id}.MOL")
+    from rdkit import RDLogger
+    RDLogger.DisableLog('rdApp.*')  # RDKitの全ての警告を無効化
+    
+    mol_file = os.path.join(mol_files_path, f"ID{mol_id}.MOL")
+    try:
+        # 分子ファイルが読み込めるか確認
+        mol = Chem.MolFromMolFile(mol_file, sanitize=False)
+        if mol is None:
+            return None, None
+        
+        # 分子の基本的なサニタイズを試みる
         try:
-            # 分子ファイルが読み込めるか確認
-            mol = Chem.MolFromMolFile(mol_file, sanitize=False)
-            if mol is None:
-                return None, None
+            # プロパティキャッシュを更新
+            for atom in mol.GetAtoms():
+                atom.UpdatePropertyCache(strict=False)
             
-            # 分子の基本的なサニタイズを試みる
-            try:
-                # プロパティキャッシュを更新
-                for atom in mol.GetAtoms():
-                    atom.UpdatePropertyCache(strict=False)
-                
-                # 部分的なサニタイズ
-                Chem.SanitizeMol(mol, 
-                               sanitizeOps=Chem.SanitizeFlags.SANITIZE_FINDRADICALS|
-                                          Chem.SanitizeFlags.SANITIZE_KEKULIZE|
-                                          Chem.SanitizeFlags.SANITIZE_SETAROMATICITY|
-                                          Chem.SanitizeFlags.SANITIZE_SETCONJUGATION|
-                                          Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION|
-                                          Chem.SanitizeFlags.SANITIZE_SYMMRINGS,
-                               catchErrors=True)
-            except Exception:
-                return None, None
-            
-            # MACCSフィンガープリントを計算
-            try:
-                maccs = MACCSkeys.GenMACCSKeys(mol)
-                fragments = np.zeros(NUM_FRAGS)
-                for i in range(NUM_FRAGS):
-                    if maccs.GetBit(i):
-                        fragments[i] = 1.0
-            except Exception:
-                fragments = np.zeros(NUM_FRAGS)
-                
-            # この分子のスペクトルがあるか確認
-            if mol_id not in msp_data:
-                return None, None
-                
-            return mol_id, fragments
+            # 部分的なサニタイズ
+            Chem.SanitizeMol(mol, 
+                           sanitizeOps=Chem.SanitizeFlags.SANITIZE_FINDRADICALS|
+                                      Chem.SanitizeFlags.SANITIZE_KEKULIZE|
+                                      Chem.SanitizeFlags.SANITIZE_SETAROMATICITY|
+                                      Chem.SanitizeFlags.SANITIZE_SETCONJUGATION|
+                                      Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION|
+                                      Chem.SanitizeFlags.SANITIZE_SYMMRINGS,
+                           catchErrors=True)
         except Exception:
             return None, None
+        
+        # MACCSフィンガープリントを計算
+        try:
+            maccs = MACCSkeys.GenMACCSKeys(mol)
+            fragments = np.zeros(NUM_FRAGS)
+            for i in range(NUM_FRAGS):
+                if maccs.GetBit(i):
+                    fragments[i] = 1.0
+        except Exception:
+            fragments = np.zeros(NUM_FRAGS)
+            
+        # この分子のスペクトルがあるか確認
+        if mol_id not in msp_data:
+            return None, None
+            
+        return mol_id, fragments
+    except Exception:
+        return None, None
 
 class OptimizedMoleculeGraphDataset(Dataset):
     def __init__(self, mol_ids, mol_files_path, msp_data, transform="log10over3", 
@@ -738,7 +740,7 @@ class OptimizedMoleculeGraphDataset(Dataset):
         self._preprocess_mol_ids()
         
     def _preprocess_mol_ids(self):
-        """有効な分子IDのみを抽出する（キャッシュ＋並列処理）"""
+        """有効な分子IDのみを抽出する（キャッシュ＋シングルスレッド処理）"""
         # キャッシュファイルのパス
         os.makedirs(self.cache_dir, exist_ok=True)
         cache_file = os.path.join(self.cache_dir, f"preprocessed_data_{hash(str(sorted(self.mol_ids)))}.pkl")
@@ -752,10 +754,9 @@ class OptimizedMoleculeGraphDataset(Dataset):
                 self.fragment_patterns = cached_data['fragment_patterns']
                 return
         
-        logger.info("分子データの前処理を開始します（並列処理）...")
+        logger.info("分子データの前処理を開始します（シングルプロセス処理）...")
         
-        # ProcessPoolExecutorで並列処理
-        cpu_count = min(os.cpu_count(), 16)  # 最大16コア使用
+        # シングルプロセスでの処理
         valid_ids = []
         fragment_patterns = {}
         
@@ -764,23 +765,22 @@ class OptimizedMoleculeGraphDataset(Dataset):
             # 処理関数
             process_func = partial(process_mol_id, mol_files_path=self.mol_files_path, msp_data=self.msp_data)
             
-            # チャンクサイズを決定（大きなチャンクサイズでオーバーヘッドを削減）
-            chunk_size = max(100, len(self.mol_ids) // (cpu_count * 4))
-            
-            with ProcessPoolExecutor(max_workers=cpu_count) as executor:
-                # チャンク単位で処理してメモリ効率を改善
-                for i in range(0, len(self.mol_ids), chunk_size):
-                    chunk = self.mol_ids[i:i+chunk_size]
-                    results = list(executor.map(process_func, chunk))
-                    
-                    # 結果を処理
-                    for mol_id, fragments in results:
-                        if mol_id is not None:
-                            valid_ids.append(mol_id)
-                            fragment_patterns[mol_id] = fragments
+            for mol_id in self.mol_ids:
+                try:
+                    mol_id_result, fragments = process_func(mol_id)
+                    if mol_id_result is not None:
+                        valid_ids.append(mol_id_result)
+                        fragment_patterns[mol_id_result] = fragments
                     
                     # 進捗更新
-                    pbar.update(len(chunk))
+                    pbar.update(1)
+                    
+                    # 定期的にガベージコレクション
+                    if len(valid_ids) % 100 == 0:
+                        gc.collect()
+                except Exception as e:
+                    logger.warning(f"分子ID {mol_id} の処理中にエラー: {str(e)}")
+                    pbar.update(1)
         
         self.valid_mol_ids = valid_ids
         self.fragment_patterns = fragment_patterns
@@ -1678,7 +1678,7 @@ def eval_model(model, test_loader, device, use_amp=True):
 
 def tiered_training(model, train_ids, val_loader, criterion, optimizer, scheduler, device, 
                   mol_files_path, msp_data, transform, normalization, cache_dir, 
-                  checkpoint_dir=CACHE_DIR, num_workers=4, patience=5):
+                  checkpoint_dir=CACHE_DIR, num_workers=0, patience=5):
     """段階的トレーニング（大規模データセット用）"""
     logger.info("段階的トレーニングを開始")
     
@@ -1748,11 +1748,10 @@ def tiered_training(model, train_ids, val_loader, criterion, optimizer, schedule
             batch_size=tier_batch_size,
             shuffle=True, 
             collate_fn=optimized_collate_fn,
-            num_workers=num_workers,
+            num_workers=0,  # シングルプロセス
             pin_memory=True,
-            persistent_workers=True if num_workers > 0 else False,
-            drop_last=True,
-            prefetch_factor=2 if num_workers > 0 else None
+            persistent_workers=False,
+            drop_last=True
         )
         
         # オプティマイザの学習率を調整
@@ -1980,7 +1979,7 @@ def main():
     else:
         batch_size = 16  # 通常サイズのデータセット用
         
-    num_workers = min(16, os.cpu_count())  # CPU数に応じて調整
+    num_workers = 0  # シングルプロセスのため0に設定
     
     logger.info(f"バッチサイズ: {batch_size}, ワーカー数: {num_workers}")
     
@@ -1990,9 +1989,9 @@ def main():
         batch_size=batch_size,
         shuffle=False, 
         collate_fn=optimized_collate_fn,
-        num_workers=num_workers,
+        num_workers=0,  # シングルプロセス
         pin_memory=True,
-        persistent_workers=True if num_workers > 0 else False,
+        persistent_workers=False,
         drop_last=True
     )
     
@@ -2001,7 +2000,7 @@ def main():
         batch_size=batch_size,
         shuffle=False, 
         collate_fn=optimized_collate_fn,
-        num_workers=num_workers,
+        num_workers=0,  # シングルプロセス
         pin_memory=True,
         drop_last=True
     )
@@ -2100,7 +2099,7 @@ def main():
         normalization=normalization,
         cache_dir=CACHE_DIR,
         checkpoint_dir=os.path.join(CACHE_DIR, "checkpoints"),
-        num_workers=num_workers,
+        num_workers=0,  # シングルプロセス
         patience=patience
     )
     
