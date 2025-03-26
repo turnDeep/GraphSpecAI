@@ -816,239 +816,241 @@ class OptimizedMoleculeGraphDataset(Dataset):
                 # キャッシュが壊れている場合は再計算
                 pass
         
-        # RDKitの警告を抑制
-        with RDLogger.DisableLog():
-            # RDKitでMOLファイルを読み込む
-            mol = Chem.MolFromMolFile(mol_file, sanitize=False)
-            if mol is None:
-                raise ValueError(f"Could not read molecule from {mol_file}")
-            
-            try:
-                # プロパティキャッシュを更新して暗黙的な原子価を計算
-                for atom in mol.GetAtoms():
-                    atom.UpdatePropertyCache(strict=False)
-                
-                # 部分的なサニタイズ
-                Chem.SanitizeMol(mol, 
-                               sanitizeOps=Chem.SanitizeFlags.SANITIZE_FINDRADICALS|
-                                          Chem.SanitizeFlags.SANITIZE_KEKULIZE|
-                                          Chem.SanitizeFlags.SANITIZE_SETAROMATICITY|
-                                          Chem.SanitizeFlags.SANITIZE_SETCONJUGATION|
-                                          Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION|
-                                          Chem.SanitizeFlags.SANITIZE_SYMMRINGS,
-                               catchErrors=True)
-                
-                # 明示的な水素を追加（安全モード）
-                try:
-                    mol = Chem.AddHs(mol)
-                except:
-                    pass
-            except Exception:
-                # エラーを無視して処理を続行
-                pass
-            
-            # 原子情報を取得
-            num_atoms = mol.GetNumAtoms()
-            x = []
-            
-            # 環情報の取得
-            ring_info = mol.GetRingInfo()
-            rings = []
-            try:
-                rings = ring_info.AtomRings()
-            except:
-                # 環情報取得に失敗した場合は空リストを使う
-                pass
-            
+        # RDKitの警告を抑制 - 正しい形式で呼び出す
+        from rdkit import RDLogger
+        RDLogger.DisableLog('rdApp.*')
+        
+        # RDKitでMOLファイルを読み込む
+        mol = Chem.MolFromMolFile(mol_file, sanitize=False)
+        if mol is None:
+            raise ValueError(f"Could not read molecule from {mol_file}")
+        
+        try:
+            # プロパティキャッシュを更新して暗黙的な原子価を計算
             for atom in mol.GetAtoms():
-                atom_symbol = atom.GetSymbol()
-                atom_feature_idx = ATOM_FEATURES.get(atom_symbol, ATOM_FEATURES['OTHER'])
+                atom.UpdatePropertyCache(strict=False)
+            
+            # 部分的なサニタイズ
+            Chem.SanitizeMol(mol, 
+                           sanitizeOps=Chem.SanitizeFlags.SANITIZE_FINDRADICALS|
+                                      Chem.SanitizeFlags.SANITIZE_KEKULIZE|
+                                      Chem.SanitizeFlags.SANITIZE_SETAROMATICITY|
+                                      Chem.SanitizeFlags.SANITIZE_SETCONJUGATION|
+                                      Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION|
+                                      Chem.SanitizeFlags.SANITIZE_SYMMRINGS,
+                           catchErrors=True)
+            
+            # 明示的な水素を追加（安全モード）
+            try:
+                mol = Chem.AddHs(mol)
+            except:
+                pass
+        except Exception:
+            # エラーを無視して処理を続行
+            pass
+        
+        # 原子情報を取得
+        num_atoms = mol.GetNumAtoms()
+        x = []
+        
+        # 環情報の取得
+        ring_info = mol.GetRingInfo()
+        rings = []
+        try:
+            rings = ring_info.AtomRings()
+        except:
+            # 環情報取得に失敗した場合は空リストを使う
+            pass
+        
+        for atom in mol.GetAtoms():
+            atom_symbol = atom.GetSymbol()
+            atom_feature_idx = ATOM_FEATURES.get(atom_symbol, ATOM_FEATURES['OTHER'])
+            
+            # 基本的な原子タイプの特徴
+            atom_feature = [0] * len(ATOM_FEATURES)
+            atom_feature[atom_feature_idx] = 1
+            
+            # 安全なメソッド呼び出し
+            try:
+                degree = atom.GetDegree() / 8.0
+            except:
+                degree = 0.0
                 
-                # 基本的な原子タイプの特徴
-                atom_feature = [0] * len(ATOM_FEATURES)
-                atom_feature[atom_feature_idx] = 1
+            try:
+                formal_charge = atom.GetFormalCharge() / 8.0
+            except:
+                formal_charge = 0.0
                 
-                # 安全なメソッド呼び出し
+            try:
+                radical_electrons = atom.GetNumRadicalElectrons() / 4.0
+            except:
+                radical_electrons = 0.0
+                
+            try:
+                is_aromatic = atom.GetIsAromatic() * 1.0
+            except:
+                is_aromatic = 0.0
+                
+            try:
+                atom_mass = atom.GetMass() / 200.0
+            except:
+                atom_mass = 0.0
+                
+            try:
+                is_in_ring = atom.IsInRing() * 1.0
+            except:
+                is_in_ring = 0.0
+                
+            try:
+                hybridization = int(atom.GetHybridization()) / 8.0
+            except:
+                hybridization = 0.0
+                
+            try:
+                explicit_valence = atom.GetExplicitValence() / 8.0
+            except:
+                explicit_valence = 0.0
+                
+            try:
+                implicit_valence = atom.GetImplicitValence() / 8.0
+            except:
+                implicit_valence = 0.0
+                
+            # 追加の環境特徴量
+            try:
+                is_in_aromatic_ring = (atom.GetIsAromatic() and atom.IsInRing()) * 1.0
+            except:
+                is_in_aromatic_ring = 0.0
+                
+            try:
+                ring_size = 0
+                atom_idx = atom.GetIdx()
+                for ring in rings:
+                    if atom_idx in ring:
+                        ring_size = max(ring_size, len(ring))
+                ring_size = ring_size / 8.0
+            except:
+                ring_size = 0.0
+                
+            try:
+                num_h = atom.GetTotalNumHs() / 8.0
+            except:
+                num_h = 0.0
+            
+            # 簡素化した特徴リスト - 計算効率を向上
+            additional_features = [
+                degree, formal_charge, radical_electrons, is_aromatic,
+                atom_mass, is_in_ring, hybridization, explicit_valence, 
+                implicit_valence, is_in_aromatic_ring, ring_size, num_h
+            ]
+            
+            # すべての特徴を結合
+            atom_feature.extend(additional_features)
+            x.append(atom_feature)
+        
+        # 結合情報を取得
+        edge_indices = []
+        edge_attrs = []
+        for bond in mol.GetBonds():
+            try:
+                i = bond.GetBeginAtomIdx()
+                j = bond.GetEndAtomIdx()
+                
+                # 結合タイプ
                 try:
-                    degree = atom.GetDegree() / 8.0
+                    bond_type = BOND_FEATURES.get(bond.GetBondType(), BOND_FEATURES[Chem.rdchem.BondType.SINGLE])
                 except:
-                    degree = 0.0
-                    
+                    bond_type = BOND_FEATURES[Chem.rdchem.BondType.SINGLE]
+                
+                # 双方向のエッジを追加
+                edge_indices.append([i, j])
+                edge_indices.append([j, i])
+                
+                # 簡素化したボンド特徴量
+                bond_feature = [0] * len(BOND_FEATURES)
+                bond_feature[bond_type] = 1
+                
+                # 安全な追加ボンド特徴量の取得
                 try:
-                    formal_charge = atom.GetFormalCharge() / 8.0
-                except:
-                    formal_charge = 0.0
-                    
-                try:
-                    radical_electrons = atom.GetNumRadicalElectrons() / 4.0
-                except:
-                    radical_electrons = 0.0
-                    
-                try:
-                    is_aromatic = atom.GetIsAromatic() * 1.0
-                except:
-                    is_aromatic = 0.0
-                    
-                try:
-                    atom_mass = atom.GetMass() / 200.0
-                except:
-                    atom_mass = 0.0
-                    
-                try:
-                    is_in_ring = atom.IsInRing() * 1.0
+                    is_in_ring = bond.IsInRing() * 1.0
                 except:
                     is_in_ring = 0.0
                     
                 try:
-                    hybridization = int(atom.GetHybridization()) / 8.0
+                    is_conjugated = bond.GetIsConjugated() * 1.0
                 except:
-                    hybridization = 0.0
+                    is_conjugated = 0.0
                     
                 try:
-                    explicit_valence = atom.GetExplicitValence() / 8.0
+                    is_aromatic = bond.GetIsAromatic() * 1.0
                 except:
-                    explicit_valence = 0.0
-                    
-                try:
-                    implicit_valence = atom.GetImplicitValence() / 8.0
-                except:
-                    implicit_valence = 0.0
-                    
-                # 追加の環境特徴量
-                try:
-                    is_in_aromatic_ring = (atom.GetIsAromatic() and atom.IsInRing()) * 1.0
-                except:
-                    is_in_aromatic_ring = 0.0
-                    
-                try:
-                    ring_size = 0
-                    atom_idx = atom.GetIdx()
-                    for ring in rings:
-                        if atom_idx in ring:
-                            ring_size = max(ring_size, len(ring))
-                    ring_size = ring_size / 8.0
-                except:
-                    ring_size = 0.0
-                    
-                try:
-                    num_h = atom.GetTotalNumHs() / 8.0
-                except:
-                    num_h = 0.0
+                    is_aromatic = 0.0
                 
-                # 簡素化した特徴リスト - 計算効率を向上
-                additional_features = [
-                    degree, formal_charge, radical_electrons, is_aromatic,
-                    atom_mass, is_in_ring, hybridization, explicit_valence, 
-                    implicit_valence, is_in_aromatic_ring, ring_size, num_h
-                ]
+                additional_bond_features = [is_in_ring, is_conjugated, is_aromatic]
                 
-                # すべての特徴を結合
-                atom_feature.extend(additional_features)
-                x.append(atom_feature)
-            
-            # 結合情報を取得
-            edge_indices = []
-            edge_attrs = []
-            for bond in mol.GetBonds():
-                try:
-                    i = bond.GetBeginAtomIdx()
-                    j = bond.GetEndAtomIdx()
-                    
-                    # 結合タイプ
-                    try:
-                        bond_type = BOND_FEATURES.get(bond.GetBondType(), BOND_FEATURES[Chem.rdchem.BondType.SINGLE])
-                    except:
-                        bond_type = BOND_FEATURES[Chem.rdchem.BondType.SINGLE]
-                    
-                    # 双方向のエッジを追加
-                    edge_indices.append([i, j])
-                    edge_indices.append([j, i])
-                    
-                    # 簡素化したボンド特徴量
-                    bond_feature = [0] * len(BOND_FEATURES)
-                    bond_feature[bond_type] = 1
-                    
-                    # 安全な追加ボンド特徴量の取得
-                    try:
-                        is_in_ring = bond.IsInRing() * 1.0
-                    except:
-                        is_in_ring = 0.0
-                        
-                    try:
-                        is_conjugated = bond.GetIsConjugated() * 1.0
-                    except:
-                        is_conjugated = 0.0
-                        
-                    try:
-                        is_aromatic = bond.GetIsAromatic() * 1.0
-                    except:
-                        is_aromatic = 0.0
-                    
-                    additional_bond_features = [is_in_ring, is_conjugated, is_aromatic]
-                    
-                    bond_feature.extend(additional_bond_features)
-                    edge_attrs.append(bond_feature)
-                    edge_attrs.append(bond_feature)  # 双方向なので同じ属性
-                except Exception:
-                    continue
-            
-            # 分子全体の特徴量 - 簡素化
-            mol_features = [0.0] * 16
-            
-            try:
-                mol_features[0] = Descriptors.MolWt(mol) / 1000.0  # 分子量
-            except:
-                pass
-                
-            try:
-                mol_features[1] = Descriptors.NumHAcceptors(mol) / 20.0  # 水素結合アクセプター数
-            except:
-                pass
-                
-            try:
-                mol_features[2] = Descriptors.NumHDonors(mol) / 10.0  # 水素結合ドナー数
-            except:
-                pass
-                
-            try:
-                mol_features[3] = Descriptors.TPSA(mol) / 200.0  # トポロジカル極性表面積
-            except:
-                pass
-            
-            # エッジが存在するか確認
-            if not edge_indices:
-                # 単一原子分子の場合や結合情報が取得できない場合、セルフループを追加
-                for i in range(num_atoms):
-                    edge_indices.append([i, i])
-                    
-                    bond_feature = [0] * len(BOND_FEATURES)
-                    bond_feature[BOND_FEATURES[Chem.rdchem.BondType.SINGLE]] = 1
-                    
-                    # ダミーの追加特徴量
-                    additional_bond_features = [0.0, 0.0, 0.0]
-                    bond_feature.extend(additional_bond_features)
-                    edge_attrs.append(bond_feature)
-            
-            # PyTorch Geometricのデータ形式に変換
-            x = torch.FloatTensor(x)
-            edge_index = torch.LongTensor(edge_indices).t().contiguous()
-            edge_attr = torch.FloatTensor(edge_attrs)
-            global_attr = torch.FloatTensor(mol_features)
-            
-            # グラフデータを作成
-            graph_data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, global_attr=global_attr)
-            
-            # キャッシュに保存
-            self.graph_cache[mol_file] = graph_data
-            
-            # ディスクキャッシュにも保存
-            try:
-                with open(cache_file, 'wb') as f:
-                    pickle.dump(graph_data, f)
+                bond_feature.extend(additional_bond_features)
+                edge_attrs.append(bond_feature)
+                edge_attrs.append(bond_feature)  # 双方向なので同じ属性
             except Exception:
-                pass
+                continue
+        
+        # 分子全体の特徴量 - 簡素化
+        mol_features = [0.0] * 16
+        
+        try:
+            mol_features[0] = Descriptors.MolWt(mol) / 1000.0  # 分子量
+        except:
+            pass
             
-            return graph_data
+        try:
+            mol_features[1] = Descriptors.NumHAcceptors(mol) / 20.0  # 水素結合アクセプター数
+        except:
+            pass
+            
+        try:
+            mol_features[2] = Descriptors.NumHDonors(mol) / 10.0  # 水素結合ドナー数
+        except:
+            pass
+            
+        try:
+            mol_features[3] = Descriptors.TPSA(mol) / 200.0  # トポロジカル極性表面積
+        except:
+            pass
+        
+        # エッジが存在するか確認
+        if not edge_indices:
+            # 単一原子分子の場合や結合情報が取得できない場合、セルフループを追加
+            for i in range(num_atoms):
+                edge_indices.append([i, i])
+                
+                bond_feature = [0] * len(BOND_FEATURES)
+                bond_feature[BOND_FEATURES[Chem.rdchem.BondType.SINGLE]] = 1
+                
+                # ダミーの追加特徴量
+                additional_bond_features = [0.0, 0.0, 0.0]
+                bond_feature.extend(additional_bond_features)
+                edge_attrs.append(bond_feature)
+        
+        # PyTorch Geometricのデータ形式に変換
+        x = torch.FloatTensor(x)
+        edge_index = torch.LongTensor(edge_indices).t().contiguous()
+        edge_attr = torch.FloatTensor(edge_attrs)
+        global_attr = torch.FloatTensor(mol_features)
+        
+        # グラフデータを作成
+        graph_data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, global_attr=global_attr)
+        
+        # キャッシュに保存
+        self.graph_cache[mol_file] = graph_data
+        
+        # ディスクキャッシュにも保存
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(graph_data, f)
+        except Exception:
+            pass
+        
+        return graph_data
     
     def _preprocess_spectrum(self, spectrum):
         """スペクトルの前処理"""
@@ -1067,8 +1069,11 @@ class OptimizedMoleculeGraphDataset(Dataset):
         mol_id = self.valid_mol_ids[idx]
         mol_file = os.path.join(self.mol_files_path, f"ID{mol_id}.MOL")
         
-        # モル変換とグラフ取得中はRDKitの警告を抑制
-        with RDLogger.DisableLog():
+        # RDKitの警告を抑制 - 正しい形式で呼び出す
+        from rdkit import RDLogger
+        RDLogger.DisableLog('rdApp.*')  # 引数を追加
+        
+        try:
             # MOLファイルからグラフ表現を生成
             graph_data = self._mol_to_graph(mol_file)
             
@@ -1094,6 +1099,21 @@ class OptimizedMoleculeGraphDataset(Dataset):
                 noise_amplitude = 0.01
                 graph_data.x = graph_data.x + torch.randn_like(graph_data.x) * noise_amplitude
                 graph_data.edge_attr = graph_data.edge_attr + torch.randn_like(graph_data.edge_attr) * noise_amplitude
+        
+        except Exception as e:
+            # エラー発生時のフォールバック処理
+            logger.warning(f"分子ID {mol_id} の処理中にエラー: {str(e)}")
+            # 最小限のグラフを生成
+            x = torch.zeros((1, len(ATOM_FEATURES)+12), dtype=torch.float)
+            edge_index = torch.tensor([[0], [0]], dtype=torch.long)
+            edge_attr = torch.zeros((1, len(BOND_FEATURES)+3), dtype=torch.float)
+            global_attr = torch.zeros(16, dtype=torch.float)
+            
+            graph_data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, global_attr=global_attr)
+            mass_spectrum = np.zeros(MAX_MZ)
+            fragment_pattern = np.zeros(NUM_FRAGS)
+            prec_mz = 0
+            prec_mz_bin = 0
         
         return {
             'graph_data': graph_data, 
