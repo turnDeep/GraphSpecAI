@@ -489,16 +489,16 @@ class OptimizedHybridMSModel(nn.Module):
         self.gate_prediction = gate_prediction
         self.global_features_dim = 16
         
-        # 次元を小さくして軽量化
+        # 次元設定
         self.hidden_channels = hidden_channels
-        self.transformer_dim = 192
+        self.transformer_dim = 128
         
-        # GNNレイヤー - 軽量化
-        self.gat1 = GATv2Conv(node_features, hidden_channels, edge_dim=edge_features, heads=4)
-        self.gat2 = GATv2Conv(hidden_channels*4, hidden_channels, edge_dim=edge_features, heads=4)
-        self.gat3 = GATv2Conv(hidden_channels*4, hidden_channels, edge_dim=edge_features, heads=4)
+        # ヘッド数を元の2に保持（変更しない）
+        self.gat1 = GATv2Conv(node_features, hidden_channels, edge_dim=edge_features, heads=2)
+        self.gat2 = GATv2Conv(hidden_channels*2, hidden_channels, edge_dim=edge_features, heads=2)
+        self.gat3 = GATv2Conv(hidden_channels*2, hidden_channels, edge_dim=edge_features, heads=2)
         
-        # スキップ接続
+        # スキップ接続の次元を確認
         self.skip_connection1 = nn.Linear(hidden_channels*2, hidden_channels*2)
         
         # グローバル特徴量処理
