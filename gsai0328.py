@@ -183,12 +183,12 @@ def unprocess_spec(spec, transform):
 
 def process_spec_discrete(spec, normalize=True, eps=EPS):
     """離散的なマススペクトル特性を保持する前処理"""
+    # NumPy配列の場合はTensorに変換
+    if not isinstance(spec, torch.Tensor):
+        spec = torch.tensor(spec, dtype=torch.float32)
+        
     # スペクトルを強度1000までスケーリング
     spec = spec / (torch.max(spec, dim=-1, keepdim=True)[0] + eps) * 1000.
-    
-    # より小さなピークをフィルタリング (離散性強化)
-    small_peak_mask = (spec < 1.0)
-    spec[small_peak_mask] = 0.0
     
     # ピークの離散的特性を保持するため変換を最小限に
     if normalize:
@@ -200,7 +200,7 @@ def process_spec_discrete(spec, normalize=True, eps=EPS):
 
 def unprocess_spec_discrete(spec, eps=EPS):
     """離散的なマススペクトル処理の逆変換"""
-    # 入力が numpy 配列の場合は Tensor に変換
+    # NumPy配列の場合はTensorに変換
     if not isinstance(spec, torch.Tensor):
         spec = torch.tensor(spec, dtype=torch.float32)
     
@@ -1110,14 +1110,18 @@ class OptimizedMoleculeGraphDataset(Dataset):
         return graph_data
     
     def _preprocess_spectrum(self, spectrum):
-      """スペクトルの前処理 - 離散的特性を保持"""
-      # スペクトルをPyTorchテンソルに変換
-      spec_tensor = torch.FloatTensor(spectrum)
-      
-      # 離散的特性を保持した処理を適用
-      processed_spec = process_spec_discrete(spec_tensor.unsqueeze(0))
-      
-      return processed_spec.squeeze(0).numpy()
+        """スペクトルの前処理 - 離散的特性を保持"""
+        # NumPy配列の場合はTensorに変換
+        if isinstance(spectrum, np.ndarray):
+            spec_tensor = torch.FloatTensor(spectrum)
+        else:
+            spec_tensor = spectrum
+        
+        # 離散的特性を保持した処理を適用
+        processed_spec = process_spec_discrete(spec_tensor.unsqueeze(0))
+        
+        # 返り値の型を確認（Tensor形式で返す）
+        return processed_spec.squeeze(0)
         
     def __len__(self):
         return len(self.valid_mol_ids)
@@ -1137,13 +1141,18 @@ class OptimizedMoleculeGraphDataset(Dataset):
             # MSPデータからマススペクトルを取得
             mass_spectrum = self.msp_data.get(mol_id, np.zeros(MAX_MZ))
             
-            # 生のスペクトルを保存 (最大値で正規化のみ)
             raw_spectrum = mass_spectrum.copy()
             if np.max(raw_spectrum) > 0:
                 raw_spectrum = raw_spectrum / np.max(raw_spectrum) * 100
             
             # モデル学習用に前処理
             mass_spectrum = self._preprocess_spectrum(mass_spectrum)
+            
+            # 返り値はNumPy配列またはTensorで統一
+            if not isinstance(mass_spectrum, torch.Tensor):
+                mass_spectrum = torch.FloatTensor(mass_spectrum)
+            if not isinstance(raw_spectrum, torch.Tensor):
+                raw_spectrum = torch.FloatTensor(raw_spectrum)
             
             # フラグメントパターンを取得
             fragment_pattern = self.fragment_patterns.get(mol_id, np.zeros(NUM_FRAGS))
@@ -1186,7 +1195,7 @@ class OptimizedMoleculeGraphDataset(Dataset):
             
             graph_data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, global_attr=global_attr)
             mass_spectrum = np.zeros(MAX_MZ)
-            raw_spectrum = np.zeros(MAX_MZ)
+            raw_spectrum = torch.zeros(MAX_MZ, dtype=torch.float)
             fragment_pattern = np.zeros(NUM_FRAGS)
             prec_mz = 0
             prec_mz_bin = 0
@@ -1961,7 +1970,7 @@ def visualize_results(test_results, num_samples=10):
         
         # 真の生スペクトル
         plt.subplot(num_samples, 2, 2*i + 1)
-        true_spec = test_results['y_true_raw'][idx].numpy()
+        true_spec = test_results['y_true_raw'][idx].cpu().numpy()
         
         # 非ゼロの位置のみをプロット (離散的特性を強調)
         nonzero_indices = np.nonzero(true_spec)[0]
@@ -1978,7 +1987,7 @@ def visualize_results(test_results, num_samples=10):
         
         # 予測スペクトル (変換後)
         plt.subplot(num_samples, 2, 2*i + 2)
-        pred_spec = test_results['y_pred_raw'][idx].numpy()
+        pred_spec = test_results['y_pred_raw'][idx].cpu().numpy()
         
         # 非ゼロの位置のみをプロット (離散的特性を強調)
         nonzero_indices = np.nonzero(pred_spec)[0]
