@@ -2172,7 +2172,7 @@ def main():
     
     # 損失関数、オプティマイザー、スケジューラーの設定
     criterion = combined_loss
-    optimizer = torch.optim.Radam(
+    optimizer = torch.optim.RAdam(
         model.parameters(), 
         lr=0.001,       # 初期学習率
         weight_decay=1e-5,  # 重み減衰
