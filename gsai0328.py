@@ -187,8 +187,9 @@ def process_spec_discrete(spec, normalize=True, eps=EPS):
     if not isinstance(spec, torch.Tensor):
         spec = torch.tensor(spec, dtype=torch.float32)
         
-    # スペクトルを強度1000までスケーリング
-    spec = spec / (torch.max(spec, dim=-1, keepdim=True)[0] + eps) * 1000.
+    # スペクトルを強度1000までスケーリング - PyTorch形式のmax()を使用
+    max_val, _ = torch.max(spec, dim=-1, keepdim=True)
+    spec = spec / (max_val + eps) * 1000.
     
     # ピークの離散的特性を保持するため変換を最小限に
     if normalize:
@@ -204,8 +205,9 @@ def unprocess_spec_discrete(spec, eps=EPS):
     if not isinstance(spec, torch.Tensor):
         spec = torch.tensor(spec, dtype=torch.float32)
     
-    # 強度を100%スケールに戻す
-    spec = spec / (torch.max(spec, dim=-1, keepdim=True)[0] + eps) * 100.
+    # 強度を100%スケールに戻す - PyTorch形式のmax()を使用
+    max_val, _ = torch.max(spec, dim=-1, keepdim=True)
+    spec = spec / (max_val + eps) * 100.
     
     # 非常に小さい値を0にする (離散的特性を強調)
     mask = (spec < 0.5)
