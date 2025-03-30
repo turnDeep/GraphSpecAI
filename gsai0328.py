@@ -186,6 +186,10 @@ def process_spec_discrete(spec, normalize=True, eps=EPS):
     # スペクトルを強度1000までスケーリング
     spec = spec / (torch.max(spec, dim=-1, keepdim=True)[0] + eps) * 1000.
     
+    # より小さなピークをフィルタリング (離散性強化)
+    small_peak_mask = (spec < 1.0)
+    spec[small_peak_mask] = 0.0
+    
     # ピークの離散的特性を保持するため変換を最小限に
     if normalize:
         # L1正規化 (合計が1になるように)
@@ -487,14 +491,12 @@ class OptimizedHybridMSModel(nn.Module):
         
         # 次元を小さくして軽量化
         self.hidden_channels = hidden_channels
-        self.transformer_dim = 128  # Transformer次元を縮小
+        self.transformer_dim = 192
         
         # GNNレイヤー - 軽量化
-        self.gat1 = GATv2Conv(node_features, hidden_channels, edge_dim=edge_features, heads=2)
-        self.gat2 = GATv2Conv(hidden_channels*2, hidden_channels, edge_dim=edge_features, heads=2)
-        
-        # 後段のGATレイヤーを削減
-        self.gat3 = GATv2Conv(hidden_channels*2, hidden_channels, edge_dim=edge_features, heads=2)
+        self.gat1 = GATv2Conv(node_features, hidden_channels, edge_dim=edge_features, heads=4)
+        self.gat2 = GATv2Conv(hidden_channels*4, hidden_channels, edge_dim=edge_features, heads=4)
+        self.gat3 = GATv2Conv(hidden_channels*4, hidden_channels, edge_dim=edge_features, heads=4)
         
         # スキップ接続
         self.skip_connection1 = nn.Linear(hidden_channels*2, hidden_channels*2)
@@ -522,6 +524,7 @@ class OptimizedHybridMSModel(nn.Module):
         
         # スペクトル予測のための全結合層 - 層を削減
         self.fc_layers = nn.ModuleList([
+            ResidualBlock(hidden_channels*2, hidden_channels*2),
             ResidualBlock(hidden_channels*2, hidden_channels*2),
             ResidualBlock(hidden_channels*2, hidden_channels)
         ])
@@ -958,13 +961,41 @@ class OptimizedMoleculeGraphDataset(Dataset):
                 num_h = atom.GetTotalNumHs() / 8.0
             except:
                 num_h = 0.0
+
+            try:
+                electronegativity = {
+                    'H': 2.2, 'C': 2.55, 'N': 3.04, 'O': 3.44, 'F': 3.98,
+                    'P': 2.19, 'S': 2.58, 'Cl': 3.16, 'Br': 2.96, 'I': 2.66
+                }.get(atom_symbol, 0.0) / 4.0
+            except:
+                electronegativity = 0.0
             
+            try:
+                # 芳香環システム内の位置情報
+                is_in_aromatic_ring_size_5 = 0.0
+                is_in_aromatic_ring_size_6 = 0.0
+                
+                if atom.GetIsAromatic() and atom.IsInRing():
+                    atom_idx = atom.GetIdx()
+                    for ring in rings:
+                        if atom_idx in ring:
+                            if len(ring) == 5:
+                                is_in_aromatic_ring_size_5 = 1.0
+                            elif len(ring) == 6:
+                                is_in_aromatic_ring_size_6 = 1.0
+            except:
+                is_in_aromatic_ring_size_5 = 0.0
+                is_in_aromatic_ring_size_6 = 0.0
+
             # 簡素化した特徴リスト - 計算効率を向上
             additional_features = [
                 degree, formal_charge, radical_electrons, is_aromatic,
                 atom_mass, is_in_ring, hybridization, explicit_valence, 
                 implicit_valence, is_in_aromatic_ring, ring_size, num_h
             ]
+
+            # 追加の特徴量をリストに追加
+            additional_features.extend([electronegativity, is_in_aromatic_ring_size_5, is_in_aromatic_ring_size_6])
             
             # すべての特徴を結合
             atom_feature.extend(additional_features)
@@ -1123,11 +1154,22 @@ class OptimizedMoleculeGraphDataset(Dataset):
             prec_mz_bin = prec_mz
             
             # データ拡張（トレーニング時のみ）
-            if self.augment and np.random.random() < 0.2:
+            if self.augment and np.random.random() < 0.3:  # 0.2から0.3に増加
                 # ノイズ追加
-                noise_amplitude = 0.01
+                noise_amplitude = 0.015  # 0.01から0.015に増加
                 graph_data.x = graph_data.x + torch.randn_like(graph_data.x) * noise_amplitude
                 graph_data.edge_attr = graph_data.edge_attr + torch.randn_like(graph_data.edge_attr) * noise_amplitude
+                
+                # ピークのランダムシフト (m/zシフトシミュレーション)
+                if np.random.random() < 0.2:
+                    shift = np.random.randint(-1, 2)  # -1, 0, 1のシフト
+                    if shift != 0:
+                        shifted_spectrum = torch.zeros_like(mass_spectrum)
+                        if shift > 0:
+                            shifted_spectrum[shift:] = mass_spectrum[:-shift]
+                        else:
+                            shifted_spectrum[:shift] = mass_spectrum[-shift:]
+                        mass_spectrum = shifted_spectrum
         
         except Exception as e:
             # エラー発生時のフォールバック処理
@@ -1834,7 +1876,7 @@ def tiered_training(model, train_ids, val_loader, criterion, optimizer, schedule
         steps_per_epoch = len(tier_loader)
         tier_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=0.001 if tier_idx == 0 else 0.0008 * (0.8 ** tier_idx),
+            max_lr=0.001 if tier_idx == 0 else 0.001 * (0.8 ** tier_idx),
             steps_per_epoch=steps_per_epoch,
             epochs=tier_epochs[tier_idx],
             pct_start=0.3,
@@ -2130,10 +2172,10 @@ def main():
     
     # 損失関数、オプティマイザー、スケジューラーの設定
     criterion = combined_loss
-    optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.Radam(
         model.parameters(), 
         lr=0.001,       # 初期学習率
-        weight_decay=1e-6,  # 重み減衰
+        weight_decay=1e-5,  # 重み減衰
         eps=1e-8        # 数値安定性用
     )
     
@@ -2141,8 +2183,8 @@ def main():
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
     
     # エポック数とその他のトレーニングパラメータ
-    num_epochs = 30  # 30エポックに増加
-    patience = 7     # 忍耐値
+    num_epochs = 100  # 30エポックに増加
+    patience = 10     # 忍耐値
     
     logger.info(f"モデルトレーニング設定: エポック数={num_epochs}, 忍耐値={patience}, バッチサイズ={batch_size}")
     logger.info("段階的トレーニングを使用してモデルのトレーニングを開始します...")
