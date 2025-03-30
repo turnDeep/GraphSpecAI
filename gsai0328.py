@@ -92,9 +92,6 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 # 最大m/z値の設定
 MAX_MZ = 2000
 
-# 重要なm/z値のリスト
-IMPORTANT_MZ = [18, 28, 43, 57, 71, 73, 77, 91, 105, 115, 128, 152, 165, 178, 207]
-
 # エフェメラル値
 EPS = np.finfo(np.float32).eps
 
@@ -121,19 +118,23 @@ NUM_FRAGS = 167  # MACCSキーのビット数
 ###############################
 
 def process_spec(spec, transform, normalization, eps=EPS):
-    """スペクトルにトランスフォームと正規化を適用"""
-    # スペクトルを1000までスケーリング
-    spec = spec / (torch.max(spec, dim=-1, keepdim=True)[0] + eps) * 1000.
+    """スペクトルにトランスフォームと正規化を適用（離散的性質を保持）"""
+    # スペクトルを1000までスケーリング（最大強度を基準）
+    max_intensity = torch.max(spec, dim=-1, keepdim=True)[0] + eps
+    spec = spec / max_intensity * 1000.
+    
+    # 離散的な性質を保持するため、ピークのみを処理
+    non_zero_mask = (spec > 0).float()
     
     # 信号変換
     if transform == "log10":
-        spec = torch.log10(spec + 1)
+        spec = torch.log10(spec + 1) * non_zero_mask
     elif transform == "log10over3":
-        spec = torch.log10(spec + 1) / 3
+        spec = torch.log10(spec + 1) / 3 * non_zero_mask
     elif transform == "loge":
-        spec = torch.log(spec + 1)
+        spec = torch.log(spec + 1) * non_zero_mask
     elif transform == "sqrt":
-        spec = torch.sqrt(spec)
+        spec = torch.sqrt(spec) * non_zero_mask
     elif transform == "none":
         pass
     else:
@@ -141,80 +142,77 @@ def process_spec(spec, transform, normalization, eps=EPS):
     
     # 正規化
     if normalization == "l1":
-        spec = F.normalize(spec, p=1, dim=-1, eps=eps)
+        norm = torch.sum(spec, dim=-1, keepdim=True) + eps
+        spec = spec / norm
     elif normalization == "l2":
-        spec = F.normalize(spec, p=2, dim=-1, eps=eps)
+        norm = torch.sqrt(torch.sum(spec * spec, dim=-1, keepdim=True)) + eps
+        spec = spec / norm
     elif normalization == "none":
         pass
     else:
         raise ValueError("invalid normalization")
     
+    # ゼロ以外の値のみを保持し、他はゼロにする
+    spec = spec * non_zero_mask
+    
     assert not torch.isnan(spec).any()
-    return spec
+    return spec, max_intensity
 
-def unprocess_spec(spec, transform):
+def unprocess_spec(spec, transform, original_intensity=None):
     """スペクトルの変換を元に戻す"""
+    # ゼロ以外のピークのみを処理
+    non_zero_mask = (spec > 0).float()
+    
     # transform signal
     if transform == "log10":
-        max_ints = float(np.log10(1000. + 1.))
-        def untransform_fn(x): return 10**x - 1.
+        untransformed = (10**spec - 1.) * non_zero_mask
     elif transform == "log10over3":
-        max_ints = float(np.log10(1000. + 1.) / 3.)
-        def untransform_fn(x): return 10**(3 * x) - 1.
+        untransformed = (10**(3 * spec) - 1.) * non_zero_mask
     elif transform == "loge":
-        max_ints = float(np.log(1000. + 1.))
-        def untransform_fn(x): return torch.exp(x) - 1.
+        untransformed = (torch.exp(spec) - 1.) * non_zero_mask
     elif transform == "sqrt":
-        max_ints = float(np.sqrt(1000.))
-        def untransform_fn(x): return x**2
-    elif transform == "linear":
-        raise NotImplementedError
+        untransformed = (spec**2) * non_zero_mask
     elif transform == "none":
-        max_ints = 1000.
-        def untransform_fn(x): return x
+        untransformed = spec
     else:
         raise ValueError("invalid transform")
-        
-    spec = spec / (torch.max(spec, dim=-1, keepdim=True)[0] + EPS) * max_ints
-    spec = untransform_fn(spec)
-    spec = torch.clamp(spec, min=0.)
-    assert not torch.isnan(spec).any()
-    return spec
+    
+    # 元のスケールに戻す
+    if original_intensity is not None:
+        untransformed = untransformed / 1000. * original_intensity
+    
+    untransformed = torch.clamp(untransformed, min=0.)
+    assert not torch.isnan(untransformed).any()
+    return untransformed
 
-def process_spec_discrete(spec, normalize=True, eps=EPS):
-    """離散的なマススペクトル特性を保持する前処理"""
-    # NumPy配列の場合はTensorに変換
-    if not isinstance(spec, torch.Tensor):
-        spec = torch.tensor(spec, dtype=torch.float32)
-        
-    # スペクトルを強度1000までスケーリング - PyTorch形式のmax()を使用
-    max_val, _ = torch.max(spec, dim=-1, keepdim=True)
-    spec = spec / (max_val + eps) * 1000.
+def convert_to_original_format(model_output, transform="log10over3"):
+    """モデル出力を元のマススペクトル形式に変換"""
+    # 非ゼロピークだけを処理
+    non_zero_mask = (model_output > 0.01).float()  # 小さな値はノイズとして除去
     
-    # ピークの離散的特性を保持するため変換を最小限に
-    if normalize:
-        # L1正規化 (合計が1になるように)
-        spec = F.normalize(spec, p=1, dim=-1, eps=eps)
+    # 非ゼロピークの位置を特定
+    peak_indices = torch.nonzero(non_zero_mask).squeeze()
     
-    assert not torch.isnan(spec).any()
-    return spec
-
-def unprocess_spec_discrete(spec, eps=EPS):
-    """離散的なマススペクトル処理の逆変換"""
-    # NumPy配列の場合はTensorに変換
-    if not isinstance(spec, torch.Tensor):
-        spec = torch.tensor(spec, dtype=torch.float32)
+    # 変換を適用
+    if transform == "log10":
+        untransformed = (10**model_output - 1.) * non_zero_mask
+    elif transform == "log10over3":
+        untransformed = (10**(3 * model_output) - 1.) * non_zero_mask
+    elif transform == "loge":
+        untransformed = (torch.exp(model_output) - 1.) * non_zero_mask
+    elif transform == "sqrt":
+        untransformed = (model_output**2) * non_zero_mask
+    elif transform == "none":
+        untransformed = model_output * non_zero_mask
     
-    # 強度を100%スケールに戻す - PyTorch形式のmax()を使用
-    max_val, _ = torch.max(spec, dim=-1, keepdim=True)
-    spec = spec / (max_val + eps) * 100.
+    # 最大値で正規化
+    max_val = torch.max(untransformed, dim=-1, keepdim=True)[0]
+    if max_val.item() > 0:
+        normalized = untransformed / max_val * 100.0
+    else:
+        normalized = untransformed
     
-    # 非常に小さい値を0にする (離散的特性を強調)
-    mask = (spec < 0.5)
-    spec[mask] = 0.0
-    
-    assert not torch.isnan(spec).any()
-    return spec
+    return normalized
 
 def mask_prediction_by_mass(raw_prediction, prec_mass_idx, prec_mass_offset, mask_value=0.):
     """前駆体質量によるマスキング"""
@@ -303,20 +301,12 @@ def parse_msp_file(msp_file_path, cache_dir=CACHE_DIR):
                     if 0 <= mz < MAX_MZ:
                         ms_vector[mz] = intensity
                 
-                # 強度を正規化
+                # 強度を正規化（最大値が100になるよう調整）
                 if np.sum(ms_vector) > 0:
                     ms_vector = ms_vector / np.max(ms_vector) * 100
                     
-                    # スムージングを省略
-                    
-                    # 小さなピークをフィルタリング (ノイズ除去 - 1%に変更)
-                    threshold = np.percentile(ms_vector[ms_vector > 0], 1)
-                    ms_vector[ms_vector < threshold] = 0
-                    
-                    # 重要なm/z値のピークを強調
-                    for mz in IMPORTANT_MZ:
-                        if mz < len(ms_vector) and ms_vector[mz] > 0:
-                            ms_vector[mz] *= 1.5
+                    # スムージングと小さなピークのフィルタリングを削除
+                    # 重要なm/z値の強調も削除
                     
                     msp_data[current_id] = ms_vector
                 else:
@@ -495,16 +485,18 @@ class OptimizedHybridMSModel(nn.Module):
         self.gate_prediction = gate_prediction
         self.global_features_dim = 16
         
-        # 次元設定
+        # 次元を小さくして軽量化
         self.hidden_channels = hidden_channels
-        self.transformer_dim = 128
+        self.transformer_dim = 128  # Transformer次元を縮小
         
-        # ヘッド数を元の2に保持（変更しない）
+        # GNNレイヤー - 軽量化
         self.gat1 = GATv2Conv(node_features, hidden_channels, edge_dim=edge_features, heads=2)
         self.gat2 = GATv2Conv(hidden_channels*2, hidden_channels, edge_dim=edge_features, heads=2)
+        
+        # 後段のGATレイヤーを削減
         self.gat3 = GATv2Conv(hidden_channels*2, hidden_channels, edge_dim=edge_features, heads=2)
         
-        # スキップ接続の次元を確認
+        # スキップ接続
         self.skip_connection1 = nn.Linear(hidden_channels*2, hidden_channels*2)
         
         # グローバル特徴量処理
@@ -530,7 +522,6 @@ class OptimizedHybridMSModel(nn.Module):
         
         # スペクトル予測のための全結合層 - 層を削減
         self.fc_layers = nn.ModuleList([
-            ResidualBlock(hidden_channels*2, hidden_channels*2),
             ResidualBlock(hidden_channels*2, hidden_channels*2),
             ResidualBlock(hidden_channels*2, hidden_channels)
         ])
@@ -967,41 +958,13 @@ class OptimizedMoleculeGraphDataset(Dataset):
                 num_h = atom.GetTotalNumHs() / 8.0
             except:
                 num_h = 0.0
-
-            try:
-                electronegativity = {
-                    'H': 2.2, 'C': 2.55, 'N': 3.04, 'O': 3.44, 'F': 3.98,
-                    'P': 2.19, 'S': 2.58, 'Cl': 3.16, 'Br': 2.96, 'I': 2.66
-                }.get(atom_symbol, 0.0) / 4.0
-            except:
-                electronegativity = 0.0
             
-            try:
-                # 芳香環システム内の位置情報
-                is_in_aromatic_ring_size_5 = 0.0
-                is_in_aromatic_ring_size_6 = 0.0
-                
-                if atom.GetIsAromatic() and atom.IsInRing():
-                    atom_idx = atom.GetIdx()
-                    for ring in rings:
-                        if atom_idx in ring:
-                            if len(ring) == 5:
-                                is_in_aromatic_ring_size_5 = 1.0
-                            elif len(ring) == 6:
-                                is_in_aromatic_ring_size_6 = 1.0
-            except:
-                is_in_aromatic_ring_size_5 = 0.0
-                is_in_aromatic_ring_size_6 = 0.0
-
             # 簡素化した特徴リスト - 計算効率を向上
             additional_features = [
                 degree, formal_charge, radical_electrons, is_aromatic,
                 atom_mass, is_in_ring, hybridization, explicit_valence, 
                 implicit_valence, is_in_aromatic_ring, ring_size, num_h
             ]
-
-            # 追加の特徴量をリストに追加
-            additional_features.extend([electronegativity, is_in_aromatic_ring_size_5, is_in_aromatic_ring_size_6])
             
             # すべての特徴を結合
             atom_feature.extend(additional_features)
@@ -1112,18 +1075,22 @@ class OptimizedMoleculeGraphDataset(Dataset):
         return graph_data
     
     def _preprocess_spectrum(self, spectrum):
-        """スペクトルの前処理 - 離散的特性を保持"""
-        # NumPy配列の場合はTensorに変換
-        if isinstance(spectrum, np.ndarray):
-            spec_tensor = torch.FloatTensor(spectrum)
-        else:
-            spec_tensor = spectrum
+        """スペクトルの前処理（離散的性質を保持）"""
+        # スペクトルをPyTorchテンソルに変換
+        spec_tensor = torch.FloatTensor(spectrum)
         
-        # 離散的特性を保持した処理を適用
-        processed_spec = process_spec_discrete(spec_tensor.unsqueeze(0))
+        # 離散的性質を保持した処理
+        processed_spec, max_intensity = process_spec(
+            spec_tensor.unsqueeze(0), 
+            self.transform, 
+            self.normalization
+        )
         
-        # 返り値の型を確認（Tensor形式で返す）
-        return processed_spec.squeeze(0)
+        # 元のスケール情報を保存
+        self.original_max_intensities = self.original_max_intensities if hasattr(self, 'original_max_intensities') else {}
+        
+        # NumPy配列に変換して返す
+        return processed_spec.squeeze(0).numpy()
         
     def __len__(self):
         return len(self.valid_mol_ids)
@@ -1142,19 +1109,7 @@ class OptimizedMoleculeGraphDataset(Dataset):
             
             # MSPデータからマススペクトルを取得
             mass_spectrum = self.msp_data.get(mol_id, np.zeros(MAX_MZ))
-            
-            raw_spectrum = mass_spectrum.copy()
-            if np.max(raw_spectrum) > 0:
-                raw_spectrum = raw_spectrum / np.max(raw_spectrum) * 100
-            
-            # モデル学習用に前処理
             mass_spectrum = self._preprocess_spectrum(mass_spectrum)
-            
-            # 返り値はNumPy配列またはTensorで統一
-            if not isinstance(mass_spectrum, torch.Tensor):
-                mass_spectrum = torch.FloatTensor(mass_spectrum)
-            if not isinstance(raw_spectrum, torch.Tensor):
-                raw_spectrum = torch.FloatTensor(raw_spectrum)
             
             # フラグメントパターンを取得
             fragment_pattern = self.fragment_patterns.get(mol_id, np.zeros(NUM_FRAGS))
@@ -1169,22 +1124,11 @@ class OptimizedMoleculeGraphDataset(Dataset):
             prec_mz_bin = prec_mz
             
             # データ拡張（トレーニング時のみ）
-            if self.augment and np.random.random() < 0.3:  # 0.2から0.3に増加
+            if self.augment and np.random.random() < 0.2:
                 # ノイズ追加
-                noise_amplitude = 0.015  # 0.01から0.015に増加
+                noise_amplitude = 0.01
                 graph_data.x = graph_data.x + torch.randn_like(graph_data.x) * noise_amplitude
                 graph_data.edge_attr = graph_data.edge_attr + torch.randn_like(graph_data.edge_attr) * noise_amplitude
-                
-                # ピークのランダムシフト (m/zシフトシミュレーション)
-                if np.random.random() < 0.2:
-                    shift = np.random.randint(-1, 2)  # -1, 0, 1のシフト
-                    if shift != 0:
-                        shifted_spectrum = torch.zeros_like(mass_spectrum)
-                        if shift > 0:
-                            shifted_spectrum[shift:] = mass_spectrum[:-shift]
-                        else:
-                            shifted_spectrum[:shift] = mass_spectrum[-shift:]
-                        mass_spectrum = shifted_spectrum
         
         except Exception as e:
             # エラー発生時のフォールバック処理
@@ -1197,7 +1141,6 @@ class OptimizedMoleculeGraphDataset(Dataset):
             
             graph_data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, global_attr=global_attr)
             mass_spectrum = np.zeros(MAX_MZ)
-            raw_spectrum = torch.zeros(MAX_MZ, dtype=torch.float)
             fragment_pattern = np.zeros(NUM_FRAGS)
             prec_mz = 0
             prec_mz_bin = 0
@@ -1205,7 +1148,6 @@ class OptimizedMoleculeGraphDataset(Dataset):
         return {
             'graph_data': graph_data, 
             'mass_spectrum': torch.FloatTensor(mass_spectrum),
-            'raw_spectrum': torch.FloatTensor(raw_spectrum),  # 生のスペクトルを追加
             'fragment_pattern': torch.FloatTensor(fragment_pattern),
             'mol_id': mol_id,
             'prec_mz': prec_mz,
@@ -1216,7 +1158,6 @@ def optimized_collate_fn(batch):
     """最適化されたバッチ内のデータ結合"""
     graph_data = [item['graph_data'] for item in batch]
     mass_spectrum = torch.stack([item['mass_spectrum'] for item in batch])
-    raw_spectrum = torch.stack([item['raw_spectrum'] for item in batch])  # 生スペクトルを追加
     fragment_pattern = torch.stack([item['fragment_pattern'] for item in batch])
     mol_id = [item['mol_id'] for item in batch]
     prec_mz = torch.tensor([item['prec_mz'] for item in batch], dtype=torch.float32)
@@ -1228,7 +1169,6 @@ def optimized_collate_fn(batch):
     return {
         'graph': batched_graphs,
         'spec': mass_spectrum,
-        'raw_spec': raw_spectrum,  # 生スペクトルを追加
         'fragment_pattern': fragment_pattern,
         'mol_id': mol_id,
         'prec_mz': prec_mz,
@@ -1239,25 +1179,11 @@ def optimized_collate_fn(batch):
 # 損失関数と類似度計算（最適化）
 ###############################
 
-def cosine_similarity_loss(y_pred, y_true, important_mz=None, important_weight=3.0):
-    """ピークと重要なm/z値を重視したコサイン類似度損失関数"""
+def cosine_similarity_loss(y_pred, y_true, eps=EPS):
+    """コサイン類似度損失関数 - 重要なm/z値のリストを使わない"""
     # 正規化
     y_pred_norm = F.normalize(y_pred, p=2, dim=1)
     y_true_norm = F.normalize(y_true, p=2, dim=1)
-    
-    # 特徴的なm/zの重み付け
-    if important_mz is not None:
-        weights = torch.ones_like(y_pred)
-        for mz in important_mz:
-            if mz < y_pred.size(1):
-                weights[:, mz] = important_weight
-        
-        # 重み付きベクトルで正規化
-        y_pred_weighted = y_pred * weights
-        y_true_weighted = y_true * weights
-        
-        y_pred_norm = F.normalize(y_pred_weighted, p=2, dim=1)
-        y_true_norm = F.normalize(y_true_weighted, p=2, dim=1)
     
     # コサイン類似度（-1〜1の範囲）
     cosine = torch.sum(y_pred_norm * y_true_norm, dim=1)
@@ -1269,7 +1195,7 @@ def cosine_similarity_loss(y_pred, y_true, important_mz=None, important_weight=3
 
 def combined_loss(y_pred, y_true, fragment_pred=None, fragment_true=None, 
                  alpha=0.2, beta=0.6, epsilon=0.2):
-    """高速化された損失関数"""
+    """高速化された損失関数 - m/z重要度リスト不使用"""
     # バッチサイズのチェックと調整
     if y_pred.shape[0] != y_true.shape[0]:
         min_batch_size = min(y_pred.shape[0], y_true.shape[0])
@@ -1286,15 +1212,12 @@ def combined_loss(y_pred, y_true, fragment_pred=None, fragment_true=None,
     peak_mask = (y_true > 0).float()
     mse_weights = peak_mask * 10.0 + 1.0
     
-    # 重要なm/z値にさらに重みを付ける
-    for mz in IMPORTANT_MZ:
-        if mz < y_true.size(1):
-            mse_weights[:, mz] *= 3.0
+    # 重要なm/z値の重み付けを削除
     
     mse_loss = torch.mean(mse_weights * (y_pred - y_true) ** 2)
     
     # 2. コサイン類似度損失
-    cosine_loss = cosine_similarity_loss(y_pred, y_true, important_mz=IMPORTANT_MZ)
+    cosine_loss = cosine_similarity_loss(y_pred, y_true)
     
     # 主要な損失関数の組み合わせ
     main_loss = alpha * mse_loss + beta * cosine_loss
@@ -1715,14 +1638,14 @@ def evaluate_model(model, data_loader, criterion, device, use_amp=False):
             'cosine_similarity': 0.0
         }
 
-def eval_model(model, test_loader, device, use_amp=True):
-    """テスト用の評価関数 - 生スペクトルを使用"""
+def eval_model(model, test_loader, device, use_amp=True, transform="log10over3"):
+    """テスト用の評価関数 - 元のマススペクトル形式も保存"""
     model = model.to(device)
     model.eval()
     y_true = []
     y_pred = []
-    y_true_raw = []  # 生の測定スペクトル
-    y_pred_raw = []  # 生の形式に変換した予測スペクトル
+    y_true_original = []  # 元の形式
+    y_pred_original = []  # 元の形式
     fragment_true = []
     fragment_pred = []
     mol_ids = []
@@ -1754,14 +1677,29 @@ def eval_model(model, test_loader, device, use_amp=True):
                 else:
                     output, frag_pred = model(processed_batch)
                 
-                # 予測を元のスペクトル形式に変換
-                output_raw = unprocess_spec_discrete(output)
-                
                 # 結果を保存
-                y_true.append(processed_batch['spec'].cpu())
-                y_pred.append(output.cpu())
-                y_true_raw.append(processed_batch['raw_spec'].cpu())  # 生スペクトル
-                y_pred_raw.append(output_raw.cpu())  # 変換後の予測
+                true_batch = processed_batch['spec'].cpu()
+                pred_batch = output.cpu()
+                
+                # 元の形式に変換
+                true_original_batch = torch.zeros_like(true_batch)
+                pred_original_batch = torch.zeros_like(pred_batch)
+                
+                for i in range(len(true_batch)):
+                    # 実測スペクトルを元の形式に変換
+                    true_tensor = true_batch[i]
+                    true_nonzero = (true_tensor > 0)
+                    if true_nonzero.sum() > 0:
+                        true_original_batch[i] = true_tensor / true_tensor.max() * 100
+                    
+                    # 予測スペクトルを元の形式に変換
+                    pred_original_batch[i] = convert_to_original_format(
+                        pred_batch[i].unsqueeze(0), transform).squeeze(0)
+                
+                y_true.append(true_batch)
+                y_pred.append(pred_batch)
+                y_true_original.append(true_original_batch)
+                y_pred_original.append(pred_original_batch)
                 fragment_true.append(processed_batch['fragment_pattern'].cpu())
                 fragment_pred.append(frag_pred.cpu())
                 mol_ids.extend(processed_batch['mol_id'])
@@ -1778,22 +1716,20 @@ def eval_model(model, test_loader, device, use_amp=True):
     # 結果を連結
     all_true = torch.cat(y_true, dim=0)
     all_pred = torch.cat(y_pred, dim=0)
-    all_true_raw = torch.cat(y_true_raw, dim=0)  # 生スペクトル
-    all_pred_raw = torch.cat(y_pred_raw, dim=0)  # 変換後の予測
+    all_true_original = torch.cat(y_true_original, dim=0)
+    all_pred_original = torch.cat(y_pred_original, dim=0)
     all_fragment_true = torch.cat(fragment_true, dim=0)
     all_fragment_pred = torch.cat(fragment_pred, dim=0)
     
-    # 処理済みデータと生データの両方でスコア計算
-    cosine_sim = cosine_similarity_score(all_true, all_pred)
-    cosine_sim_raw = cosine_similarity_score(all_true_raw, all_pred_raw)
+    # スコア計算（元の形式で計算）
+    cosine_sim = cosine_similarity_score(all_true_original, all_pred_original)
     
     return {
         'cosine_similarity': cosine_sim,
-        'cosine_similarity_raw': cosine_sim_raw,
         'y_true': all_true,
         'y_pred': all_pred,
-        'y_true_raw': all_true_raw,  # 生スペクトル
-        'y_pred_raw': all_pred_raw,  # 変換後の予測
+        'y_true_original': all_true_original,
+        'y_pred_original': all_pred_original,
         'fragment_true': all_fragment_true,
         'fragment_pred': all_fragment_pred,
         'mol_ids': mol_ids
@@ -1891,7 +1827,7 @@ def tiered_training(model, train_ids, val_loader, criterion, optimizer, schedule
         steps_per_epoch = len(tier_loader)
         tier_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=0.001 if tier_idx == 0 else 0.001 * (0.8 ** tier_idx),
+            max_lr=0.001 if tier_idx == 0 else 0.0008 * (0.8 ** tier_idx),
             steps_per_epoch=steps_per_epoch,
             epochs=tier_epochs[tier_idx],
             pct_start=0.3,
@@ -1949,8 +1885,8 @@ def tiered_training(model, train_ids, val_loader, criterion, optimizer, schedule
     
     return all_train_losses, all_val_losses, all_val_cosine_similarities, best_cosine
 
-def visualize_results(test_results, num_samples=10):
-    """Prediction result visualization - 生スペクトルを使用"""
+def visualize_results(test_results, num_samples=10, transform="log10over3"):
+    """Prediction result visualization - 元のマススペクトル形式で表示"""
     plt.figure(figsize=(15, num_samples*4))
     
     # サンプルのインデックスをランダムに選択
@@ -1960,50 +1896,66 @@ def visualize_results(test_results, num_samples=10):
                                          replace=False)
     else:
         # mol_idsがない場合は予測結果から選択
-        sample_indices = np.random.choice(len(test_results['y_true_raw']), 
-                                         min(num_samples, len(test_results['y_true_raw'])), 
+        sample_indices = np.random.choice(len(test_results['y_true']), 
+                                         min(num_samples, len(test_results['y_true'])), 
                                          replace=False)
     
     for i, idx in enumerate(sample_indices):
-        # 生スペクトルでの類似度を計算
-        true_vector = test_results['y_true_raw'][idx].reshape(1, -1).cpu().numpy()
-        pred_vector = test_results['y_pred_raw'][idx].reshape(1, -1).cpu().numpy()
-        sim = cosine_similarity(true_vector, pred_vector)[0][0]
+        # 真のスペクトルと予測スペクトルを元の形式に変換
+        true_spec = test_results['y_true'][idx].numpy()
+        pred_spec = test_results['y_pred'][idx].numpy()
         
-        # 真の生スペクトル
-        plt.subplot(num_samples, 2, 2*i + 1)
-        true_spec = test_results['y_true_raw'][idx].cpu().numpy()
+        # 予測を元の形式に変換
+        pred_tensor = torch.FloatTensor(pred_spec)
+        pred_original = convert_to_original_format(pred_tensor.unsqueeze(0), transform).squeeze(0).numpy()
         
-        # 非ゼロの位置のみをプロット (離散的特性を強調)
-        nonzero_indices = np.nonzero(true_spec)[0]
-        if len(nonzero_indices) > 0:
-            plt.stem(nonzero_indices, true_spec[nonzero_indices], markerfmt=" ", basefmt="b-")
+        # 測定データを元の形式に変換（単純に最大値で正規化）
+        true_tensor = torch.FloatTensor(true_spec)
+        true_nonzero = (true_tensor > 0)
+        if true_nonzero.sum() > 0:
+            true_original = (true_tensor / true_tensor.max() * 100).numpy()
         else:
-            plt.plot(range(len(true_spec)), true_spec, 'b-')
-            
+            true_original = true_tensor.numpy()
+        
+        # 類似度を計算 - 元の形式で計算
+        true_vector = true_original.reshape(1, -1)
+        pred_vector = pred_original.reshape(1, -1)
+        # ゼロ除算を防ぐ
+        if np.sum(true_vector**2) > 0 and np.sum(pred_vector**2) > 0:
+            sim = cosine_similarity(true_vector, pred_vector)[0][0]
+        else:
+            sim = 0.0
+        
+        # 真のスペクトル - 棒グラフ表示（ステムプロット）
+        plt.subplot(num_samples, 2, 2*i + 1)
+        
+        # 非ゼロの位置のみをプロット
+        nonzero_indices = np.nonzero(true_original)[0]
+        if len(nonzero_indices) > 0:
+            plt.stem(nonzero_indices, true_original[nonzero_indices], markerfmt="o", basefmt=" ")
+        
         # タイトルの設定
         mol_id_str = f" - ID: {test_results['mol_ids'][idx]}" if 'mol_ids' in test_results else ""
         plt.title(f"Measured Spectrum{mol_id_str}")
         plt.xlabel("m/z")
-        plt.ylabel("Intensity (%)")
+        plt.ylabel("Relative Intensity (%)")
+        plt.ylim([0, 105])  # 最大値100%に少し余裕を持たせる
         
-        # 予測スペクトル (変換後)
+        # 予測スペクトル - 棒グラフ表示（ステムプロット）
         plt.subplot(num_samples, 2, 2*i + 2)
-        pred_spec = test_results['y_pred_raw'][idx].cpu().numpy()
         
-        # 非ゼロの位置のみをプロット (離散的特性を強調)
-        nonzero_indices = np.nonzero(pred_spec)[0]
+        # 非ゼロの位置のみをプロット
+        nonzero_indices = np.nonzero(pred_original)[0]
         if len(nonzero_indices) > 0:
-            plt.stem(nonzero_indices, pred_spec[nonzero_indices], markerfmt=" ", basefmt="r-")
-        else:
-            plt.plot(range(len(pred_spec)), pred_spec, 'r-')
-            
+            plt.stem(nonzero_indices, pred_original[nonzero_indices], markerfmt="o", basefmt=" ", linefmt="r-")
+        
         plt.title(f"Predicted Spectrum - Similarity: {sim:.4f}")
         plt.xlabel("m/z")
-        plt.ylabel("Intensity (%)")
+        plt.ylabel("Relative Intensity (%)")
+        plt.ylim([0, 105])  # 最大値100%に少し余裕を持たせる
     
     plt.tight_layout()
-    plt.savefig('hybrid_raw_prediction_visualization.png')
+    plt.savefig('hybrid_prediction_visualization.png')
     plt.close()
 
 ###############################
@@ -2187,10 +2139,10 @@ def main():
     
     # 損失関数、オプティマイザー、スケジューラーの設定
     criterion = combined_loss
-    optimizer = torch.optim.RAdam(
+    optimizer = torch.optim.AdamW(
         model.parameters(), 
         lr=0.001,       # 初期学習率
-        weight_decay=1e-5,  # 重み減衰
+        weight_decay=1e-6,  # 重み減衰
         eps=1e-8        # 数値安定性用
     )
     
@@ -2198,8 +2150,8 @@ def main():
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
     
     # エポック数とその他のトレーニングパラメータ
-    num_epochs = 100  # 30エポックに増加
-    patience = 10     # 忍耐値
+    num_epochs = 30  # 30エポックに増加
+    patience = 7     # 忍耐値
     
     logger.info(f"モデルトレーニング設定: エポック数={num_epochs}, 忍耐値={patience}, バッチサイズ={batch_size}")
     logger.info("段階的トレーニングを使用してモデルのトレーニングを開始します...")
@@ -2254,12 +2206,11 @@ def main():
         
         logger.info("テストデータでの評価を開始します...")
         test_results = eval_model(model, test_loader, device, use_amp=True)
-        logger.info(f"テストデータ平均コサイン類似度 (処理済): {test_results['cosine_similarity']:.4f}")
-        logger.info(f"テストデータ平均コサイン類似度 (生スペクトル): {test_results['cosine_similarity_raw']:.4f}")
+        logger.info(f"テストデータ平均コサイン類似度: {test_results['cosine_similarity']:.4f}")
         
         # 予測結果の可視化
         visualize_results(test_results, num_samples=10)
-        logger.info("予測結果の可視化を保存しました: hybrid_raw_prediction_visualization.png")
+        logger.info("予測結果の可視化を保存しました: hybrid_prediction_visualization.png")
     except Exception as e:
         logger.error(f"テスト評価エラー: {e}")
         import traceback
@@ -2269,28 +2220,28 @@ def main():
     
     # 追加の結果分析
     try:
-        # 類似度分布のヒストグラム - 生スペクトルの類似度を使用
+        # 類似度分布のヒストグラム
         similarities = []
-        for i in range(len(test_results['y_true_raw'])):
-            true_vector = test_results['y_true_raw'][i].reshape(1, -1).cpu().numpy()
-            pred_vector = test_results['y_pred_raw'][i].reshape(1, -1).cpu().numpy()
+        for i in range(len(test_results['y_true'])):
+            true_vector = test_results['y_true'][i].reshape(1, -1).cpu().numpy()
+            pred_vector = test_results['y_pred'][i].reshape(1, -1).cpu().numpy()
             sim = cosine_similarity(true_vector, pred_vector)[0][0]
             similarities.append(sim)
         
         plt.figure(figsize=(10, 6))
         plt.hist(similarities, bins=20, alpha=0.7)
-        plt.axvline(x=test_results['cosine_similarity_raw'], color='r', linestyle='--', 
-                    label=f'Mean: {test_results["cosine_similarity_raw"]:.4f}')
-        plt.xlabel('Cosine Similarity (Raw Spectra)')
+        plt.axvline(x=test_results['cosine_similarity'], color='r', linestyle='--', 
+                    label=f'Mean: {test_results["cosine_similarity"]:.4f}')
+        plt.xlabel('Cosine Similarity')
         plt.ylabel('Number of Samples')
-        plt.title('Cosine Similarity Distribution of Test Data (Raw Spectra)')
+        plt.title('Cosine Similarity Distribution of Test Data')
         plt.legend()
         plt.grid(alpha=0.3)
-        plt.savefig('raw_similarity_distribution.png')
-        logger.info("生スペクトルの類似度分布を保存しました: raw_similarity_distribution.png")
+        plt.savefig('similarity_distribution.png')
+        logger.info("Similarity distribution saved: similarity_distribution.png")
         plt.close()
     except Exception as e:
-        logger.error(f"追加分析中にエラー: {e}")
+        logger.error(f"Error in additional analysis: {e}")
     
     logger.info("============= 質量スペクトル予測モデルの実行終了 =============")
     return model, train_losses, val_losses, val_cosine_similarities, test_results
