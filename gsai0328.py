@@ -1886,7 +1886,7 @@ def tiered_training(model, train_ids, val_loader, criterion, optimizer, schedule
     return all_train_losses, all_val_losses, all_val_cosine_similarities, best_cosine
 
 def visualize_results(test_results, num_samples=10, transform="log10over3"):
-    """Prediction result visualization - 元のマススペクトル形式で表示"""
+    """Prediction result visualization - 元のマススペクトル形式で表示、○印なし"""
     plt.figure(figsize=(15, num_samples*4))
     
     # サンプルのインデックスをランダムに選択
@@ -1926,14 +1926,15 @@ def visualize_results(test_results, num_samples=10, transform="log10over3"):
         else:
             sim = 0.0
         
-        # 真のスペクトル - ○印なしの棒グラフ表示
+        # stem関数の代わりにvlinesを使用して○印を完全に消す - 測定スペクトル
         plt.subplot(num_samples, 2, 2*i + 1)
         
         # 非ゼロの位置のみをプロット
         nonzero_indices = np.nonzero(true_original)[0]
         if len(nonzero_indices) > 0:
-            # markerfmt=" " に変更してマーカーを非表示に
-            plt.stem(nonzero_indices, true_original[nonzero_indices], markerfmt=" ", basefmt=" ")
+            # stemではなくvlinesを使用
+            plt.vlines(nonzero_indices, [0] * len(nonzero_indices), true_original[nonzero_indices], 
+                      colors='b', linewidths=1)
         
         # タイトルの設定
         mol_id_str = f" - ID: {test_results['mol_ids'][idx]}" if 'mol_ids' in test_results else ""
@@ -1942,14 +1943,15 @@ def visualize_results(test_results, num_samples=10, transform="log10over3"):
         plt.ylabel("Relative Intensity (%)")
         plt.ylim([0, 105])  # 最大値100%に少し余裕を持たせる
         
-        # 予測スペクトル - ○印なしの棒グラフ表示
+        # 予測スペクトル - vlines使用
         plt.subplot(num_samples, 2, 2*i + 2)
         
         # 非ゼロの位置のみをプロット
         nonzero_indices = np.nonzero(pred_original)[0]
         if len(nonzero_indices) > 0:
-            # markerfmt=" " に変更してマーカーを非表示に
-            plt.stem(nonzero_indices, pred_original[nonzero_indices], markerfmt=" ", basefmt=" ", linefmt="r-")
+            # stemではなくvlinesを使用
+            plt.vlines(nonzero_indices, [0] * len(nonzero_indices), pred_original[nonzero_indices], 
+                      colors='r', linewidths=1)
         
         plt.title(f"Predicted Spectrum - Similarity: {sim:.4f}")
         plt.xlabel("m/z")
@@ -1959,7 +1961,7 @@ def visualize_results(test_results, num_samples=10, transform="log10over3"):
     plt.tight_layout()
     plt.savefig('hybrid_prediction_visualization.png')
     plt.close()
-
+    
 ###############################
 # メイン関数（最適化）
 ###############################
