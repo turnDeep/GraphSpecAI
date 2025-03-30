@@ -1750,21 +1750,21 @@ def tiered_training(model, train_ids, val_loader, criterion, optimizer, schedule
             train_ids[:100000],   # 次に10万
             train_ids             # 最後に全データ
         ]
-        tier_epochs = [3, 3, 4, 5, 15]  # ティアごとのエポック数
+        tier_epochs = [10, 10, 15, 15, 20]  # ティアごとのエポック数
     elif len(train_ids) > 50000:
         train_tiers = [
             train_ids[:10000], 
             train_ids[:30000],
             train_ids
         ]
-        tier_epochs = [3, 4, 23]
+        tier_epochs = [10, 15, 20]
     else:
         # 小さなデータセットは段階を少なく
         train_tiers = [
             train_ids[:5000] if len(train_ids) > 5000 else train_ids[:len(train_ids)//2],
             train_ids
         ]
-        tier_epochs = [5, 25]
+        tier_epochs = [10, 30]
     
     best_cosine = 0.0
     all_train_losses = []
