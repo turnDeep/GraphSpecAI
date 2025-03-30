@@ -200,6 +200,10 @@ def process_spec_discrete(spec, normalize=True, eps=EPS):
 
 def unprocess_spec_discrete(spec, eps=EPS):
     """離散的なマススペクトル処理の逆変換"""
+    # 入力が numpy 配列の場合は Tensor に変換
+    if not isinstance(spec, torch.Tensor):
+        spec = torch.tensor(spec, dtype=torch.float32)
+    
     # 強度を100%スケールに戻す
     spec = spec / (torch.max(spec, dim=-1, keepdim=True)[0] + eps) * 100.
     
