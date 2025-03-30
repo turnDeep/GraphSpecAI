@@ -1926,13 +1926,14 @@ def visualize_results(test_results, num_samples=10, transform="log10over3"):
         else:
             sim = 0.0
         
-        # 真のスペクトル - 棒グラフ表示（ステムプロット）
+        # 真のスペクトル - ○印なしの棒グラフ表示
         plt.subplot(num_samples, 2, 2*i + 1)
         
         # 非ゼロの位置のみをプロット
         nonzero_indices = np.nonzero(true_original)[0]
         if len(nonzero_indices) > 0:
-            plt.stem(nonzero_indices, true_original[nonzero_indices], markerfmt="o", basefmt=" ")
+            # markerfmt=" " に変更してマーカーを非表示に
+            plt.stem(nonzero_indices, true_original[nonzero_indices], markerfmt=" ", basefmt=" ")
         
         # タイトルの設定
         mol_id_str = f" - ID: {test_results['mol_ids'][idx]}" if 'mol_ids' in test_results else ""
@@ -1941,13 +1942,14 @@ def visualize_results(test_results, num_samples=10, transform="log10over3"):
         plt.ylabel("Relative Intensity (%)")
         plt.ylim([0, 105])  # 最大値100%に少し余裕を持たせる
         
-        # 予測スペクトル - 棒グラフ表示（ステムプロット）
+        # 予測スペクトル - ○印なしの棒グラフ表示
         plt.subplot(num_samples, 2, 2*i + 2)
         
         # 非ゼロの位置のみをプロット
         nonzero_indices = np.nonzero(pred_original)[0]
         if len(nonzero_indices) > 0:
-            plt.stem(nonzero_indices, pred_original[nonzero_indices], markerfmt="o", basefmt=" ", linefmt="r-")
+            # markerfmt=" " に変更してマーカーを非表示に
+            plt.stem(nonzero_indices, pred_original[nonzero_indices], markerfmt=" ", basefmt=" ", linefmt="r-")
         
         plt.title(f"Predicted Spectrum - Similarity: {sim:.4f}")
         plt.xlabel("m/z")
