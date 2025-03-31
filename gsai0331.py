@@ -1,4 +1,3 @@
-
 import os
 import numpy as np
 import torch
@@ -2304,9 +2303,6 @@ def main():
     
     logger.info("============= 質量スペクトル予測モデルの実行終了 =============")
     return model, train_losses, val_losses, val_cosine_similarities, test_results
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
