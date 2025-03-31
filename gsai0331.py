@@ -181,8 +181,8 @@ def unprocess_spec(spec, transform):
     assert not torch.isnan(spec).any()
     return spec
 
-def hybrid_spectrum_conversion(smoothed_prediction, transform="log10over3"):
-    """予測結果を実際のマススペクトルに近い離散的な形式に変換（改良版）"""
+def enhanced_spectrum_conversion(smoothed_prediction, transform="log10over3"):
+    """より本物に近いマススペクトルへの変換（大幅改良版）"""
     # モデル出力を元のスケールに戻す
     if transform == "log10":
         untransformed = 10**smoothed_prediction - 1.
@@ -195,80 +195,177 @@ def hybrid_spectrum_conversion(smoothed_prediction, transform="log10over3"):
     else:
         untransformed = smoothed_prediction
     
-    # 非ゼロの値だけを処理
-    non_zero_mask = untransformed > 0.001  # 極小値はノイズとして除去
+    # 極小ノイズをフィルタリング
+    noise_threshold = 0.0005
+    untransformed[untransformed < noise_threshold] = 0
     
     # 初期化
     discrete_spectrum = np.zeros_like(untransformed)
     max_intensity = np.max(untransformed) if np.max(untransformed) > 0 else 1.0
     
-    # 1. 複数レベルの閾値でピークを検出
-    from scipy.signal import find_peaks
+    # 各m/z領域に適した閾値を設定
+    spectrum_length = len(untransformed)
+    low_mz_region = int(spectrum_length * 0.25)    # 最初の25%
+    mid_mz_region = int(spectrum_length * 0.7)     # 70%まで
     
-    # 高強度ピークの検出（最大値の5%以上）
-    high_peaks, _ = find_peaks(untransformed, height=max_intensity * 0.05, distance=1)
-    for peak in high_peaks:
-        discrete_spectrum[peak] = untransformed[peak]
+    # 領域ごとの閾値設定
+    thresholds = {
+        'low_mz': {
+            'high': 0.02,    # 最大ピークの2%
+            'medium': 0.005, # 0.5%
+            'low': 0.002     # 0.2%
+        },
+        'mid_mz': {
+            'high': 0.02,
+            'medium': 0.006,
+            'low': 0.0025
+        },
+        'high_mz': {
+            'high': 0.02,
+            'medium': 0.004,
+            'low': 0.0015    # 高m/z域では低い閾値（0.15%）
+        }
+    }
     
-    # 中強度ピークの検出（最大値の2%以上）
-    medium_peaks, _ = find_peaks(untransformed, height=max_intensity * 0.02, distance=1)
-    for peak in medium_peaks:
-        discrete_spectrum[peak] = untransformed[peak]
+    # 1. m/z領域ごとにピーク検出と保持を行う
+    for region_start, region_end, region_name in [
+        (0, low_mz_region, 'low_mz'),
+        (low_mz_region, mid_mz_region, 'mid_mz'),
+        (mid_mz_region, spectrum_length, 'high_mz')
+    ]:
+        region_data = untransformed[region_start:region_end]
+        if np.max(region_data) == 0:
+            continue
+            
+        # 領域内の高強度ピークを検出
+        from scipy.signal import find_peaks
+        high_peaks, _ = find_peaks(
+            region_data, 
+            height=max_intensity * thresholds[region_name]['high'],
+            distance=1
+        )
+        
+        # 領域内の中強度ピークを検出
+        medium_peaks, _ = find_peaks(
+            region_data, 
+            height=max_intensity * thresholds[region_name]['medium'],
+            distance=1
+        )
+        
+        # 領域内の低強度ピークを検出（数を制限）
+        low_peaks, low_props = find_peaks(
+            region_data, 
+            height=max_intensity * thresholds[region_name]['low'],
+            distance=1
+        )
+        
+        # 絶対m/z値に変換
+        high_peaks = high_peaks + region_start
+        medium_peaks = medium_peaks + region_start
+        low_peaks = low_peaks + region_start
+        
+        # ピークを保持
+        for peak in high_peaks:
+            discrete_spectrum[peak] = untransformed[peak]
+            
+        for peak in medium_peaks:
+            discrete_spectrum[peak] = untransformed[peak]
+        
+        # 低強度ピークは数を制限（各領域で最大50個）
+        if len(low_peaks) > 0:
+            # 強度でソート
+            heights = [untransformed[p] for p in low_peaks]
+            sorted_indices = np.argsort(-np.array(heights))
+            count = 0
+            for idx in sorted_indices:
+                peak = low_peaks[idx]
+                if discrete_spectrum[peak] == 0 and count < 50:  # 未追加で最大50個まで
+                    discrete_spectrum[peak] = untransformed[peak]
+                    count += 1
     
-    # 低強度ピークの検出（最大値の1%以上）- サンプルごとに最大20個まで追加
-    low_peaks, low_props = find_peaks(untransformed, height=max_intensity * 0.01, distance=1)
-    # 強度順にソート
-    if len(low_peaks) > 0:
-        sorted_indices = np.argsort(-low_props['peak_heights'])
-        sorted_low_peaks = low_peaks[sorted_indices]
-        # 既に追加されていないピークのみを追加（最大20個まで）
-        count = 0
-        for peak in sorted_low_peaks:
-            if discrete_spectrum[peak] == 0 and count < 20:
-                discrete_spectrum[peak] = untransformed[peak]
-                count += 1
+    # 2. クラスターパターンの検出と保持（連続するピークグループ）
+    window_size = 5
+    for i in range(window_size, len(untransformed) - window_size):
+        window = untransformed[i-window_size:i+window_size+1]
+        # ウィンドウ内に3つ以上のピークがあり、合計強度が閾値を超える場合
+        non_zero_count = np.count_nonzero(window > 0)
+        window_sum = np.sum(window)
+        
+        if non_zero_count >= 3 and window_sum > max_intensity * 0.025:
+            # クラスター内のすべてのピークを保持
+            for j in range(i-window_size, i+window_size+1):
+                if untransformed[j] > 0:
+                    discrete_spectrum[j] = untransformed[j]
     
-    # 2. 既知の重要なm/z値のピークを保持
+    # 3. 同位体パターンの検出と保持
+    for i in range(len(untransformed) - 2):
+        # 強いピークを起点に
+        if untransformed[i] > max_intensity * 0.08:
+            # M+1, M+2ピークのチェック
+            isotope_pattern = False
+            
+            # M+1, M+2があるかチェック
+            if i+1 < len(untransformed) and untransformed[i+1] > 0:
+                ratio_1 = untransformed[i+1] / untransformed[i]
+                # 典型的な同位体比の範囲（〜30%）
+                if 0.01 < ratio_1 < 0.3:
+                    isotope_pattern = True
+                    discrete_spectrum[i+1] = untransformed[i+1]
+                    
+            if isotope_pattern and i+2 < len(untransformed) and untransformed[i+2] > 0:
+                ratio_2 = untransformed[i+2] / untransformed[i]
+                # M+2は通常M+1より小さい
+                if ratio_2 < ratio_1 and ratio_2 > 0.005:
+                    discrete_spectrum[i+2] = untransformed[i+2]
+    
+    # 4. 分子イオンピーク付近の情報を詳細に保持（高m/z領域）
+    high_mz_start = int(len(untransformed) * 0.8)  # 最後の20%
+    for i in range(high_mz_start, len(untransformed)):
+        if untransformed[i] > max_intensity * 0.001:  # 非常に低い閾値
+            discrete_spectrum[i] = untransformed[i]
+    
+    # 5. 強度分布を保ちつつ、スペクトル全体の形状をより忠実に再現
+    # 整数m/z間隔でピーク検出（質量分析の基本単位）
+    mz_interval = 14  # CH2基の質量に相当（代表的なフラグメント間隔）
+    for interval in [12, 14, 16, 18, 28]:  # 一般的なフラグメントパターン間隔
+        for start in range(interval):  # 各開始点から間隔ごとにチェック
+            for i in range(start, len(untransformed), interval):
+                if untransformed[i] > max_intensity * 0.003:
+                    discrete_spectrum[i] = untransformed[i]
+    
+    # 6. 孤立ピークの保存（周囲に他のピークがない場合）
+    for i in range(3, len(untransformed) - 3):
+        # 前後6ポイントの範囲でピークが唯一の場合
+        surrounding = list(untransformed[i-3:i]) + list(untransformed[i+1:i+4])
+        if untransformed[i] > max_intensity * 0.003 and max(surrounding) < max_intensity * 0.001:
+            discrete_spectrum[i] = untransformed[i]
+    
+    # 7. IMPORTANT_MZ値のピークを低閾値で保持
     IMPORTANT_MZ = [18, 28, 43, 57, 71, 73, 77, 91, 105, 115, 128, 152, 165, 178, 207]
     for mz in IMPORTANT_MZ:
-        if mz < len(untransformed) and untransformed[mz] > max_intensity * 0.01:
+        if mz < len(untransformed) and untransformed[mz] > max_intensity * 0.0008:
             discrete_spectrum[mz] = untransformed[mz]
     
-    # 3. 孤立したピークで重要そうなものを保持
-    for i in range(2, len(untransformed)-2):
-        # 周囲4点が低強度であるが、自身は比較的強度が高い孤立ピーク
-        if (untransformed[i] > max_intensity * 0.015 and
-            untransformed[i-2] < max_intensity * 0.01 and
-            untransformed[i-1] < max_intensity * 0.01 and
-            untransformed[i+1] < max_intensity * 0.01 and
-            untransformed[i+2] < max_intensity * 0.01):
-            discrete_spectrum[i] = untransformed[i]
+    # 8. スペクトル内のギャップを検出し、適切な補間を行う
+    # （連続的な形状が途切れる部分を検出して補完）
+    for i in range(5, len(discrete_spectrum) - 5):
+        # 前後のピークが存在するがギャップがある場合
+        if (np.sum(discrete_spectrum[i-5:i] > 0) >= 2 and 
+            np.sum(discrete_spectrum[i:i+5] > 0) >= 2 and
+            discrete_spectrum[i] == 0):
+            # ギャップを補間（元の強度の70%で保持）
+            if untransformed[i] > max_intensity * 0.001:
+                discrete_spectrum[i] = untransformed[i]
     
-    # 4. 同位体パターンを検出・保持（M, M+1, M+2のパターン）
-    for i in range(2, len(untransformed)-2):
-        # 強いピークが検出されていて
-        if discrete_spectrum[i] > max_intensity * 0.1:
-            # M+1, M+2ピークのチェック（典型的な同位体パターン）
-            if i+1 < len(untransformed) and untransformed[i+1] > max_intensity * 0.005:
-                discrete_spectrum[i+1] = untransformed[i+1]  # M+1ピークを保持
-            if i+2 < len(untransformed) and untransformed[i+2] > max_intensity * 0.003:
-                discrete_spectrum[i+2] = untransformed[i+2]  # M+2ピークを保持
-    
-    # 5. 高m/z領域のピークを優先的に保持（通常、分子イオンや特徴的フラグメントが存在）
-    high_mz_region = int(len(untransformed) * 0.7)  # スペクトルの後半70%を「高m/z領域」と定義
-    for i in range(high_mz_region, len(untransformed)):
-        if untransformed[i] > max_intensity * 0.008:  # 高m/z領域では低い閾値を使用
-            discrete_spectrum[i] = untransformed[i]
-    
-    # 6. 特徴的なクラスターパターンの保持（連続する複数のピーク）
-    for i in range(3, len(untransformed)-3):
-        # 3つ以上連続するピークパターン
-        if (untransformed[i-1] > 0 and untransformed[i] > 0 and 
-            untransformed[i+1] > 0 and untransformed[i-1] + untransformed[i] + untransformed[i+1] > max_intensity * 0.03):
-            # クラスター全体を保持
-            discrete_spectrum[i-1] = untransformed[i-1]
-            discrete_spectrum[i] = untransformed[i]
-            discrete_spectrum[i+1] = untransformed[i+1]
+    # 9. 多すぎるピークを抑制（ノイズを減らす）
+    # ピーク数をカウント
+    peak_count = np.sum(discrete_spectrum > 0)
+    if peak_count > 300:  # ピークが多すぎる場合
+        # 強度順にソートして上位300個だけを保持
+        indices = np.argsort(-discrete_spectrum)
+        mask = np.zeros_like(discrete_spectrum, dtype=bool)
+        mask[indices[:300]] = True
+        discrete_spectrum = discrete_spectrum * mask
     
     # 最大値で正規化（相対強度に変換）
     if np.max(discrete_spectrum) > 0:
