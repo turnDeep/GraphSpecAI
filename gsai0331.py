@@ -1898,8 +1898,9 @@ def tiered_training(model, train_ids, val_loader, criterion, optimizer, schedule
     return all_train_losses, all_val_losses, all_val_cosine_similarities, best_cosine
 
 def visualize_results(test_results, num_samples=10):
-    """Prediction result visualization with both smooth and discrete predictions"""
-    plt.figure(figsize=(15, num_samples*4))
+    """Prediction result visualization with discrete predictions only"""
+    # 1つの大きな図に全サンプルをまとめる
+    plt.figure(figsize=(16, num_samples*4))
     
     # サンプルのインデックスをランダムに選択
     if 'mol_ids' in test_results and len(test_results['mol_ids']) > 0:
@@ -1912,20 +1913,18 @@ def visualize_results(test_results, num_samples=10):
                                          replace=False)
     
     for i, idx in enumerate(sample_indices):
-        # 行ごとに3つのサブプロット（真のスペクトル、元の予測、離散化した予測）
-        plt.figure(figsize=(18, 4))
-        
         # 類似度を計算
         true_vector = test_results['y_true'][idx].reshape(1, -1).cpu().numpy()
-        pred_vector = test_results['y_pred'][idx].reshape(1, -1).cpu().numpy()
         discrete_vector = test_results['y_pred_discrete'][idx].reshape(1, -1).cpu().numpy()
-        
-        smooth_sim = cosine_similarity(true_vector, pred_vector)[0][0]
         discrete_sim = cosine_similarity(true_vector, discrete_vector)[0][0]
         
         # 1. 真のスペクトル
-        plt.subplot(1, 3, 1)
+        plt.subplot(num_samples, 2, 2*i + 1)
         true_spec = test_results['y_true'][idx].numpy()
+        
+        # 原スペクトルを相対強度（%）に変換
+        if np.max(true_spec) > 0:
+            true_spec = true_spec / np.max(true_spec) * 100
         
         # 非ゼロの位置を強調
         nonzero_indices = np.nonzero(true_spec)[0]
@@ -1937,21 +1936,11 @@ def visualize_results(test_results, num_samples=10):
         mol_id_str = f" - ID: {test_results['mol_ids'][idx]}" if 'mol_ids' in test_results else ""
         plt.title(f"Measured Spectrum{mol_id_str}")
         plt.xlabel("m/z")
-        plt.ylabel("Intensity")
+        plt.ylabel("Relative Intensity (%)")
+        plt.ylim([0, 105])  # 最大値100%に少し余裕を持たせる
         
-        # 2. 元の予測スペクトル（スムーズな形状）
-        plt.subplot(1, 3, 2)
-        pred_spec = test_results['y_pred'][idx].numpy()
-        
-        # スムーズなので通常の線形プロット
-        plt.plot(range(len(pred_spec)), pred_spec, 'r-')
-            
-        plt.title(f"Smooth Prediction - Similarity: {smooth_sim:.4f}")
-        plt.xlabel("m/z")
-        plt.ylabel("Intensity")
-        
-        # 3. 離散化した予測スペクトル
-        plt.subplot(1, 3, 3)
+        # 2. 離散化した予測スペクトル
+        plt.subplot(num_samples, 2, 2*i + 2)
         discrete_spec = test_results['y_pred_discrete'][idx].numpy()
         
         # 非ゼロの位置を強調
@@ -1962,21 +1951,11 @@ def visualize_results(test_results, num_samples=10):
             
         plt.title(f"Discrete Prediction - Similarity: {discrete_sim:.4f}")
         plt.xlabel("m/z")
-        plt.ylabel("Intensity")
-        
-        plt.tight_layout()
-        plt.savefig(f'spectrum_comparison_{i}.png')
-        plt.close()
+        plt.ylabel("Relative Intensity (%)")
+        plt.ylim([0, 105])  # 最大値100%に少し余裕を持たせる
     
-    # 全体の類似度比較
-    plt.figure(figsize=(10, 6))
-    plt.bar(['Smooth Prediction', 'Discrete Prediction'], 
-           [test_results['cosine_similarity'], test_results['discrete_cosine_similarity']], 
-           color=['blue', 'green'])
-    plt.title('Cosine Similarity Comparison')
-    plt.ylabel('Average Cosine Similarity')
-    plt.grid(axis='y', alpha=0.3)
-    plt.savefig('similarity_comparison.png')
+    plt.tight_layout()
+    plt.savefig('spectrum_comparison.png')
     plt.close()
 
 ###############################
@@ -2220,86 +2199,84 @@ def main():
     except Exception as e:
         logger.error(f"モデル読み込みエラー: {e}")
     
-    # テストデータでの評価 - ここが変更部分
-    try:
-        # テスト前にメモリ解放
-        aggressive_memory_cleanup(force_sync=True, purge_cache=True)
-        
-        logger.info("テストデータでの評価を開始します...")
-        test_results = eval_model(model, test_loader, device, use_amp=True, transform=transform)
-        logger.info(f"テストデータ平均コサイン類似度 (元の予測): {test_results['cosine_similarity']:.4f}")
-        logger.info(f"テストデータ平均コサイン類似度 (離散化後): {test_results['discrete_cosine_similarity']:.4f}")
-        
-        # 予測結果の可視化
-        visualize_results(test_results, num_samples=10)
-        logger.info("予測結果の可視化を保存しました")
-        
-        # 性能比較グラフの保存
-        plt.figure(figsize=(10, 6))
-        plt.bar(['元の予測', '離散化後'], 
-               [test_results['cosine_similarity'], test_results['discrete_cosine_similarity']], 
-               color=['blue', 'green'])
-        plt.title('コサイン類似度の比較')
-        plt.ylabel('平均コサイン類似度')
-        plt.grid(axis='y', alpha=0.3)
-        plt.savefig('similarity_comparison.png')
-        plt.close()
-        logger.info("コサイン類似度比較グラフを保存しました: similarity_comparison.png")
-    except Exception as e:
-        logger.error(f"テスト評価エラー: {e}")
-        import traceback
-        traceback.print_exc()
+    # テストデータでの評価部分のコード変更
+try:
+    # テスト前にメモリ解放
+    aggressive_memory_cleanup(force_sync=True, purge_cache=True)
     
-    logger.info("解析プロセス完了！")
+    logger.info("テストデータでの評価を開始します...")
+    test_results = eval_model(model, test_loader, device, use_amp=True, transform=transform)
+    logger.info(f"テストデータ平均コサイン類似度 (元の予測): {test_results['cosine_similarity']:.4f}")
+    logger.info(f"テストデータ平均コサイン類似度 (離散化後): {test_results['discrete_cosine_similarity']:.4f}")
     
-    # 追加の結果分析
-    try:
-        # スムーズな予測と離散化した予測の類似度分布の比較
-        smooth_similarities = []
-        discrete_similarities = []
+    # 予測結果の可視化
+    visualize_results(test_results, num_samples=10)
+    logger.info("予測結果の可視化を保存しました: spectrum_comparison.png")
+    
+    # 性能比較グラフの保存
+    plt.figure(figsize=(10, 6))
+    plt.bar(['Original Prediction', 'Discrete Prediction'], 
+           [test_results['cosine_similarity'], test_results['discrete_cosine_similarity']], 
+           color=['blue', 'green'])
+    plt.title('Comparison of Cosine Similarity')
+    plt.ylabel('Average Cosine Similarity')
+    plt.grid(axis='y', alpha=0.3)
+    plt.savefig('similarity_comparison.png')
+    plt.close()
+    logger.info("コサイン類似度比較グラフを保存しました: similarity_comparison.png")
+except Exception as e:
+    logger.error(f"テスト評価エラー: {e}")
+    import traceback
+    traceback.print_exc()
+
+# 追加の結果分析部分のコード変更
+try:
+    # スムーズな予測と離散化した予測の類似度分布の比較
+    smooth_similarities = []
+    discrete_similarities = []
+    
+    for i in range(len(test_results['y_true'])):
+        true_vector = test_results['y_true'][i].reshape(1, -1).cpu().numpy()
         
-        for i in range(len(test_results['y_true'])):
-            true_vector = test_results['y_true'][i].reshape(1, -1).cpu().numpy()
-            
-            # スムーズな予測との類似度
-            pred_vector = test_results['y_pred'][i].reshape(1, -1).cpu().numpy()
-            smooth_sim = cosine_similarity(true_vector, pred_vector)[0][0]
-            smooth_similarities.append(smooth_sim)
-            
-            # 離散化した予測との類似度
-            discrete_vector = test_results['y_pred_discrete'][i].reshape(1, -1).cpu().numpy()
-            discrete_sim = cosine_similarity(true_vector, discrete_vector)[0][0]
-            discrete_similarities.append(discrete_sim)
+        # スムーズな予測との類似度
+        pred_vector = test_results['y_pred'][i].reshape(1, -1).cpu().numpy()
+        smooth_sim = cosine_similarity(true_vector, pred_vector)[0][0]
+        smooth_similarities.append(smooth_sim)
         
-        # 類似度分布のヒストグラム
-        plt.figure(figsize=(12, 6))
-        
-        plt.subplot(1, 2, 1)
-        plt.hist(smooth_similarities, bins=20, alpha=0.7, color='blue')
-        plt.axvline(x=test_results['cosine_similarity'], color='r', linestyle='--', 
-                    label=f'平均: {test_results["cosine_similarity"]:.4f}')
-        plt.xlabel('コサイン類似度')
-        plt.ylabel('サンプル数')
-        plt.title('元の予測の類似度分布')
-        plt.legend()
-        plt.grid(alpha=0.3)
-        
-        plt.subplot(1, 2, 2)
-        plt.hist(discrete_similarities, bins=20, alpha=0.7, color='green')
-        plt.axvline(x=test_results['discrete_cosine_similarity'], color='r', linestyle='--', 
-                    label=f'平均: {test_results["discrete_cosine_similarity"]:.4f}')
-        plt.xlabel('コサイン類似度')
-        plt.ylabel('サンプル数')
-        plt.title('離散化後の類似度分布')
-        plt.legend()
-        plt.grid(alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig('similarity_distributions.png')
-        logger.info("類似度分布を保存しました: similarity_distributions.png")
-        plt.close()
-    except Exception as e:
-        logger.error(f"追加分析中にエラー: {str(e)}")
+        # 離散化した予測との類似度
+        discrete_vector = test_results['y_pred_discrete'][i].reshape(1, -1).cpu().numpy()
+        discrete_sim = cosine_similarity(true_vector, discrete_vector)[0][0]
+        discrete_similarities.append(discrete_sim)
+    
+    # 類似度分布のヒストグラム
+    plt.figure(figsize=(12, 6))
+    
+    plt.subplot(1, 2, 1)
+    plt.hist(smooth_similarities, bins=20, alpha=0.7, color='blue')
+    plt.axvline(x=test_results['cosine_similarity'], color='r', linestyle='--', 
+                label=f'Mean: {test_results["cosine_similarity"]:.4f}')
+    plt.xlabel('Cosine Similarity')
+    plt.ylabel('Number of Samples')
+    plt.title('Original Prediction Similarity Distribution')
+    plt.legend()
+    plt.grid(alpha=0.3)
+    
+    plt.subplot(1, 2, 2)
+    plt.hist(discrete_similarities, bins=20, alpha=0.7, color='green')
+    plt.axvline(x=test_results['discrete_cosine_similarity'], color='r', linestyle='--', 
+                label=f'Mean: {test_results["discrete_cosine_similarity"]:.4f}')
+    plt.xlabel('Cosine Similarity')
+    plt.ylabel('Number of Samples')
+    plt.title('Discrete Prediction Similarity Distribution')
+    plt.legend()
+    plt.grid(alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('similarity_distributions.png')
+    logger.info("類似度分布を保存しました: similarity_distributions.png")
+    plt.close()
+except Exception as e:
+    logger.error(f"追加分析中にエラー: {str(e)}")
     
     logger.info("============= 質量スペクトル予測モデルの実行終了 =============")
     return model, train_losses, val_losses, val_cosine_similarities, test_results
