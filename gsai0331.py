@@ -2200,83 +2200,83 @@ def main():
         logger.error(f"モデル読み込みエラー: {e}")
     
     # テストデータでの評価部分のコード変更
-try:
-    # テスト前にメモリ解放
-    aggressive_memory_cleanup(force_sync=True, purge_cache=True)
-    
-    logger.info("テストデータでの評価を開始します...")
-    test_results = eval_model(model, test_loader, device, use_amp=True, transform=transform)
-    logger.info(f"テストデータ平均コサイン類似度 (元の予測): {test_results['cosine_similarity']:.4f}")
-    logger.info(f"テストデータ平均コサイン類似度 (離散化後): {test_results['discrete_cosine_similarity']:.4f}")
-    
-    # 予測結果の可視化
-    visualize_results(test_results, num_samples=10)
-    logger.info("予測結果の可視化を保存しました: spectrum_comparison.png")
-    
-    # 性能比較グラフの保存
-    plt.figure(figsize=(10, 6))
-    plt.bar(['Original Prediction', 'Discrete Prediction'], 
-           [test_results['cosine_similarity'], test_results['discrete_cosine_similarity']], 
-           color=['blue', 'green'])
-    plt.title('Comparison of Cosine Similarity')
-    plt.ylabel('Average Cosine Similarity')
-    plt.grid(axis='y', alpha=0.3)
-    plt.savefig('similarity_comparison.png')
-    plt.close()
-    logger.info("コサイン類似度比較グラフを保存しました: similarity_comparison.png")
-except Exception as e:
-    logger.error(f"テスト評価エラー: {e}")
-    import traceback
-    traceback.print_exc()
-
-# 追加の結果分析部分のコード変更
-try:
-    # スムーズな予測と離散化した予測の類似度分布の比較
-    smooth_similarities = []
-    discrete_similarities = []
-    
-    for i in range(len(test_results['y_true'])):
-        true_vector = test_results['y_true'][i].reshape(1, -1).cpu().numpy()
+    try:
+        # テスト前にメモリ解放
+        aggressive_memory_cleanup(force_sync=True, purge_cache=True)
         
-        # スムーズな予測との類似度
-        pred_vector = test_results['y_pred'][i].reshape(1, -1).cpu().numpy()
-        smooth_sim = cosine_similarity(true_vector, pred_vector)[0][0]
-        smooth_similarities.append(smooth_sim)
+        logger.info("テストデータでの評価を開始します...")
+        test_results = eval_model(model, test_loader, device, use_amp=True, transform=transform)
+        logger.info(f"テストデータ平均コサイン類似度 (元の予測): {test_results['cosine_similarity']:.4f}")
+        logger.info(f"テストデータ平均コサイン類似度 (離散化後): {test_results['discrete_cosine_similarity']:.4f}")
         
-        # 離散化した予測との類似度
-        discrete_vector = test_results['y_pred_discrete'][i].reshape(1, -1).cpu().numpy()
-        discrete_sim = cosine_similarity(true_vector, discrete_vector)[0][0]
-        discrete_similarities.append(discrete_sim)
+        # 予測結果の可視化
+        visualize_results(test_results, num_samples=10)
+        logger.info("予測結果の可視化を保存しました: spectrum_comparison.png")
+        
+        # 性能比較グラフの保存
+        plt.figure(figsize=(10, 6))
+        plt.bar(['Original Prediction', 'Discrete Prediction'], 
+               [test_results['cosine_similarity'], test_results['discrete_cosine_similarity']], 
+               color=['blue', 'green'])
+        plt.title('Comparison of Cosine Similarity')
+        plt.ylabel('Average Cosine Similarity')
+        plt.grid(axis='y', alpha=0.3)
+        plt.savefig('similarity_comparison.png')
+        plt.close()
+        logger.info("コサイン類似度比較グラフを保存しました: similarity_comparison.png")
+    except Exception as e:
+        logger.error(f"テスト評価エラー: {e}")
+        import traceback
+        traceback.print_exc()
     
-    # 類似度分布のヒストグラム
-    plt.figure(figsize=(12, 6))
-    
-    plt.subplot(1, 2, 1)
-    plt.hist(smooth_similarities, bins=20, alpha=0.7, color='blue')
-    plt.axvline(x=test_results['cosine_similarity'], color='r', linestyle='--', 
-                label=f'Mean: {test_results["cosine_similarity"]:.4f}')
-    plt.xlabel('Cosine Similarity')
-    plt.ylabel('Number of Samples')
-    plt.title('Original Prediction Similarity Distribution')
-    plt.legend()
-    plt.grid(alpha=0.3)
-    
-    plt.subplot(1, 2, 2)
-    plt.hist(discrete_similarities, bins=20, alpha=0.7, color='green')
-    plt.axvline(x=test_results['discrete_cosine_similarity'], color='r', linestyle='--', 
-                label=f'Mean: {test_results["discrete_cosine_similarity"]:.4f}')
-    plt.xlabel('Cosine Similarity')
-    plt.ylabel('Number of Samples')
-    plt.title('Discrete Prediction Similarity Distribution')
-    plt.legend()
-    plt.grid(alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig('similarity_distributions.png')
-    logger.info("類似度分布を保存しました: similarity_distributions.png")
-    plt.close()
-except Exception as e:
-    logger.error(f"追加分析中にエラー: {str(e)}")
+    # 追加の結果分析部分のコード変更
+    try:
+        # スムーズな予測と離散化した予測の類似度分布の比較
+        smooth_similarities = []
+        discrete_similarities = []
+        
+        for i in range(len(test_results['y_true'])):
+            true_vector = test_results['y_true'][i].reshape(1, -1).cpu().numpy()
+            
+            # スムーズな予測との類似度
+            pred_vector = test_results['y_pred'][i].reshape(1, -1).cpu().numpy()
+            smooth_sim = cosine_similarity(true_vector, pred_vector)[0][0]
+            smooth_similarities.append(smooth_sim)
+            
+            # 離散化した予測との類似度
+            discrete_vector = test_results['y_pred_discrete'][i].reshape(1, -1).cpu().numpy()
+            discrete_sim = cosine_similarity(true_vector, discrete_vector)[0][0]
+            discrete_similarities.append(discrete_sim)
+        
+        # 類似度分布のヒストグラム
+        plt.figure(figsize=(12, 6))
+        
+        plt.subplot(1, 2, 1)
+        plt.hist(smooth_similarities, bins=20, alpha=0.7, color='blue')
+        plt.axvline(x=test_results['cosine_similarity'], color='r', linestyle='--', 
+                    label=f'Mean: {test_results["cosine_similarity"]:.4f}')
+        plt.xlabel('Cosine Similarity')
+        plt.ylabel('Number of Samples')
+        plt.title('Original Prediction Similarity Distribution')
+        plt.legend()
+        plt.grid(alpha=0.3)
+        
+        plt.subplot(1, 2, 2)
+        plt.hist(discrete_similarities, bins=20, alpha=0.7, color='green')
+        plt.axvline(x=test_results['discrete_cosine_similarity'], color='r', linestyle='--', 
+                    label=f'Mean: {test_results["discrete_cosine_similarity"]:.4f}')
+        plt.xlabel('Cosine Similarity')
+        plt.ylabel('Number of Samples')
+        plt.title('Discrete Prediction Similarity Distribution')
+        plt.legend()
+        plt.grid(alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig('similarity_distributions.png')
+        logger.info("類似度分布を保存しました: similarity_distributions.png")
+        plt.close()
+    except Exception as e:
+        logger.error(f"追加分析中にエラー: {str(e)}")
     
     logger.info("============= 質量スペクトル予測モデルの実行終了 =============")
     return model, train_losses, val_losses, val_cosine_similarities, test_results
