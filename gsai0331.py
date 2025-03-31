@@ -181,7 +181,7 @@ def unprocess_spec(spec, transform):
     assert not torch.isnan(spec).any()
     return spec
 
-def enhanced_spectrum_conversion(smoothed_prediction, transform="log10over3"):
+def hybrid_spectrum_conversion(smoothed_prediction, transform="log10over3"):
     """より本物に近いマススペクトルへの変換（大幅改良版）"""
     # モデル出力を元のスケールに戻す
     if transform == "log10":
