@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import os
 import numpy as np
 import torch
@@ -16,8 +15,9 @@ RDLogger.DisableLog('rdApp.*')
 
 # Transformersライブラリのインポート (ChemBERTa用)
 from transformers import RobertaConfig, RobertaModel, RobertaTokenizer
-from transformers import AdamW, get_linear_schedule_with_warmup
-
+from transformers import get_linear_schedule_with_warmup  # AdamWをtorch.optimからインポートするよう修正
+from torch.optim import AdamW  # PyTorchからAdamWをインポート
+from rdkit import DataStructs
 from tqdm import tqdm
 import logging
 import copy
@@ -273,18 +273,20 @@ def parse_msp_file_raw(msp_file_path, cache_dir=CACHE_DIR):
     msp_data = {}
     current_id = None
     current_peaks = []
+    skipped_lines = 0  # エラーカウント用
+    
     with open(msp_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-        for line_num, line in enumerate(f): # 行番号を追加してデバッグしやすく
+        for line_num, line in enumerate(f):
             line = line.strip()
             try:
                 if line.startswith("ID:"):
                     # ID行の処理前に前の化合物を保存
                     if current_id is not None and current_peaks:
-                         ms_vector = np.zeros(MAX_MZ, dtype=np.float32) # メモリ効率のためfloat32
+                         ms_vector = np.zeros(MAX_MZ, dtype=np.float32)
                          for mz, intensity in current_peaks:
                              mz_int = int(round(mz))
                              if 0 <= mz_int < MAX_MZ:
-                                 ms_vector[mz_int] = max(ms_vector[mz_int], intensity) # 強度が最大の値を取る
+                                 ms_vector[mz_int] = max(ms_vector[mz_int], intensity)
                          msp_data[current_id] = ms_vector
                     # 新しいIDとピークリストを初期化
                     current_id = int(line.split(":")[-1].strip())
@@ -292,6 +294,10 @@ def parse_msp_file_raw(msp_file_path, cache_dir=CACHE_DIR):
                 elif line.startswith("Num peaks:"):
                     # ピーク数情報は特に使わないが、ピーク開始の目印
                     pass
+                # 重要: Comment:行やその他のメタデータ行をスキップ
+                elif line.startswith(("Comment:", "Name:", "Formula:", "MW:", "ExactMass:", "CASNO:")):
+                    # これらの行はピークデータではないので無視
+                    continue
                 elif current_id is not None and ";" in line: # ピーク行の形式 (e.g., "15 345; 16 521;")
                     peak_pairs = line.split(';')
                     for pair in peak_pairs:
@@ -321,10 +327,13 @@ def parse_msp_file_raw(msp_file_path, cache_dir=CACHE_DIR):
                      current_id = None
                      current_peaks = []
             except Exception as e:
-                 logger.error(f"MSPファイル解析エラー (行 {line_num + 1}): {e} - Line: '{line}'")
+                 # エラーログの数を減らすためにカウントのみ
+                 skipped_lines += 1
                  # エラーが発生しても、次の化合物から処理を試みる
-                 current_id = None
-                 current_peaks = []
+                 if skipped_lines <= 10:  # 最初の10件だけログ出力
+                     logger.error(f"MSPファイル解析エラー (行 {line_num + 1}): {e} - Line: '{line}'")
+                 elif skipped_lines == 11:
+                     logger.warning("多数の解析エラーが発生しています。以降のエラーログは省略します。")
 
     # ファイル末尾に残っているデータを処理
     if current_id is not None and current_peaks:
@@ -335,6 +344,7 @@ def parse_msp_file_raw(msp_file_path, cache_dir=CACHE_DIR):
                 ms_vector[mz_int] = max(ms_vector[mz_int], intensity)
         msp_data[current_id] = ms_vector
 
+    logger.info(f"MSPファイル解析完了: {len(msp_data)}件の化合物データを読み込み（{skipped_lines}行をスキップ）")
     logger.info(f"生MSPデータをキャッシュに保存中: {cache_file}")
     try:
         with open(cache_file, 'wb') as f: pickle.dump(msp_data, f)
@@ -381,11 +391,11 @@ def get_morgan_fingerprint(mol, radius=MORGAN_RADIUS, n_bits=MORGAN_DIM):
         
         morgan_fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
         # numpyアレイに変換
-        arr = np.zeros((1,), dtype=np.int8)
+        arr = np.zeros((n_bits,), dtype=np.int8)  # サイズを正しく設定
         DataStructs.ConvertToNumpyArray(morgan_fp, arr)
         return arr.astype(np.float32)
     except Exception as e:
-        # logger.warning(f"Morganフィンガープリント計算エラー: {e}")
+        logger.warning(f"Morganフィンガープリント計算エラー: {e}")
         return np.zeros(n_bits, dtype=np.float32)
 
 ###############################
@@ -699,6 +709,7 @@ class ChemBERTaMoleculeDataset(Dataset):
         return len(self.valid_mol_ids)
 
     def __getitem__(self, idx):
+        if idx >= len(self.valid_mol_ids): raise IndexError("Index out of range")
         mol_id = self.valid_mol_ids[idx]
         
         # SMILESの取得（キャッシュから）
@@ -728,13 +739,17 @@ class ChemBERTaMoleculeDataset(Dataset):
         raw_spectrum = self.msp_data.get(mol_id, np.zeros(MAX_MZ))
         processed_intensity, target_prob = self._preprocess_spectrum(raw_spectrum)
         
-        # Morganフィンガープリント
+        # Morganフィンガープリント (確実にテンソルとして返す)
         morgan_fp = torch.FloatTensor(self.morgan_fingerprints.get(mol_id, np.zeros(MORGAN_DIM)))
         
-        # 前駆体 m/z 計算
+        # 前駆体 m/z 計算 (テンソルに変換)
         peaks = np.nonzero(raw_spectrum)[0]
         prec_mz = float(np.max(peaks)) if len(peaks) > 0 else 0.0
         prec_mz_bin = int(round(prec_mz))
+        
+        # テンソル型に明示的に変換
+        prec_mz = torch.tensor(prec_mz, dtype=torch.float32)
+        prec_mz_bin = torch.tensor(prec_mz_bin, dtype=torch.long)
         
         # Data Augmentation
         if self.augment and random.random() < 0.1:
@@ -755,15 +770,15 @@ class ChemBERTaMoleculeDataset(Dataset):
             'attention_mask': attention_mask,
             'spec_intensity': processed_intensity,
             'spec_prob': target_prob,
-            'morgan_fingerprint': morgan_fp,  # MACCSからMorganに変更
+            'morgan_fingerprint': morgan_fp,  # テンソル型
             'mol_id': mol_id,
-            'prec_mz': prec_mz,
-            'prec_mz_bin': prec_mz_bin,
+            'prec_mz': prec_mz,  # テンソル型
+            'prec_mz_bin': prec_mz_bin,  # テンソル型
             'smiles': smiles
         }
 
 def chemberta_collate_fn(batch):
-    """ChemBERTa用のカスタムCollate関数"""
+    """ChemBERTa用のカスタムCollate関数（型エラー対応版）"""
     if not batch:
         return None
     
@@ -773,9 +788,36 @@ def chemberta_collate_fn(batch):
     
     for key in keys:
         if key in ['input_ids', 'attention_mask', 'spec_intensity', 'spec_prob', 
-                  'morgan_fingerprint', 'prec_mz', 'prec_mz_bin']:  # fragmentをmorganに変更
-            # テンソル型のデータはスタック
-            result[key] = torch.stack([item[key] for item in batch])
+                  'morgan_fingerprint', 'prec_mz', 'prec_mz_bin']:
+            try:
+                # テンソル型のデータはスタック
+                # 型チェックを追加して、必要であれば変換
+                items = []
+                for item in batch:
+                    value = item[key]
+                    # floatやint値をテンソルに変換
+                    if isinstance(value, (float, int)):
+                        value = torch.tensor([value], dtype=torch.float32)
+                    # すでにテンソルの場合は追加
+                    elif isinstance(value, torch.Tensor):
+                        pass
+                    # numpy arrayをテンソルに変換
+                    elif isinstance(value, np.ndarray):
+                        value = torch.from_numpy(value).float()
+                    # その他の型はエラー
+                    else:
+                        raise TypeError(f"Unexpected type for key {key}: {type(value)}")
+                    items.append(value)
+                result[key] = torch.stack(items)
+            except Exception as e:
+                logger.error(f"Collate error for key {key}: {e}")
+                # エラーが発生しても続行できるように、スキップするか代替値を使用
+                if key == 'prec_mz' or key == 'prec_mz_bin':
+                    # prec_mzとprec_mz_binは数値のリストとして扱う
+                    result[key] = torch.tensor([item.get(key, 0) for item in batch], dtype=torch.float32)
+                else:
+                    # その他のキーの場合は空のテンソルを作成
+                    logger.warning(f"Skipping problematic key: {key}")
         elif key in ['mol_id', 'smiles']:
             # リスト型のデータはリストに集約
             result[key] = [item[key] for item in batch]
