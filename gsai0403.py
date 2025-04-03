@@ -487,51 +487,57 @@ class DirectedMessagePassing(nn.Module):
         num_nodes = x.size(0)
         num_edges = edge_index.size(1)
         
-        # 初期メッセージを準備：エッジ特徴で初期化
-        messages = torch.zeros(num_edges, self.hidden_size, device=device)
-        
-        # メッセージパッシングのD回のステップを実行
-        for step in range(self.depth):
-            # 各方向エッジ（i->j）に対するメッセージを計算
-            source_nodes = edge_index[0]  # メッセージの送信元
-            target_nodes = edge_index[1]  # メッセージの送信先
+        # 混合精度計算を一時的に無効化（型不一致エラーを防ぐ）
+        with torch.cuda.amp.autocast(enabled=False):
+            # すべてのテンソルをFloat32に変換して型を統一
+            x = x.float()
+            edge_attr = edge_attr.float()
             
-            # メッセージ入力特徴の作成
-            # [エッジ特徴, 送信元ノードの特徴, 隠れ状態]
-            message_inputs = torch.cat([
-                edge_attr,
-                x[source_nodes],
-                messages
-            ], dim=1)
+            # 初期メッセージを準備：エッジ特徴で初期化
+            messages = torch.zeros(num_edges, self.hidden_size, device=device)
             
-            # メッセージパッシング関数で新しいメッセージを計算
-            new_messages = self.W_message(message_inputs)
+            # メッセージパッシングのD回のステップを実行
+            for step in range(self.depth):
+                # 各方向エッジ（i->j）に対するメッセージを計算
+                source_nodes = edge_index[0]  # メッセージの送信元
+                target_nodes = edge_index[1]  # メッセージの送信先
+                
+                # メッセージ入力特徴の作成
+                # [エッジ特徴, 送信元ノードの特徴, 隠れ状態]
+                message_inputs = torch.cat([
+                    edge_attr,
+                    x[source_nodes],
+                    messages
+                ], dim=1)
+                
+                # メッセージパッシング関数で新しいメッセージを計算
+                new_messages = self.W_message(message_inputs)
+                
+                # ノードに集約するときにエッジインデックスをエッジID（0〜num_edges）に変換する必要がある
+                # エッジをターゲットノードでグループ化し、メッセージをマージ
+                # 各ノードへの入力メッセージを集約（合計）
+                aggr_messages = torch.zeros(num_nodes, self.hidden_size, device=device)
+                aggr_messages.index_add_(0, target_nodes, new_messages)
+                
+                # GRUを使用してメッセージを更新
+                messages = self.W_update(
+                    new_messages,
+                    messages
+                )
             
-            # ノードに集約するときにエッジインデックスをエッジID（0〜num_edges）に変換する必要がある
-            # エッジをターゲットノードでグループ化し、メッセージをマージ
-            # 各ノードへの入力メッセージを集約（合計）
-            aggr_messages = torch.zeros(num_nodes, self.hidden_size, device=device)
-            aggr_messages.index_add_(0, target_nodes, new_messages)
+            # ノード特徴の最終集約
+            # 各ノードに入るエッジからのメッセージを集約
+            node_messages = torch.zeros(num_nodes, self.hidden_size, device=device)
+            node_messages.index_add_(0, target_nodes, messages)
             
-            # GRUを使用してメッセージを更新
-            messages = self.W_update(
-                new_messages,
-                messages
-            )
-        
-        # ノード特徴の最終集約
-        # 各ノードに入るエッジからのメッセージを集約
-        node_messages = torch.zeros(num_nodes, self.hidden_size, device=device)
-        node_messages.index_add_(0, target_nodes, messages)
-        
-        # ノード表現を計算
-        node_inputs = torch.cat([x, node_messages], dim=1)
-        node_representations = self.W_node(node_inputs)
-        
-        # ノード表現の読み出し
-        node_outputs = self.W_o(node_representations)
-        
-        return node_outputs
+            # ノード表現を計算
+            node_inputs = torch.cat([x, node_messages], dim=1)
+            node_representations = self.W_node(node_inputs)
+            
+            # ノード表現の読み出し
+            node_outputs = self.W_o(node_representations)
+            
+            return node_outputs
 
 class SqueezeExcitation(nn.Module):
     """Squeeze-and-Excitation ブロック - 最適化版"""
@@ -708,6 +714,10 @@ class DMPNNMSPredictor(nn.Module):
             else:
                 prec_mz_bin = None
         
+        # 全てのテンソルを確実にFloat32に変換
+        x = x.float()
+        edge_attr = edge_attr.float()
+        
         # データオブジェクトの作成
         processed_data = Data(
             x=x,
@@ -716,26 +726,29 @@ class DMPNNMSPredictor(nn.Module):
             batch=batch
         )
         
-        # DMPNN処理
-        node_features = self.dmpnn(processed_data)
+        # 型の不一致問題を防ぐために一時的に混合精度を無効化
+        with torch.cuda.amp.autocast(enabled=False):
+            # DMPNN処理
+            node_features = self.dmpnn(processed_data)
+            
+            # グラフプーリング（ノードから分子特徴へ）
+            # ここで次元の統一が必要
+            batch_size = torch.max(batch).item() + 1
+            pooled_features = torch.zeros(batch_size, self.hidden_size, device=device)
+            
+            # 正規化されたプーリング
+            for i in range(batch_size):
+                batch_mask = (batch == i)
+                if batch_mask.any():
+                    # 各分子のノード特徴を抽出
+                    mol_features = node_features[batch_mask]
+                    # 平均プーリングを適用
+                    pooled_features[i] = torch.mean(mol_features, dim=0)
+            
+            # 分子表現の読み出し
+            mol_representation = self.readout(pooled_features)
         
-        # グラフプーリング（ノードから分子特徴へ）
-        # ここで次元の統一が必要
-        batch_size = torch.max(batch).item() + 1
-        pooled_features = torch.zeros(batch_size, self.hidden_size, device=device)
-        
-        # 正規化されたプーリング
-        for i in range(batch_size):
-            batch_mask = (batch == i)
-            if batch_mask.any():
-                # 各分子のノード特徴を抽出
-                mol_features = node_features[batch_mask]
-                # 平均プーリングを適用
-                pooled_features[i] = torch.mean(mol_features, dim=0)
-        
-        # 分子表現の読み出し
-        mol_representation = self.readout(pooled_features)
-        
+        # 以降の処理は混合精度可
         # グローバル特徴量の処理
         if global_attr is not None:
             # グローバル属性のサイズ調整
@@ -1500,7 +1513,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 optimizer.zero_grad(set_to_none=True)  # メモリ効率のためNoneに設定
                 
                 # Automatic Mixed Precision (AMP)を使用した順伝播
-                with autocast():
+                device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
+                with autocast(device_type=device_type):
                     output, fragment_pred = model(processed_batch)
                     loss = criterion(output, processed_batch['spec'], fragment_pred, processed_batch['fragment_pattern'])
                 
@@ -1707,7 +1721,8 @@ def evaluate_model(model, data_loader, criterion, device, use_amp=False):
                 
                 # AMP使用時は混合精度で予測
                 if use_amp:
-                    with autocast():
+                    device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
+                    with autocast(device_type=device_type):
                         output, fragment_pred = model(processed_batch)
                         loss = criterion(output, processed_batch['spec'], 
                                          fragment_pred, processed_batch['fragment_pattern'])
@@ -1786,7 +1801,8 @@ def eval_model(model, test_loader, device, use_amp=True, transform="log10over3")
                 
                 # 予測（混合精度使用時）
                 if use_amp:
-                    with autocast():
+                    device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
+                    with autocast(device_type=device_type):
                         output, frag_pred = model(processed_batch)
                 else:
                     output, frag_pred = model(processed_batch)
