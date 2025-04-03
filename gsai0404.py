@@ -9,7 +9,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics.pairwise import cosine_similarity
 import matplotlib.pyplot as plt
 from rdkit import Chem
-from rdkit.Chem import AllChem, Descriptors, MACCSkeys
+from rdkit.Chem import AllChem, Descriptors
 # RDKitの警告を抑制
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
@@ -44,7 +44,9 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 # ===== パラメータ設定 =====
 MAX_MZ = 2000  # 最大m/z値
-NUM_FRAGS = 167  # MACCSキーのビット数（フラグメントパターン）
+MORGAN_BITS = 1024  # Morgan フィンガープリントのビット数
+ATOMPAIR_BITS = 1024  # AtomPair フィンガープリントのビット数
+NUM_FRAGS = MORGAN_BITS + ATOMPAIR_BITS  # 合計フラグメントパターン数
 # 重要なm/z値のリスト（フラグメントイオンに対応）- ただし強調は行わない
 IMPORTANT_MZ = [18, 28, 43, 57, 71, 73, 77, 91, 105, 115, 128, 152, 165, 178, 207]
 EPS = np.finfo(np.float32).eps  # エフェメラル値（小さな値）
@@ -894,14 +896,23 @@ class DMPNNMoleculeDataset(Dataset):
                         pbar.update(1)
                         continue
                     
-                    # フラグメントパターンを計算
+                    # フラグメントパターンを計算 - Morgan + AtomPair フィンガープリント
                     try:
-                        # MACCSフィンガープリントを計算
-                        maccs = MACCSkeys.GenMACCSKeys(mol)
+                        # Morgan フィンガープリントを計算
+                        morgan = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=MORGAN_BITS)
+                        
+                        # AtomPair フィンガープリントを計算
+                        atompair = AllChem.GetHashedAtomPairFingerprintAsBitVect(mol, nBits=ATOMPAIR_BITS)
+                        
+                        # 両方のフィンガープリントを結合
                         fragments = np.zeros(NUM_FRAGS)
-                        for i in range(NUM_FRAGS):
-                            if maccs.GetBit(i):
+                        for i in range(MORGAN_BITS):
+                            if morgan.GetBit(i):
                                 fragments[i] = 1.0
+                        for i in range(ATOMPAIR_BITS):
+                            if atompair.GetBit(i):
+                                fragments[MORGAN_BITS + i] = 1.0
+                                
                         fragment_patterns[mol_id] = fragments
                     except Exception:
                         fragment_patterns[mol_id] = np.zeros(NUM_FRAGS)
@@ -1827,7 +1838,7 @@ def eval_model(model, test_loader, device, use_amp=True, transform="log10over3")
                 traceback.print_exc()
                 continue
     
-# 結果を連結
+    # 結果を連結
     all_true = torch.cat(y_true, dim=0)
     all_pred = torch.cat(y_pred, dim=0)
     all_pred_discrete = torch.stack(y_pred_discrete)
@@ -2268,12 +2279,19 @@ def main():
     try:
         best_model_path = os.path.join(CACHE_DIR, "checkpoints", 'best_model.pth')
         if not os.path.exists(best_model_path):
-            # ティアごとの最良モデルを探す
-            tier_models = [f for f in os.listdir(os.path.join(CACHE_DIR, "checkpoints")) 
-                         if f.startswith("tier") and f.endswith("_model.pth")]
-            if tier_models:
-                # 最後のティアモデルを使用
-                best_model_path = os.path.join(CACHE_DIR, "checkpoints", tier_models[-1])
+            # tier5_model.pthを明示的に探す
+            tier5_model_path = os.path.join(CACHE_DIR, "checkpoints", "tier5_model.pth")
+            if os.path.exists(tier5_model_path):
+                best_model_path = tier5_model_path
+            else:
+                # tier5が無い場合は利用可能な最後のティアモデルを探す
+                tier_models = [f for f in os.listdir(os.path.join(CACHE_DIR, "checkpoints")) 
+                            if f.startswith("tier") and f.endswith("_model.pth")]
+                if tier_models:
+                    # 番号で並べ替えて最大のティアを選択
+                    tier_numbers = [int(m.split("tier")[1].split("_")[0]) for m in tier_models]
+                    max_tier_idx = tier_numbers.index(max(tier_numbers))
+                    best_model_path = os.path.join(CACHE_DIR, "checkpoints", tier_models[max_tier_idx])
         
         model.load_state_dict(torch.load(best_model_path, map_location=device))
         logger.info(f"最良モデルを読み込みました: {best_model_path}")
