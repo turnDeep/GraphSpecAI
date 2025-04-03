@@ -50,7 +50,7 @@ NUM_FRAGS = MORGAN_BITS + ATOMPAIR_BITS  # 合計フラグメントパターン�
 # 重要なm/z値のリスト（フラグメントイオンに対応）- ただし強調は行わない
 IMPORTANT_MZ = [18, 28, 43, 57, 71, 73, 77, 91, 105, 115, 128, 152, 165, 178, 207]
 EPS = np.finfo(np.float32).eps  # エフェメラル値（小さな値）
-MAX_PEAKS = 500  # 最大ピーク数 - 実際のNIST17データに基づくべき
+MAX_PEAKS = 50  # 最大ピーク数 - 実際のNIST17データに基づくべき
 
 # ===== 原子と結合の特徴マッピング =====
 # 非金属元素のリスト（これらのみを含む分子を許可）
@@ -1915,21 +1915,21 @@ def tiered_training(model, train_ids, val_loader, criterion, optimizer, schedule
             train_ids[:100000],   # 次に10万
             train_ids             # 最後に全データ
         ]
-        tier_epochs = [3, 3, 4, 5, 15]  # ティアごとのエポック数
+        tier_epochs = [3, 3, 3, 3, 3]  # ティアごとのエポック数
     elif len(train_ids) > 50000:
         train_tiers = [
             train_ids[:10000], 
             train_ids[:30000],
             train_ids
         ]
-        tier_epochs = [3, 4, 23]
+        tier_epochs = [3, 4, 8]
     else:
         # 小さなデータセットは段階を少なく
         train_tiers = [
             train_ids[:5000] if len(train_ids) > 5000 else train_ids[:len(train_ids)//2],
             train_ids
         ]
-        tier_epochs = [5, 25]
+        tier_epochs = [5, 10]
     
     best_cosine = 0.0
     all_train_losses = []
