@@ -23,7 +23,8 @@ import gc
 import pickle
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
-from torch.amp import autocast, GradScaler
+# AMPを使用しないため、autocastとGradScalerを削除
+# from torch.amp import autocast, GradScaler
 import time
 import datetime
 
@@ -485,14 +486,12 @@ class DirectedMessagePassing(nn.Module):
         num_nodes = x.size(0)
         num_edges = edge_index.size(1)
         
-        # 混合精度計算を一時的に無効化（型不一致エラーを防ぐ）
-        with autocast(enabled=False):
-            # すべてのテンソルをFloat32に変換して型を統一
-            x = x.float()
-            edge_attr = edge_attr.float()
-            
-            # 初期メッセージを準備：エッジ特徴で初期化
-            messages = torch.zeros(num_edges, self.hidden_size, device=device)
+        # すべてのテンソルをFloat32に変換して型を統一
+        x = x.float()
+        edge_attr = edge_attr.float()
+        
+        # 初期メッセージを準備：エッジ特徴で初期化
+        messages = torch.zeros(num_edges, self.hidden_size, device=device)
             
             # メッセージパッシングのD回のステップを実行
             for step in range(self.depth):
@@ -724,27 +723,26 @@ class DMPNNMSPredictor(nn.Module):
             batch=batch
         )
         
-        # 型の不一致問題を防ぐために一時的に混合精度を無効化
-        with autocast(enabled=False):
-            # DMPNN処理
-            node_features = self.dmpnn(processed_data)
-            
-            # グラフプーリング（ノードから分子特徴へ）
-            # ここで次元の統一が必要
-            batch_size = torch.max(batch).item() + 1
-            pooled_features = torch.zeros(batch_size, self.hidden_size, device=device)
-            
-            # 正規化されたプーリング
-            for i in range(batch_size):
-                batch_mask = (batch == i)
-                if batch_mask.any():
-                    # 各分子のノード特徴を抽出
-                    mol_features = node_features[batch_mask]
-                    # 平均プーリングを適用
-                    pooled_features[i] = torch.mean(mol_features, dim=0)
-            
-            # 分子表現の読み出し
-            mol_representation = self.readout(pooled_features)
+        # AMPを使用せずに処理
+        # DMPNN処理
+        node_features = self.dmpnn(processed_data)
+        
+        # グラフプーリング（ノードから分子特徴へ）
+        # ここで次元の統一が必要
+        batch_size = torch.max(batch).item() + 1
+        pooled_features = torch.zeros(batch_size, self.hidden_size, device=device)
+        
+        # 正規化されたプーリング
+        for i in range(batch_size):
+            batch_mask = (batch == i)
+            if batch_mask.any():
+                # 各分子のノード特徴を抽出
+                mol_features = node_features[batch_mask]
+                # 平均プーリングを適用
+                pooled_features[i] = torch.mean(mol_features, dim=0)
+        
+        # 分子表現の読み出し
+        mol_representation = self.readout(pooled_features)
         
         # 以降の処理は混合精度可
         # グローバル特徴量の処理
@@ -1464,9 +1462,6 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             logger.error(f"チェックポイント読み込みエラー: {e}")
             start_epoch = 0
     
-    # Automatic Mixed Precision (AMP)のスケーラー
-    scaler = GradScaler()
-    
     # モデルをデバイスに明示的に転送
     model = model.to(device)
     
@@ -1520,22 +1515,18 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 # 勾配をゼロに初期化
                 optimizer.zero_grad(set_to_none=True)  # メモリ効率のためNoneに設定
                 
-                # Automatic Mixed Precision (AMP)を使用した順伝播
-                device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
-                with autocast(device_type=device_type):
-                    output, fragment_pred = model(processed_batch)
-                    loss = criterion(output, processed_batch['spec'], fragment_pred, processed_batch['fragment_pattern'])
+                # 順伝播（AMPなし）
+                output, fragment_pred = model(processed_batch)
+                loss = criterion(output, processed_batch['spec'], fragment_pred, processed_batch['fragment_pattern'])
                 
-                # AMP逆伝播
-                scaler.scale(loss).backward()
+                # 逆伝播
+                loss.backward()
                 
                 # 勾配クリッピング
-                scaler.unscale_(optimizer)  # スケーリングを解除して勾配クリッピング
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
                 
                 # オプティマイザステップ
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 
                 # OneCycleLRスケジューラーの更新
                 if isinstance(scheduler, torch.optim.lr_scheduler.OneCycleLR):
@@ -1699,7 +1690,7 @@ def plot_training_progress(train_losses, val_losses, val_cosine_similarities, be
     plt.savefig('dmpnn_learning_curves.png')
     plt.close()
     
-def evaluate_model(model, data_loader, criterion, device, use_amp=False):
+def evaluate_model(model, data_loader, criterion, device):
     """モデル評価用の関数"""
     model.eval()
     total_loss = 0
@@ -1776,7 +1767,7 @@ def evaluate_model(model, data_loader, criterion, device, use_amp=False):
             'cosine_similarity': 0.0
         }
 
-def eval_model(model, test_loader, device, use_amp=True, transform="log10over3"):
+def eval_model(model, test_loader, device, transform="log10over3"):
     """テスト用の評価関数 - 離散化処理追加"""
     model = model.to(device)
     model.eval()
@@ -2304,7 +2295,7 @@ def main():
         aggressive_memory_cleanup(force_sync=True, purge_cache=True)
         
         logger.info("テストデータでの評価を開始します...")
-        test_results = eval_model(model, test_loader, device, use_amp=True, transform=transform)
+        test_results = eval_model(model, test_loader, device, transform=transform)
         logger.info(f"テストデータ平均コサイン類似度 (元の予測): {test_results['cosine_similarity']:.4f}")
         logger.info(f"テストデータ平均コサイン類似度 (離散化後): {test_results['discrete_cosine_similarity']:.4f}")
         
