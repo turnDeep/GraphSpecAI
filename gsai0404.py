@@ -51,7 +51,7 @@ NUM_FRAGS = MORGAN_BITS + ATOMPAIR_BITS  # 合計フラグメントパターン�
 # 重要なm/z値のリスト（フラグメントイオンに対応）- ただし強調は行わない
 IMPORTANT_MZ = [18, 28, 43, 57, 71, 73, 77, 91, 105, 115, 128, 152, 165, 178, 207]
 EPS = np.finfo(np.float32).eps  # エフェメラル値（小さな値）
-MAX_PEAKS = 50  # 最大ピーク数 - 実際のNIST17データに基づくべき
+MAX_PEAKS = 500  # 最大ピーク数 - 実際のNIST17データに基づくべき
 
 # ===== 原子と結合の特徴マッピング =====
 # 非金属元素のリスト（これらのみを含む分子を許可）
@@ -492,7 +492,7 @@ class DirectedMessagePassing(nn.Module):
         
         # 初期メッセージを準備：エッジ特徴で初期化
         messages = torch.zeros(num_edges, self.hidden_size, device=device)
-            
+        
         # メッセージパッシングのD回のステップを実行
         for step in range(self.depth):
             # 各方向エッジ（i->j）に対するメッセージを計算
@@ -1613,7 +1613,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 aggressive_memory_cleanup()
                 
                 # 評価モードで検証
-                val_metrics = evaluate_model(model, val_loader, criterion, device, use_amp=True)
+                val_metrics = evaluate_model(model, val_loader, criterion, device)
                 val_loss = val_metrics['loss']
                 cosine_sim = val_metrics['cosine_similarity']
                 
@@ -1661,175 +1661,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     
     return train_losses, val_losses, val_cosine_similarities, best_cosine
 
-def plot_training_progress(train_losses, val_losses, val_cosine_similarities, best_cosine):
-    """トレーニング進捗の可視化"""
-    plt.figure(figsize=(12, 5))
-    
-    plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label='Training Loss')
-    if val_losses:  # 検証損失が存在する場合
-        # エポック間隔を調整
-        val_epochs = np.linspace(0, len(train_losses)-1, len(val_losses))
-        plt.plot(val_epochs, val_losses, label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.title('Loss Curves')
-    
-    plt.subplot(1, 2, 2)
-    if val_cosine_similarities:  # コサイン類似度が存在する場合
-        val_epochs = np.linspace(0, len(train_losses)-1, len(val_cosine_similarities))
-        plt.plot(val_epochs, val_cosine_similarities, label='Validation Cosine Similarity')
-        plt.axhline(y=best_cosine, color='r', linestyle='--', label=f'Best: {best_cosine:.4f}')
-    plt.xlabel('Epoch')
-    plt.ylabel('Cosine Similarity')
-    plt.legend()
-    plt.title('Cosine Similarity')
-    
-    plt.tight_layout()
-    plt.savefig('dmpnn_learning_curves.png')
-    plt.close()
-    
-def evaluate_model(model, data_loader, criterion, device):
-    """モデル評価用の関数"""
-    model.eval()
-    total_loss = 0
-    batch_count = 0
-    y_true = []
-    y_pred = []
-    
-    with torch.no_grad():
-        for batch in tqdm(data_loader, desc="評価中", leave=False):
-            try:
-                # データをGPUに転送
-                processed_batch = {}
-                for k, v in batch.items():
-                    if isinstance(v, torch.Tensor):
-                        processed_batch[k] = v.to(device, non_blocking=True)
-                    elif k == 'graph':
-                        # グラフデータは別途処理
-                        v.x = v.x.to(device, non_blocking=True)
-                        v.edge_index = v.edge_index.to(device, non_blocking=True)
-                        v.edge_attr = v.edge_attr.to(device, non_blocking=True)
-                        v.batch = v.batch.to(device, non_blocking=True)
-                        if hasattr(v, 'global_attr'):
-                            v.global_attr = v.global_attr.to(device, non_blocking=True)
-                        processed_batch[k] = v
-                    else:
-                        processed_batch[k] = v
-                
-                # AMP使用時は混合精度で予測
-                if use_amp:
-                    device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
-                    with autocast(device_type=device_type):
-                        output, fragment_pred = model(processed_batch)
-                        loss = criterion(output, processed_batch['spec'], 
-                                         fragment_pred, processed_batch['fragment_pattern'])
-                else:
-                    output, fragment_pred = model(processed_batch)
-                    loss = criterion(output, processed_batch['spec'], 
-                                     fragment_pred, processed_batch['fragment_pattern'])
-                
-                total_loss += loss.item()
-                batch_count += 1
-                
-                # 類似度計算用に結果を保存
-                y_true.append(processed_batch['spec'].cpu())
-                y_pred.append(output.cpu())
-                
-            except RuntimeError as e:
-                print(f"評価中にエラー発生: {str(e)}")
-                continue
-    
-    # 結果を集計
-    if batch_count > 0:
-        avg_loss = total_loss / batch_count
-        
-        # コサイン類似度を計算
-        if y_true and y_pred:
-            try:
-                all_true = torch.cat(y_true, dim=0)
-                all_pred = torch.cat(y_pred, dim=0)
-                cosine_sim = cosine_similarity_score(all_true, all_pred)
-            except Exception as e:
-                print(f"類似度計算エラー: {str(e)}")
-                cosine_sim = 0.0
-        else:
-            cosine_sim = 0.0
-        
-        return {
-            'loss': avg_loss,
-            'cosine_similarity': cosine_sim
-        }
-    else:
-        return {
-            'loss': float('inf'),
-            'cosine_similarity': 0.0
-        }
-
-def eval_model(model, test_loader, device, transform="log10over3"):
-    """テスト用の評価関数 - 離散化処理追加"""
-    model = model.to(device)
-    model.eval()
-    y_true = []
-    y_pred = []
-    y_pred_discrete = []  # 離散化後の予測結果
-    fragment_true = []
-    fragment_pred = []
-    mol_ids = []
-    
-    with torch.no_grad():
-        for batch in tqdm(test_loader, desc="テスト中"):
-            try:
-                # データをGPUに転送
-                processed_batch = {}
-                for k, v in batch.items():
-                    if isinstance(v, torch.Tensor):
-                        processed_batch[k] = v.to(device, non_blocking=True)
-                    elif k == 'graph':
-                        # グラフデータは別途処理
-                        v.x = v.x.to(device, non_blocking=True)
-                        v.edge_index = v.edge_index.to(device, non_blocking=True)
-                        v.edge_attr = v.edge_attr.to(device, non_blocking=True)
-                        v.batch = v.batch.to(device, non_blocking=True)
-                        if hasattr(v, 'global_attr'):
-                            v.global_attr = v.global_attr.to(device, non_blocking=True)
-                        processed_batch[k] = v
-                    else:
-                        processed_batch[k] = v
-                
-                # 予測（混合精度使用時）
-                if use_amp:
-                    device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
-                    with autocast(device_type=device_type):
-                        output, frag_pred = model(processed_batch)
-                else:
-                    output, frag_pred = model(processed_batch)
-                
-                # 元のスムーズな予測結果を保存
-                y_true.append(processed_batch['spec'].cpu())
-                y_pred.append(output.cpu())
-                
-                # 離散化処理を適用
-                for i in range(len(output)):
-                    pred_np = output[i].cpu().numpy()
-                    discrete_pred = hybrid_spectrum_conversion(pred_np, transform)
-                    y_pred_discrete.append(torch.from_numpy(discrete_pred).float())
-                
-                fragment_true.append(processed_batch['fragment_pattern'].cpu())
-                fragment_pred.append(frag_pred.cpu())
-                mol_ids.extend(processed_batch['mol_id'])
-                
-                # バッチごとにメモリ解放
-                torch.cuda.empty_cache()
-                
-            except RuntimeError as e:
-                print(f"テスト中にエラー発生: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                continue
-    
-    # 結果を連結
+# 結果を連結
     all_true = torch.cat(y_true, dim=0)
     all_pred = torch.cat(y_pred, dim=0)
     all_pred_discrete = torch.stack(y_pred_discrete)
@@ -2270,19 +2102,12 @@ def main():
     try:
         best_model_path = os.path.join(CACHE_DIR, "checkpoints", 'best_model.pth')
         if not os.path.exists(best_model_path):
-            # tier5_model.pthを明示的に探す
-            tier5_model_path = os.path.join(CACHE_DIR, "checkpoints", "tier5_model.pth")
-            if os.path.exists(tier5_model_path):
-                best_model_path = tier5_model_path
-            else:
-                # tier5が無い場合は利用可能な最後のティアモデルを探す
-                tier_models = [f for f in os.listdir(os.path.join(CACHE_DIR, "checkpoints")) 
-                            if f.startswith("tier") and f.endswith("_model.pth")]
-                if tier_models:
-                    # 番号で並べ替えて最大のティアを選択
-                    tier_numbers = [int(m.split("tier")[1].split("_")[0]) for m in tier_models]
-                    max_tier_idx = tier_numbers.index(max(tier_numbers))
-                    best_model_path = os.path.join(CACHE_DIR, "checkpoints", tier_models[max_tier_idx])
+            # ティアごとの最良モデルを探す
+            tier_models = [f for f in os.listdir(os.path.join(CACHE_DIR, "checkpoints")) 
+                         if f.startswith("tier") and f.endswith("_model.pth")]
+            if tier_models:
+                # 最後のティアモデルを使用
+                best_model_path = os.path.join(CACHE_DIR, "checkpoints", tier_models[-1])
         
         model.load_state_dict(torch.load(best_model_path, map_location=device))
         logger.info(f"最良モデルを読み込みました: {best_model_path}")
@@ -2295,7 +2120,7 @@ def main():
         aggressive_memory_cleanup(force_sync=True, purge_cache=True)
         
         logger.info("テストデータでの評価を開始します...")
-        test_results = eval_model(model, test_loader, device, transform=transform)
+        test_results = eval_model(model, test_loader, device, use_amp=True, transform=transform)
         logger.info(f"テストデータ平均コサイン類似度 (元の予測): {test_results['cosine_similarity']:.4f}")
         logger.info(f"テストデータ平均コサイン類似度 (離散化後): {test_results['discrete_cosine_similarity']:.4f}")
         
