@@ -493,48 +493,48 @@ class DirectedMessagePassing(nn.Module):
         # 初期メッセージを準備：エッジ特徴で初期化
         messages = torch.zeros(num_edges, self.hidden_size, device=device)
             
-            # メッセージパッシングのD回のステップを実行
-            for step in range(self.depth):
-                # 各方向エッジ（i->j）に対するメッセージを計算
-                source_nodes = edge_index[0]  # メッセージの送信元
-                target_nodes = edge_index[1]  # メッセージの送信先
-                
-                # メッセージ入力特徴の作成
-                # [エッジ特徴, 送信元ノードの特徴, 隠れ状態]
-                message_inputs = torch.cat([
-                    edge_attr,
-                    x[source_nodes],
-                    messages
-                ], dim=1)
-                
-                # メッセージパッシング関数で新しいメッセージを計算
-                new_messages = self.W_message(message_inputs)
-                
-                # ノードに集約するときにエッジインデックスをエッジID（0〜num_edges）に変換する必要がある
-                # エッジをターゲットノードでグループ化し、メッセージをマージ
-                # 各ノードへの入力メッセージを集約（合計）
-                aggr_messages = torch.zeros(num_nodes, self.hidden_size, device=device)
-                aggr_messages.index_add_(0, target_nodes, new_messages)
-                
-                # GRUを使用してメッセージを更新
-                messages = self.W_update(
-                    new_messages,
-                    messages
-                )
+        # メッセージパッシングのD回のステップを実行
+        for step in range(self.depth):
+            # 各方向エッジ（i->j）に対するメッセージを計算
+            source_nodes = edge_index[0]  # メッセージの送信元
+            target_nodes = edge_index[1]  # メッセージの送信先
             
-            # ノード特徴の最終集約
-            # 各ノードに入るエッジからのメッセージを集約
-            node_messages = torch.zeros(num_nodes, self.hidden_size, device=device)
-            node_messages.index_add_(0, target_nodes, messages)
+            # メッセージ入力特徴の作成
+            # [エッジ特徴, 送信元ノードの特徴, 隠れ状態]
+            message_inputs = torch.cat([
+                edge_attr,
+                x[source_nodes],
+                messages
+            ], dim=1)
             
-            # ノード表現を計算
-            node_inputs = torch.cat([x, node_messages], dim=1)
-            node_representations = self.W_node(node_inputs)
+            # メッセージパッシング関数で新しいメッセージを計算
+            new_messages = self.W_message(message_inputs)
             
-            # ノード表現の読み出し
-            node_outputs = self.W_o(node_representations)
+            # ノードに集約するときにエッジインデックスをエッジID（0〜num_edges）に変換する必要がある
+            # エッジをターゲットノードでグループ化し、メッセージをマージ
+            # 各ノードへの入力メッセージを集約（合計）
+            aggr_messages = torch.zeros(num_nodes, self.hidden_size, device=device)
+            aggr_messages.index_add_(0, target_nodes, new_messages)
             
-            return node_outputs
+            # GRUを使用してメッセージを更新
+            messages = self.W_update(
+                new_messages,
+                messages
+            )
+        
+        # ノード特徴の最終集約
+        # 各ノードに入るエッジからのメッセージを集約
+        node_messages = torch.zeros(num_nodes, self.hidden_size, device=device)
+        node_messages.index_add_(0, target_nodes, messages)
+        
+        # ノード表現を計算
+        node_inputs = torch.cat([x, node_messages], dim=1)
+        node_representations = self.W_node(node_inputs)
+        
+        # ノード表現の読み出し
+        node_outputs = self.W_o(node_representations)
+        
+        return node_outputs
 
 class SqueezeExcitation(nn.Module):
     """Squeeze-and-Excitation ブロック - 最適化版"""
