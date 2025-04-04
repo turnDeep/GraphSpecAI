@@ -10,7 +10,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 import matplotlib.pyplot as plt
 from rdkit import Chem
 from rdkit.Chem import AllChem, Descriptors
-# RDKitの警告を抑制
+# Suppress RDKit warnings
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
 
@@ -23,60 +23,59 @@ import gc
 import pickle
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
-# AMPを使用しないため、autocastとGradScalerを削除
 import time
 import datetime
 
-# ===== ロギング設定 =====
+# ===== Logging Configuration =====
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ===== パス設定 =====
+# ===== Path Configuration =====
 DATA_PATH = "data/"
 MOL_FILES_PATH = os.path.join(DATA_PATH, "mol_files/")
 MSP_FILE_PATH = os.path.join(DATA_PATH, "NIST17.MSP")
 CACHE_DIR = os.path.join(DATA_PATH, "cache/")
 CHECKPOINT_DIR = os.path.join(CACHE_DIR, "checkpoints/")
 
-# ディレクトリの作成
+# Create directories
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-# ===== パラメータ設定 =====
-MAX_MZ = 2000  # 最大m/z値
-MORGAN_BITS = 1024  # Morgan フィンガープリントのビット数
-ATOMPAIR_BITS = 1024  # AtomPair フィンガープリントのビット数
-NUM_FRAGS = MORGAN_BITS + ATOMPAIR_BITS  # 合計フラグメントパターン数
-# 重要なm/z値のリスト（フラグメントイオンに対応）- ただし強調は行わない
+# ===== Parameter Configuration =====
+MAX_MZ = 2000  # Maximum m/z value
+MORGAN_BITS = 1024  # Number of Morgan fingerprint bits
+ATOMPAIR_BITS = 1024  # Number of AtomPair fingerprint bits
+NUM_FRAGS = MORGAN_BITS + ATOMPAIR_BITS  # Total fragment pattern size
+# List of important m/z values (corresponding to fragment ions)
 IMPORTANT_MZ = [18, 28, 43, 57, 71, 73, 77, 91, 105, 115, 128, 152, 165, 178, 207]
-EPS = np.finfo(np.float32).eps  # エフェメラル値（小さな値）
-MAX_PEAKS = 50  # 最大ピーク数 - 実際のNIST17データに基づくべき
+EPS = np.finfo(np.float32).eps  # Small epsilon value
+MAX_PEAKS = 50  # Maximum number of peaks - should be based on actual NIST17 data
 
-# ===== 原子と結合の特徴マッピング =====
-# 非金属元素のリスト（これらのみを含む分子を許可）
+# ===== Atom and Bond Feature Mappings =====
+# List of non-metal elements (only molecules containing these atoms are allowed)
 NON_METAL_ATOMS = {'H', 'C', 'N', 'O', 'S', 'F', 'Cl', 'Br', 'I', 'P', 'Si', 'B', 'Se', 'Te', 'As'}
 
-# 原子の特徴マッピング（非金属のみ）
+# Atom feature mapping (non-metals only)
 ATOM_FEATURES = {
-    'C': 0,    # 炭素
-    'N': 1,    # 窒素
-    'O': 2,    # 酸素
-    'S': 3,    # 硫黄
-    'F': 4,    # フッ素
-    'Cl': 5,   # 塩素
-    'Br': 6,   # 臭素
-    'I': 7,    # ヨウ素
-    'P': 8,    # リン
-    'Si': 9,   # ケイ素
-    'B': 10,   # ホウ素
-    'H': 11,   # 水素
-    'Se': 12,  # セレン
-    'Te': 13,  # テルル
-    'As': 14,  # ヒ素
-    'OTHER': 15 # その他（エラー処理用）
+    'C': 0,    # Carbon
+    'N': 1,    # Nitrogen
+    'O': 2,    # Oxygen
+    'S': 3,    # Sulfur
+    'F': 4,    # Fluorine
+    'Cl': 5,   # Chlorine
+    'Br': 6,   # Bromine
+    'I': 7,    # Iodine
+    'P': 8,    # Phosphorus
+    'Si': 9,   # Silicon
+    'B': 10,   # Boron
+    'H': 11,   # Hydrogen
+    'Se': 12,  # Selenium
+    'Te': 13,  # Tellurium
+    'As': 14,  # Arsenic
+    'OTHER': 15 # Others (for error handling)
 }
 
-# 結合の特徴マッピング
+# Bond feature mapping
 BOND_FEATURES = {
     Chem.rdchem.BondType.SINGLE: 0,
     Chem.rdchem.BondType.DOUBLE: 1,
@@ -84,42 +83,42 @@ BOND_FEATURES = {
     Chem.rdchem.BondType.AROMATIC: 3
 }
 
-# ===== メモリ管理関数 =====
+# ===== Memory Management Functions =====
 def aggressive_memory_cleanup(force_sync=True, percent=70, purge_cache=False):
-    """強化版メモリクリーンアップ関数"""
+    """Enhanced memory cleanup function"""
     gc.collect()
     
     if not torch.cuda.is_available():
         return False
     
-    # 強制同期してGPUリソースを確実に解放
+    # Force synchronization to ensure GPU resources are released
     if force_sync:
         torch.cuda.synchronize()
     
     torch.cuda.empty_cache()
     
-    # メモリ使用率の計算
+    # Calculate memory usage
     gpu_memory_allocated = torch.cuda.memory_allocated()
     total_memory = torch.cuda.get_device_properties(0).total_memory
     gpu_memory_percent = gpu_memory_allocated / total_memory * 100
     
     if gpu_memory_percent > percent:
-        logger.warning(f"高いGPUメモリ使用率 ({gpu_memory_percent:.1f}%)。キャッシュをクリアします。")
+        logger.warning(f"High GPU memory usage ({gpu_memory_percent:.1f}%). Clearing cache.")
         
         if purge_cache:
-            # データセットキャッシュが存在する場合はクリア
+            # Clear dataset cache if it exists
             for obj_name in ['train_dataset', 'val_dataset', 'test_dataset']:
                 if obj_name in globals():
                     obj = globals()[obj_name]
                     if hasattr(obj, 'graph_cache') and isinstance(obj.graph_cache, dict):
                         obj.graph_cache.clear()
-                        logger.info(f"{obj_name}のグラフキャッシュをクリア")
+                        logger.info(f"Cleared graph cache of {obj_name}")
         
-        # もう一度クリーンアップ
+        # Run cleanup again
         gc.collect()
         torch.cuda.empty_cache()
         
-        # PyTorchメモリアロケータをリセット
+        # Reset PyTorch memory allocator
         if hasattr(torch.cuda, 'memory_stats'):
             torch.cuda.reset_peak_memory_stats()
         
@@ -127,39 +126,39 @@ def aggressive_memory_cleanup(force_sync=True, percent=70, purge_cache=False):
     
     return False
 
-# ===== 評価指標関数 =====
+# ===== Evaluation Metric Functions =====
 def cosine_similarity_score(y_true, y_pred):
-    """コサイン類似度スコア計算（最適化）"""
-    # バッチサイズチェック
+    """Calculate cosine similarity score (optimized)"""
+    # Check batch size
     min_batch = min(y_true.shape[0], y_pred.shape[0])
     y_true = y_true[:min_batch]
     y_pred = y_pred[:min_batch]
     
-    # NumPy配列に変換
+    # Convert to NumPy arrays
     y_true_np = y_true.cpu().numpy() if isinstance(y_true, torch.Tensor) else y_true
     y_pred_np = y_pred.cpu().numpy() if isinstance(y_pred, torch.Tensor) else y_pred
     
     y_true_flat = y_true_np.reshape(y_true_np.shape[0], -1)
     y_pred_flat = y_pred_np.reshape(y_pred_np.shape[0], -1)
     
-    # 効率的なバッチ計算
+    # Efficient batch calculation
     dot_products = np.sum(y_true_flat * y_pred_flat, axis=1)
     true_norms = np.sqrt(np.sum(y_true_flat**2, axis=1))
     pred_norms = np.sqrt(np.sum(y_pred_flat**2, axis=1))
     
-    # ゼロ除算を防ぐ
+    # Prevent division by zero
     true_norms = np.maximum(true_norms, 1e-10)
     pred_norms = np.maximum(pred_norms, 1e-10)
     
     similarities = dot_products / (true_norms * pred_norms)
     
-    # NaNや無限大の値を修正
+    # Fix NaN or inf values
     similarities = np.nan_to_num(similarities, nan=0.0, posinf=1.0, neginf=-1.0)
     
     return np.mean(similarities)
 
 def evaluate_model(model, data_loader, criterion, device):
-    """モデル評価用の関数"""
+    """Model evaluation function"""
     model.eval()
     total_loss = 0
     batch_count = 0
@@ -167,15 +166,15 @@ def evaluate_model(model, data_loader, criterion, device):
     y_pred = []
     
     with torch.no_grad():
-        for batch in tqdm(data_loader, desc="評価中", leave=False):
+        for batch in tqdm(data_loader, desc="Evaluating", leave=False):
             try:
-                # データをGPUに転送
+                # Transfer data to GPU
                 processed_batch = {}
                 for k, v in batch.items():
                     if isinstance(v, torch.Tensor):
                         processed_batch[k] = v.to(device, non_blocking=True)
                     elif k == 'graph':
-                        # グラフデータは別途処理
+                        # Process graph data separately
                         v.x = v.x.to(device, non_blocking=True)
                         v.edge_index = v.edge_index.to(device, non_blocking=True)
                         v.edge_attr = v.edge_attr.to(device, non_blocking=True)
@@ -186,34 +185,36 @@ def evaluate_model(model, data_loader, criterion, device):
                     else:
                         processed_batch[k] = v
                 
-                # 通常の予測（AMPなし）
+                # Regular prediction
                 output, fragment_pred = model(processed_batch)
                 loss = criterion(output, processed_batch['spec'], 
-                                 fragment_pred, processed_batch['fragment_pattern'])
+                                fragment_pred, processed_batch['fragment_pattern'],
+                                processed_batch.get('graph', None), 
+                                processed_batch.get('prec_mz_bin', None))
                 
                 total_loss += loss.item()
                 batch_count += 1
                 
-                # 類似度計算用に結果を保存
+                # Save results for similarity calculation
                 y_true.append(processed_batch['spec'].cpu())
                 y_pred.append(output.cpu())
                 
             except RuntimeError as e:
-                print(f"評価中にエラー発生: {str(e)}")
+                print(f"Error during evaluation: {str(e)}")
                 continue
     
-    # 結果を集計
+    # Aggregate results
     if batch_count > 0:
         avg_loss = total_loss / batch_count
         
-        # コサイン類似度を計算
+        # Calculate cosine similarity
         if y_true and y_pred:
             try:
                 all_true = torch.cat(y_true, dim=0)
                 all_pred = torch.cat(y_pred, dim=0)
                 cosine_sim = cosine_similarity_score(all_true, all_pred)
             except Exception as e:
-                print(f"類似度計算エラー: {str(e)}")
+                print(f"Similarity calculation error: {str(e)}")
                 cosine_sim = 0.0
         else:
             cosine_sim = 0.0
@@ -229,26 +230,26 @@ def evaluate_model(model, data_loader, criterion, device):
         }
 
 def eval_model(model, test_loader, device, transform="log10over3"):
-    """テスト用の評価関数 - 離散化処理追加"""
+    """Evaluation function for testing - with discretization processing"""
     model = model.to(device)
     model.eval()
     y_true = []
     y_pred = []
-    y_pred_discrete = []  # 離散化後の予測結果
+    y_pred_discrete = []  # Discretized prediction results
     fragment_true = []
     fragment_pred = []
     mol_ids = []
     
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc="テスト中"):
+        for batch in tqdm(test_loader, desc="Testing"):
             try:
-                # データをGPUに転送
+                # Transfer data to GPU
                 processed_batch = {}
                 for k, v in batch.items():
                     if isinstance(v, torch.Tensor):
                         processed_batch[k] = v.to(device, non_blocking=True)
                     elif k == 'graph':
-                        # グラフデータは別途処理
+                        # Process graph data separately
                         v.x = v.x.to(device, non_blocking=True)
                         v.edge_index = v.edge_index.to(device, non_blocking=True)
                         v.edge_attr = v.edge_attr.to(device, non_blocking=True)
@@ -259,14 +260,14 @@ def eval_model(model, test_loader, device, transform="log10over3"):
                     else:
                         processed_batch[k] = v
                 
-                # 通常の予測（AMPなし）
+                # Regular prediction
                 output, frag_pred = model(processed_batch)
                 
-                # 元のスムーズな予測結果を保存
+                # Save original smooth prediction results
                 y_true.append(processed_batch['spec'].cpu())
                 y_pred.append(output.cpu())
                 
-                # 離散化処理を適用
+                # Apply discretization
                 for i in range(len(output)):
                     pred_np = output[i].cpu().numpy()
                     discrete_pred = hybrid_spectrum_conversion(pred_np, transform)
@@ -276,29 +277,29 @@ def eval_model(model, test_loader, device, transform="log10over3"):
                 fragment_pred.append(frag_pred.cpu())
                 mol_ids.extend(processed_batch['mol_id'])
                 
-                # バッチごとにメモリ解放
+                # Clear memory for each batch
                 torch.cuda.empty_cache()
                 
             except RuntimeError as e:
-                print(f"テスト中にエラー発生: {str(e)}")
+                print(f"Error during testing: {str(e)}")
                 import traceback
                 traceback.print_exc()
                 continue
     
-    # 結果を連結
+    # Concatenate results
     all_true = torch.cat(y_true, dim=0)
     all_pred = torch.cat(y_pred, dim=0)
     all_pred_discrete = torch.stack(y_pred_discrete)
     all_fragment_true = torch.cat(fragment_true, dim=0)
     all_fragment_pred = torch.cat(fragment_pred, dim=0)
     
-    # スコア計算
+    # Calculate scores
     smooth_cosine_sim = cosine_similarity_score(all_true, all_pred)
     discrete_cosine_sim = cosine_similarity_score(all_true, all_pred_discrete)
     
     return {
-        'cosine_similarity': smooth_cosine_sim,  # 元の予測との類似度
-        'discrete_cosine_similarity': discrete_cosine_sim,  # 離散化後の類似度
+        'cosine_similarity': smooth_cosine_sim,  # Similarity with original prediction
+        'discrete_cosine_similarity': discrete_cosine_sim,  # Similarity with discretized prediction
         'y_true': all_true,
         'y_pred': all_pred,
         'y_pred_discrete': all_pred_discrete,
@@ -307,13 +308,13 @@ def eval_model(model, test_loader, device, transform="log10over3"):
         'mol_ids': mol_ids
     }
 
-# ===== データ処理関数 =====
+# ===== Data Processing Functions =====
 def process_spec(spec, transform, normalization, eps=EPS):
-    """スペクトルにトランスフォームと正規化を適用"""
-    # スペクトルを1000までスケーリング
+    """Apply transformation and normalization to spectrum"""
+    # Scale spectrum to 1000
     spec = spec / (torch.max(spec, dim=-1, keepdim=True)[0] + eps) * 1000.
     
-    # 信号変換
+    # Signal transformation
     if transform == "log10":
         spec = torch.log10(spec + 1)
     elif transform == "log10over3":
@@ -327,7 +328,7 @@ def process_spec(spec, transform, normalization, eps=EPS):
     else:
         raise ValueError("invalid transform")
     
-    # 正規化
+    # Normalization
     if normalization == "l1":
         spec = F.normalize(spec, p=1, dim=-1, eps=eps)
     elif normalization == "l2":
@@ -341,8 +342,8 @@ def process_spec(spec, transform, normalization, eps=EPS):
     return spec
 
 def hybrid_spectrum_conversion(smoothed_prediction, transform="log10over3"):
-    """NISTデータ向けにシンプル化したマススペクトルへの変換関数"""
-    # モデル出力を元のスケールに戻す
+    """Simplified mass spectrum conversion function for NIST data"""
+    # Convert model output back to original scale
     if transform == "log10":
         untransformed = 10**smoothed_prediction - 1.
     elif transform == "log10over3":
@@ -354,38 +355,38 @@ def hybrid_spectrum_conversion(smoothed_prediction, transform="log10over3"):
     else:
         untransformed = smoothed_prediction
     
-    # 非常に低い値をゼロに設定（モデルの数値的ノイズを除去）
-    # NISTデータ自体にはノイズがないが、モデル予測のごく小さい値を除去
-    noise_threshold = 0.0001  # 非常に低い閾値
+    # Set very low values to zero (remove numerical noise from model)
+    # NIST data itself has no noise, but we remove very small values from model prediction
+    noise_threshold = 0.0001  # Very low threshold
     untransformed[untransformed < noise_threshold] = 0
     
-    # 離散スペクトルを初期化
+    # Initialize discrete spectrum
     discrete_spectrum = np.zeros_like(untransformed)
     
-    # 重要なピークを選択（シンプルな閾値のみ使用）
-    relative_threshold = 0.005  # 最大強度の0.5%以上のピークを保持
+    # Select important peaks (simple threshold only)
+    relative_threshold = 0.005  # Keep peaks above 0.5% of max intensity
     if np.max(untransformed) > 0:
         peak_threshold = np.max(untransformed) * relative_threshold
         peak_indices = np.where(untransformed >= peak_threshold)[0]
         
-        # 選択したピークを離散スペクトルに設定
+        # Set selected peaks in discrete spectrum
         for idx in peak_indices:
             discrete_spectrum[idx] = untransformed[idx]
     
-    # 特に重要なm/z値のピークを追加で保持
+    # Additionally preserve peaks at important m/z values
     for mz in IMPORTANT_MZ:
         if mz < len(untransformed) and untransformed[mz] > 0:
             discrete_spectrum[mz] = untransformed[mz]
     
-    # 分子イオンピーク（最大m/z値のピーク）を保持
-    # 微弱でも重要な情報なので低い閾値を使用
+    # Preserve molecular ion peak (highest m/z value peak)
+    # This is important even if weak
     mz_values = np.nonzero(untransformed)[0]
     if len(mz_values) > 0:
         max_mz = np.max(mz_values)
         if untransformed[max_mz] > 0:
             discrete_spectrum[max_mz] = untransformed[max_mz]
     
-    # 最大値で正規化（相対強度に変換）
+    # Normalize by max value (convert to relative intensity)
     max_intensity = np.max(discrete_spectrum)
     if max_intensity > 0:
         discrete_spectrum = discrete_spectrum / max_intensity * 100
@@ -393,17 +394,17 @@ def hybrid_spectrum_conversion(smoothed_prediction, transform="log10over3"):
     return discrete_spectrum
 
 def mask_prediction_by_mass(raw_prediction, prec_mass_idx, prec_mass_offset, mask_value=0.):
-    """前駆体質量によるマスキング"""
+    """Mask prediction by precursor mass"""
     device = raw_prediction.device
     max_idx = raw_prediction.shape[1]
     
-    # prec_mass_idxのデータ型を確認し調整
+    # Check and adjust precursor mass index data type
     if prec_mass_idx.dtype != torch.long:
         prec_mass_idx = prec_mass_idx.long()
     
-    # エラーチェックを追加
+    # Add error check
     if not torch.all(prec_mass_idx < max_idx):
-        # エラーを回避するために範囲外の値をクリップ
+        # Clip out-of-range values to avoid error
         prec_mass_idx = torch.clamp(prec_mass_idx, max=max_idx-1)
     
     idx = torch.arange(max_idx, device=device)
@@ -414,17 +415,17 @@ def mask_prediction_by_mass(raw_prediction, prec_mass_idx, prec_mass_offset, mas
     return mask * raw_prediction + (1. - mask) * mask_value
 
 def parse_msp_file(msp_file_path, cache_dir=CACHE_DIR):
-    """MSPファイルを解析し、ID->マススペクトルのマッピングを返す（キャッシュ対応）"""
-    # キャッシュファイルのパス
+    """Parse MSP file and return ID->mass spectrum mapping (with caching)"""
+    # Cache file path
     cache_file = os.path.join(cache_dir, f"msp_data_cache_{os.path.basename(msp_file_path)}.pkl")
     
-    # キャッシュが存在すれば読み込む
+    # Load from cache if it exists
     if os.path.exists(cache_file):
-        logger.info(f"キャッシュからMSPデータを読み込み中: {cache_file}")
+        logger.info(f"Loading MSP data from cache: {cache_file}")
         with open(cache_file, 'rb') as f:
             return pickle.load(f)
     
-    logger.info(f"MSPファイルを解析中: {msp_file_path}")
+    logger.info(f"Parsing MSP file: {msp_file_path}")
     msp_data = {}
     current_id = None
     current_peaks = []
@@ -433,24 +434,24 @@ def parse_msp_file(msp_file_path, cache_dir=CACHE_DIR):
         for line in f:
             line = line.strip()
             
-            # IDを検出
+            # Detect ID
             if line.startswith("ID:"):
                 current_id = line.split(":")[1].strip()
                 current_id = int(current_id)
             
-            # ピーク数を検出（これはピークデータの直前にある）
+            # Detect number of peaks (this is right before peak data)
             elif line.startswith("Num peaks:"):
                 current_peaks = []
             
-            # 空行は化合物の区切り
+            # Empty line is the separator between compounds
             elif line == "" and current_id is not None and current_peaks:
-                # マススペクトルをベクトルに変換
+                # Convert mass spectrum to vector
                 ms_vector = np.zeros(MAX_MZ)
                 for mz, intensity in current_peaks:
                     if 0 <= mz < MAX_MZ:
                         ms_vector[mz] = intensity
                 
-                # 強度を正規化（相対強度に変換）- シンプルな最大値正規化のみ
+                # Normalize intensities (convert to relative intensity) - simple max normalization
                 if np.sum(ms_vector) > 0:
                     ms_vector = ms_vector / np.max(ms_vector) * 100
                 
@@ -458,7 +459,7 @@ def parse_msp_file(msp_file_path, cache_dir=CACHE_DIR):
                 current_id = None
                 current_peaks = []
             
-            # ピークデータを処理
+            # Process peak data
             elif current_id is not None and " " in line and not any(line.startswith(prefix) for prefix in ["Name:", "Formula:", "MW:", "ExactMass:", "CASNO:", "Comment:"]):
                 try:
                     parts = line.split()
@@ -467,25 +468,25 @@ def parse_msp_file(msp_file_path, cache_dir=CACHE_DIR):
                         intensity = float(parts[1])
                         current_peaks.append((mz, intensity))
                 except ValueError:
-                    pass  # 数値に変換できない行はスキップ
+                    pass  # Skip lines that can't be converted to numbers
     
-    # キャッシュに保存
-    logger.info(f"MSPデータをキャッシュに保存中: {cache_file}")
+    # Save to cache
+    logger.info(f"Saving MSP data to cache: {cache_file}")
     with open(cache_file, 'wb') as f:
         pickle.dump(msp_data, f)
     
     return msp_data
 
 def contains_metal(mol):
-    """分子に非金属以外の原子が含まれているかチェック"""
+    """Check if molecule contains non-non-metal atoms"""
     for atom in mol.GetAtoms():
         if atom.GetSymbol() not in NON_METAL_ATOMS:
             return True
     return False
 
-# ===== DMPNN関連のモジュール =====
+# ===== DMPNN Related Modules =====
 class DirectedMessagePassing(nn.Module):
-    """有向メッセージパッシングニューラルネットワーク(DMPNN)のメッセージ関数"""
+    """Directed Message Passing Neural Network (DMPNN) message function"""
     def __init__(self, hidden_size, edge_fdim, node_fdim, depth=3):
         super(DirectedMessagePassing, self).__init__()
         self.hidden_size = hidden_size
@@ -493,10 +494,10 @@ class DirectedMessagePassing(nn.Module):
         self.node_fdim = node_fdim
         self.depth = depth
         
-        # 入力サイズは、エッジの特徴次元 + ノードの特徴次元 + 隠れ層次元
+        # Input size is edge feature dim + node feature dim + hidden dim
         input_size = edge_fdim + node_fdim + hidden_size
         
-        # 各メッセージパッシングステップ用のネットワーク
+        # Network for each message passing step
         self.W_message = nn.Sequential(
             nn.Linear(input_size, hidden_size),
             nn.ReLU(),
@@ -504,13 +505,13 @@ class DirectedMessagePassing(nn.Module):
             nn.Linear(hidden_size, hidden_size)
         )
         
-        # 更新ネットワーク
+        # Update network
         self.W_update = nn.GRUCell(hidden_size, hidden_size)
         
-        # ノード表現を計算するネットワーク
+        # Network to compute node representations
         self.W_node = nn.Linear(node_fdim + hidden_size, hidden_size)
         
-        # 読み出しネットワーク
+        # Readout network
         self.W_o = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
@@ -519,66 +520,66 @@ class DirectedMessagePassing(nn.Module):
         )
         
     def forward(self, data):
-        """メッセージパッシングを実行"""
-        # データからグラフ情報を抽出
+        """Run message passing"""
+        # Extract graph information from data
         x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
         
         device = x.device
         num_nodes = x.size(0)
         num_edges = edge_index.size(1)
         
-        # すべてのテンソルをFloat32に変換して型を統一
+        # Convert all tensors to Float32 for consistent type
         x = x.float()
         edge_attr = edge_attr.float()
         
-        # 初期メッセージを準備：エッジ特徴で初期化
+        # Prepare initial messages: initialized with edge features
         messages = torch.zeros(num_edges, self.hidden_size, device=device)
         
-        # メッセージパッシングのD回のステップを実行
+        # Run D steps of message passing
         for step in range(self.depth):
-            # 各方向エッジ（i->j）に対するメッセージを計算
-            source_nodes = edge_index[0]  # メッセージの送信元
-            target_nodes = edge_index[1]  # メッセージの送信先
+            # Compute messages for each directed edge (i->j)
+            source_nodes = edge_index[0]  # Message sender
+            target_nodes = edge_index[1]  # Message receiver
             
-            # メッセージ入力特徴の作成
-            # [エッジ特徴, 送信元ノードの特徴, 隠れ状態]
+            # Create message input features
+            # [edge features, source node features, hidden state]
             message_inputs = torch.cat([
                 edge_attr,
                 x[source_nodes],
                 messages
             ], dim=1)
             
-            # メッセージパッシング関数で新しいメッセージを計算
+            # Compute new messages with message passing function
             new_messages = self.W_message(message_inputs)
             
-            # ノードに集約するときにエッジインデックスをエッジID（0〜num_edges）に変換する必要がある
-            # エッジをターゲットノードでグループ化し、メッセージをマージ
-            # 各ノードへの入力メッセージを集約（合計）
+            # When aggregating to nodes, we need to convert edge indices to edge IDs (0 to num_edges)
+            # Group edges by target node and merge messages
+            # Aggregate incoming messages to each node (sum)
             aggr_messages = torch.zeros(num_nodes, self.hidden_size, device=device)
             aggr_messages.index_add_(0, target_nodes, new_messages)
             
-            # GRUを使用してメッセージを更新
+            # Update messages using GRU
             messages = self.W_update(
                 new_messages,
                 messages
             )
         
-        # ノード特徴の最終集約
-        # 各ノードに入るエッジからのメッセージを集約
+        # Final aggregation of node features
+        # Aggregate messages coming into each node
         node_messages = torch.zeros(num_nodes, self.hidden_size, device=device)
         node_messages.index_add_(0, target_nodes, messages)
         
-        # ノード表現を計算
+        # Compute node representations
         node_inputs = torch.cat([x, node_messages], dim=1)
         node_representations = self.W_node(node_inputs)
         
-        # ノード表現の読み出し
+        # Readout node representations
         node_outputs = self.W_o(node_representations)
         
         return node_outputs
 
 class SqueezeExcitation(nn.Module):
-    """Squeeze-and-Excitation ブロック - 最適化版"""
+    """Squeeze-and-Excitation Block - Optimized Version"""
     def __init__(self, channel, reduction=16):
         super(SqueezeExcitation, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool1d(1)
@@ -591,13 +592,13 @@ class SqueezeExcitation(nn.Module):
 
     def forward(self, x):
         b, c = x.size()
-        # 高速化のためのシンプルな実装
+        # Faster implementation of simple squeeze-excitation
         y = torch.mean(x, dim=0, keepdim=True).expand(b, c)
         y = self.fc(y).view(b, c)
         return x * y
 
 class ResidualBlock(nn.Module):
-    """残差ブロック - 最適化版"""
+    """Residual Block - Optimized Version"""
     def __init__(self, in_channels, out_channels, dropout=0.1):
         super(ResidualBlock, self).__init__()
         self.conv1 = nn.Linear(in_channels, out_channels)
@@ -605,7 +606,7 @@ class ResidualBlock(nn.Module):
         self.conv2 = nn.Linear(out_channels, out_channels)
         self.ln2 = nn.LayerNorm(out_channels)
         
-        # 入力と出力のチャネル数が異なる場合の調整用レイヤー
+        # Projection layer for input with different channel count
         self.shortcut = nn.Sequential()
         if in_channels != out_channels:
             self.shortcut = nn.Sequential(
@@ -613,7 +614,7 @@ class ResidualBlock(nn.Module):
                 nn.LayerNorm(out_channels)
             )
             
-        # ドロップアウト
+        # Dropout
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
@@ -623,13 +624,13 @@ class ResidualBlock(nn.Module):
         out = self.dropout(out)
         out = self.ln2(self.conv2(out))
         
-        out += residual  # 残差接続
+        out += residual  # Residual connection
         out = F.leaky_relu(out)
         
         return out
 
 class DMPNNMSPredictor(nn.Module):
-    """DMPNNを用いたマススペクトル予測モデル"""
+    """Mass Spectrum Predictor using DMPNN"""
     def __init__(self, 
                  node_fdim, 
                  edge_fdim, 
@@ -653,7 +654,7 @@ class DMPNNMSPredictor(nn.Module):
         self.gate_prediction = gate_prediction
         self.prec_mass_offset = prec_mass_offset
         
-        # DMPNN部分
+        # DMPNN part
         self.dmpnn = DirectedMessagePassing(
             hidden_size=hidden_size,
             edge_fdim=edge_fdim,
@@ -661,14 +662,14 @@ class DMPNNMSPredictor(nn.Module):
             depth=depth
         )
         
-        # グローバル特徴量処理
+        # Global feature processing
         self.global_proj = nn.Sequential(
             nn.Linear(global_features_dim, hidden_size),
             nn.LeakyReLU(),
             nn.LayerNorm(hidden_size)
         )
         
-        # 分子表現の集約と処理（プーリング後）
+        # Molecular representation aggregation and processing (after pooling)
         self.readout = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
@@ -676,14 +677,14 @@ class DMPNNMSPredictor(nn.Module):
             nn.Linear(hidden_size, hidden_size)
         )
         
-        # スペクトル予測のための全結合層
+        # Fully connected layers for spectrum prediction
         self.fc_layers = nn.ModuleList([
             ResidualBlock(hidden_size * 2, hidden_size * 2),
             ResidualBlock(hidden_size * 2, hidden_size * 2),
             ResidualBlock(hidden_size * 2, hidden_size)
         ])
         
-        # マルチタスク学習: フラグメントパターン予測
+        # Multi-task learning: Fragment pattern prediction
         self.fragment_pred = nn.Sequential(
             nn.Linear(hidden_size, hidden_size//2),
             nn.LeakyReLU(),
@@ -691,7 +692,7 @@ class DMPNNMSPredictor(nn.Module):
             nn.Linear(hidden_size//2, num_fragments),
         )
         
-        # 双方向予測用レイヤー
+        # Bidirectional prediction layers
         if bidirectional:
             self.forw_out_layer = nn.Linear(hidden_size, output_dim)
             self.rev_out_layer = nn.Linear(hidden_size, output_dim)
@@ -700,7 +701,7 @@ class DMPNNMSPredictor(nn.Module):
                 nn.Sigmoid()
             )
         else:
-            # 通常の出力レイヤー
+            # Regular output layer
             self.out_layer = nn.Linear(hidden_size, output_dim)
             if gate_prediction:
                 self.out_gate = nn.Sequential(
@@ -708,11 +709,11 @@ class DMPNNMSPredictor(nn.Module):
                     nn.Sigmoid()
                 )
                 
-        # 重み初期化
+        # Weight initialization
         self._init_weights()
                 
     def _init_weights(self):
-        """重みの初期化（収束を高速化）"""
+        """Initialize weights (for faster convergence)"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -723,12 +724,12 @@ class DMPNNMSPredictor(nn.Module):
                 nn.init.constant_(m.bias, 0)
     
     def forward(self, data):
-        """順伝播計算"""
+        """Forward computation"""
         device = next(self.parameters()).device
         
-        # データ形式を標準化
+        # Standardize data format
         if isinstance(data, dict):
-            # MassFormer形式の入力
+            # MassFormer format input
             x = data['graph'].x.to(device)
             edge_index = data['graph'].edge_index.to(device)
             edge_attr = data['graph'].edge_attr.to(device)
@@ -739,24 +740,24 @@ class DMPNNMSPredictor(nn.Module):
             if prec_mz_bin is not None:
                 prec_mz_bin = prec_mz_bin.to(device)
         else:
-            # 直接Dataオブジェクトが渡された場合
+            # Direct Data object passed
             x = data.x.to(device)
             edge_index = data.edge_index.to(device)
             edge_attr = data.edge_attr.to(device)
             batch = data.batch.to(device)
             
             global_attr = data.global_attr.to(device) if hasattr(data, 'global_attr') else None
-            # 前駆体質量のダミー値を作成
+            # Create dummy precursor mass
             if hasattr(data, 'mass'):
                 prec_mz_bin = data.mass.to(device)
             else:
                 prec_mz_bin = None
         
-        # 全てのテンソルを確実にFloat32に変換
+        # Ensure all tensors are Float32
         x = x.float()
         edge_attr = edge_attr.float()
         
-        # データオブジェクトの作成
+        # Create data object
         processed_data = Data(
             x=x,
             edge_index=edge_index,
@@ -764,36 +765,34 @@ class DMPNNMSPredictor(nn.Module):
             batch=batch
         )
         
-        # AMPを使用せずに処理
-        # DMPNN処理
+        # Process with DMPNN
         node_features = self.dmpnn(processed_data)
         
-        # グラフプーリング（ノードから分子特徴へ）
-        # ここで次元の統一が必要
+        # Graph pooling (node to molecule features)
+        # Need to unify dimensions here
         batch_size = torch.max(batch).item() + 1
         pooled_features = torch.zeros(batch_size, self.hidden_size, device=device)
         
-        # 正規化されたプーリング
+        # Normalized pooling
         for i in range(batch_size):
             batch_mask = (batch == i)
             if batch_mask.any():
-                # 各分子のノード特徴を抽出
+                # Extract node features for each molecule
                 mol_features = node_features[batch_mask]
-                # 平均プーリングを適用
+                # Apply mean pooling
                 pooled_features[i] = torch.mean(mol_features, dim=0)
         
-        # 分子表現の読み出し
+        # Readout molecular representation
         mol_representation = self.readout(pooled_features)
         
-        # 以降の処理は混合精度可
-        # グローバル特徴量の処理
+        # Process global features if available
         if global_attr is not None:
-            # グローバル属性のサイズ調整
+            # Adjust global attribute size
             if len(global_attr.shape) == 1:
-                # 一次元の場合、バッチサイズに合わせて再形成
+                # If one-dimensional, reshape to match batch size
                 global_attr = global_attr.view(batch_size, -1)
                 
-                # 期待する次元にパディング
+                # Pad to expected dimension
                 if global_attr.shape[1] != self.global_features_dim:
                     padded = torch.zeros(batch_size, self.global_features_dim, device=device)
                     copy_size = min(global_attr.shape[1], self.global_features_dim)
@@ -802,66 +801,66 @@ class DMPNNMSPredictor(nn.Module):
                     
             global_features = self.global_proj(global_attr)
         else:
-            # グローバル特徴がない場合はゼロパディング
+            # Zero padding if no global features
             global_features = torch.zeros(batch_size, self.hidden_size, device=device)
         
-        # 分子表現とグローバル特徴を結合
+        # Combine molecular representation and global features
         x_combined = torch.cat([mol_representation, global_features], dim=1)
         
-        # 残差ブロックを通した特徴抽出
+        # Feature extraction through residual blocks
         for i, fc_layer in enumerate(self.fc_layers):
             x_combined = fc_layer(x_combined)
         
-        # マルチタスク学習: フラグメントパターン予測
+        # Multi-task learning: Fragment pattern prediction
         fragment_pred = self.fragment_pred(x_combined)
         
-        # 双方向予測を使用する場合
+        # Use bidirectional prediction if enabled
         if self.bidirectional and prec_mz_bin is not None:
-            # 順方向と逆方向の予測
+            # Forward and reverse prediction
             ff = self.forw_out_layer(x_combined)
             
-            # 逆方向の予測と前駆体質量による調整
+            # Reverse prediction with precursor mass adjustment
             fr_raw = self.rev_out_layer(x_combined)
-            # 逆順にしてから前駆体質量に基づいて位置を調整
+            # Flip and adjust by precursor mass position
             fr = torch.flip(fr_raw, dims=(1,))
             
-            # 前駆体質量を考慮したマスキング
+            # Masking based on precursor mass
             prec_mass_offset = self.prec_mass_offset
             max_idx = fr.shape[1]
             
-            # prec_mz_binのデータ型と範囲を調整
+            # Adjust prec_mz_bin data type and range
             if prec_mz_bin.dtype != torch.long:
                 prec_mz_bin = prec_mz_bin.long()
             
             prec_mz_bin = torch.clamp(prec_mz_bin, max=max_idx-prec_mass_offset-1)
             
-            # ゲート機構で重み付け
+            # Gate mechanism weighting
             fg = self.out_gate(x_combined)
             output = ff * fg + fr * (1. - fg)
             
-            # 前駆体質量でマスク
+            # Mask by precursor mass
             output = mask_prediction_by_mass(output, prec_mz_bin, prec_mass_offset)
         else:
-            # 通常の予測
+            # Regular prediction
             if hasattr(self, 'out_layer'):
                 output = self.out_layer(x_combined)
                 
-                # ゲート予測を使用する場合
+                # Use gate prediction if enabled
                 if self.gate_prediction and hasattr(self, 'out_gate'):
                     fg = self.out_gate(x_combined)
                     output = fg * output
             else:
-                # 双方向予測のためのレイヤーが存在しても前駆体質量情報がない場合
+                # Fallback to forward layer if bidirectional layers exist but no precursor mass info
                 output = self.forw_out_layer(x_combined)
         
-        # 出力をReLUで活性化
+        # Activate output with ReLU
         output = F.relu(output)
         
         return output, fragment_pred
 
-# ===== データセットクラス =====
+# ===== Dataset Classes =====
 class DMPNNMoleculeDataset(Dataset):
-    """金属原子を除外したDMPNN用データセット"""
+    """Dataset for DMPNN excluding metal-containing molecules"""
     def __init__(self, mol_ids, mol_files_path, msp_data, transform="log10over3", 
                 normalization="l1", augment=False, cache_dir=CACHE_DIR):
         self.mol_ids = mol_ids
@@ -873,56 +872,56 @@ class DMPNNMoleculeDataset(Dataset):
         self.valid_mol_ids = []
         self.fragment_patterns = {}
         self.cache_dir = cache_dir
-        self.graph_cache = {}  # メモリ内キャッシュ
+        self.graph_cache = {}  # In-memory cache
         
-        # 前処理で有効な分子IDを抽出（非金属のみを含むもの）
+        # Preprocess to extract valid molecule IDs (containing only non-metals)
         self._preprocess_mol_ids()
         
     def _preprocess_mol_ids(self):
-        """非金属のみを含む有効な分子IDのみを抽出する"""
-        # キャッシュファイルのパス
+        """Extract valid molecule IDs containing only non-metals"""
+        # Cache file path
         os.makedirs(self.cache_dir, exist_ok=True)
         cache_key = f"dmpnn_preprocessed_data_{hash(str(sorted(self.mol_ids)))}"
         cache_file = os.path.join(self.cache_dir, f"{cache_key}.pkl")
         
-        # キャッシュファイルが存在するか確認
+        # Check if cache file exists
         if os.path.exists(cache_file):
-            logger.info(f"キャッシュから前処理データを読み込み中: {cache_file}")
+            logger.info(f"Loading preprocessed data from cache: {cache_file}")
             with open(cache_file, 'rb') as f:
                 cached_data = pickle.load(f)
                 self.valid_mol_ids = cached_data['valid_mol_ids']
                 self.fragment_patterns = cached_data['fragment_patterns']
                 return
         
-        logger.info("分子データの前処理を開始します（非金属のみを含む分子を抽出）...")
+        logger.info("Starting molecule preprocessing (extracting non-metal-only molecules)...")
         
         valid_ids = []
         fragment_patterns = {}
         
-        # 進捗表示用
-        with tqdm(total=len(self.mol_ids), desc="分子の検証") as pbar:
+        # For progress display
+        with tqdm(total=len(self.mol_ids), desc="Validating molecules") as pbar:
             for mol_id in self.mol_ids:
                 try:
                     mol_file = os.path.join(self.mol_files_path, f"ID{mol_id}.MOL")
                     
-                    # MOLファイルが読み込めるか確認
+                    # Check if MOL file can be loaded
                     mol = Chem.MolFromMolFile(mol_file, sanitize=False)
                     if mol is None:
                         pbar.update(1)
                         continue
                     
-                    # 非金属以外の原子を含む分子を除外
+                    # Exclude molecules containing non-non-metal atoms
                     if contains_metal(mol):
                         pbar.update(1)
                         continue
                     
-                    # 分子の基本的なサニタイズを試みる
+                    # Attempt basic sanitization of molecule
                     try:
-                        # プロパティキャッシュを更新
+                        # Update property cache
                         for atom in mol.GetAtoms():
                             atom.UpdatePropertyCache(strict=False)
                         
-                        # 部分的なサニタイズ
+                        # Partial sanitization
                         Chem.SanitizeMol(mol, 
                                        sanitizeOps=Chem.SanitizeFlags.SANITIZE_FINDRADICALS|
                                                   Chem.SanitizeFlags.SANITIZE_KEKULIZE|
@@ -935,15 +934,15 @@ class DMPNNMoleculeDataset(Dataset):
                         pbar.update(1)
                         continue
                     
-                    # フラグメントパターンを計算 - Morgan + AtomPair フィンガープリント
+                    # Calculate fragment pattern - Morgan + AtomPair fingerprints
                     try:
-                        # Morgan フィンガープリントを計算
+                        # Calculate Morgan fingerprint
                         morgan = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=MORGAN_BITS)
                         
-                        # AtomPair フィンガープリントを計算
+                        # Calculate AtomPair fingerprint
                         atompair = AllChem.GetHashedAtomPairFingerprintAsBitVect(mol, nBits=ATOMPAIR_BITS)
                         
-                        # 両方のフィンガープリントを結合
+                        # Combine both fingerprints
                         fragments = np.zeros(NUM_FRAGS)
                         for i in range(MORGAN_BITS):
                             if morgan.GetBit(i):
@@ -956,71 +955,71 @@ class DMPNNMoleculeDataset(Dataset):
                     except Exception:
                         fragment_patterns[mol_id] = np.zeros(NUM_FRAGS)
                     
-                    # この分子のスペクトルがあるか確認
+                    # Check if spectrum exists for this molecule
                     if mol_id in self.msp_data:
                         valid_ids.append(mol_id)
                     
-                    # 定期的にガベージコレクション
+                    # Periodic garbage collection
                     if len(valid_ids) % 1000 == 0:
                         gc.collect()
                         
                 except Exception as e:
-                    logger.warning(f"分子ID {mol_id} の処理中にエラー: {str(e)}")
+                    logger.warning(f"Error processing molecule ID {mol_id}: {str(e)}")
                 
                 pbar.update(1)
         
         self.valid_mol_ids = valid_ids
         self.fragment_patterns = fragment_patterns
         
-        # 結果をキャッシュに保存
-        logger.info(f"前処理結果をキャッシュに保存中: {cache_file}")
+        # Save results to cache
+        logger.info(f"Saving preprocessing results to cache: {cache_file}")
         with open(cache_file, 'wb') as f:
             pickle.dump({
                 'valid_mol_ids': valid_ids,
                 'fragment_patterns': fragment_patterns
             }, f)
         
-        logger.info(f"有効な分子: {len(valid_ids)}個 / 全体: {len(self.mol_ids)}個")
+        logger.info(f"Valid molecules: {len(valid_ids)} / Total: {len(self.mol_ids)}")
     
     def _mol_to_graph(self, mol_file):
-        """分子をDMPNN用グラフに変換（非金属チェック付き）"""
-        # キャッシュをチェック
+        """Convert molecule to graph for DMPNN (with non-metal check)"""
+        # Check cache
         if mol_file in self.graph_cache:
             return self.graph_cache[mol_file]
         
-        # キャッシュファイルのパス
+        # Cache file path
         cache_file = os.path.join(self.cache_dir, f"dmpnn_graph_cache_{os.path.basename(mol_file)}.pkl")
         
-        # ディスクキャッシュをチェック
+        # Check disk cache
         if os.path.exists(cache_file):
             try:
                 with open(cache_file, 'rb') as f:
                     graph_data = pickle.load(f)
-                    # メモリキャッシュに追加
+                    # Add to memory cache
                     self.graph_cache[mol_file] = graph_data
                     return graph_data
             except Exception:
-                # キャッシュが壊れている場合は再計算
+                # Recompute if cache is corrupted
                 pass
         
-        # RDKitの警告を抑制
+        # Suppress RDKit warnings
         RDLogger.DisableLog('rdApp.*')
         
-        # RDKitでMOLファイルを読み込む
+        # Load MOL file with RDKit
         mol = Chem.MolFromMolFile(mol_file, sanitize=False)
         if mol is None:
             raise ValueError(f"Could not read molecule from {mol_file}")
         
-        # 非金属以外の原子を含む分子を除外
+        # Exclude molecules containing non-non-metal atoms
         if contains_metal(mol):
             raise ValueError(f"Molecule {mol_file} contains non-allowed atoms")
         
         try:
-            # プロパティキャッシュを更新して暗黙的な原子価を計算
+            # Update property cache to calculate implicit valence
             for atom in mol.GetAtoms():
                 atom.UpdatePropertyCache(strict=False)
             
-            # 部分的なサニタイズ
+            # Partial sanitization
             Chem.SanitizeMol(mol, 
                            sanitizeOps=Chem.SanitizeFlags.SANITIZE_FINDRADICALS|
                                       Chem.SanitizeFlags.SANITIZE_KEKULIZE|
@@ -1030,38 +1029,38 @@ class DMPNNMoleculeDataset(Dataset):
                                       Chem.SanitizeFlags.SANITIZE_SYMMRINGS,
                            catchErrors=True)
             
-            # 明示的な水素を追加（安全モード）
+            # Add explicit hydrogens (safe mode)
             try:
                 mol = Chem.AddHs(mol)
             except:
                 pass
         except Exception:
-            # エラーを無視して処理を続行
+            # Ignore errors and continue processing
             pass
         
-        # 原子情報を取得
+        # Get atom information
         num_atoms = mol.GetNumAtoms()
         x = []
         
-        # 環情報の取得
+        # Get ring information
         ring_info = mol.GetRingInfo()
         rings = []
         try:
             rings = ring_info.AtomRings()
         except:
-            # 環情報取得に失敗した場合は空リストを使う
+            # Use empty list if ring info retrieval fails
             pass
         
         for atom in mol.GetAtoms():
             atom_symbol = atom.GetSymbol()
-            # 非金属リストにある原子のみを特定の特徴ベクトルとして扱う
+            # Only treat atoms in non-metal list with specific feature vectors
             atom_feature_idx = ATOM_FEATURES.get(atom_symbol, ATOM_FEATURES['OTHER'])
             
-            # 基本的な原子タイプの特徴
+            # Basic atom type feature
             atom_feature = [0] * len(ATOM_FEATURES)
             atom_feature[atom_feature_idx] = 1
             
-            # 安全なメソッド呼び出し
+            # Safe method calls
             try:
                 degree = atom.GetDegree() / 8.0
             except:
@@ -1107,7 +1106,7 @@ class DMPNNMoleculeDataset(Dataset):
             except:
                 implicit_valence = 0.0
                 
-            # 追加の環境特徴量
+            # Additional environment features
             try:
                 is_in_aromatic_ring = (atom.GetIsAromatic() and atom.IsInRing()) * 1.0
             except:
@@ -1128,18 +1127,18 @@ class DMPNNMoleculeDataset(Dataset):
             except:
                 num_h = 0.0
             
-            # 簡素化した特徴リスト - 計算効率を向上
+            # Simplified feature list - improve computational efficiency
             additional_features = [
                 degree, formal_charge, radical_electrons, is_aromatic,
                 atom_mass, is_in_ring, hybridization, explicit_valence, 
                 implicit_valence, is_in_aromatic_ring, ring_size, num_h
             ]
             
-            # すべての特徴を結合
+            # Concatenate all features
             atom_feature.extend(additional_features)
             x.append(atom_feature)
         
-        # 結合情報を取得
+        # Get bond information
         edge_indices = []
         edge_attrs = []
         for bond in mol.GetBonds():
@@ -1147,23 +1146,23 @@ class DMPNNMoleculeDataset(Dataset):
                 i = bond.GetBeginAtomIdx()
                 j = bond.GetEndAtomIdx()
                 
-                # 結合タイプ
+                # Bond type
                 try:
                     bond_type = BOND_FEATURES.get(bond.GetBondType(), BOND_FEATURES[Chem.rdchem.BondType.SINGLE])
                 except:
                     bond_type = BOND_FEATURES[Chem.rdchem.BondType.SINGLE]
                 
-                # DMPNNは有向グラフを使用するため、双方向のエッジを個別に作成
-                # 方向i->j
+                # DMPNN uses directed graph, so create edges in both directions
+                # Direction i->j
                 edge_indices.append([i, j])
-                # 方向j->i
+                # Direction j->i
                 edge_indices.append([j, i])
                 
-                # 簡素化したボンド特徴量
+                # Simplified bond features
                 bond_feature = [0] * len(BOND_FEATURES)
                 bond_feature[bond_type] = 1
                 
-                # 安全な追加ボンド特徴量の取得
+                # Safe additional bond feature retrieval
                 try:
                     is_in_ring = bond.IsInRing() * 1.0
                 except:
@@ -1183,62 +1182,62 @@ class DMPNNMoleculeDataset(Dataset):
                 
                 bond_feature.extend(additional_bond_features)
                 
-                # i->jとj->iの両方に同じ特徴を追加
+                # Add same features to both i->j and j->i
                 edge_attrs.append(bond_feature)
-                edge_attrs.append(bond_feature)  # 同じ特徴を両方向に
+                edge_attrs.append(bond_feature)  # Same features for both directions
             except Exception:
                 continue
         
-        # 分子全体の特徴量 - 簡素化
+        # Global molecule features - simplified
         mol_features = [0.0] * 16
         
         try:
-            mol_features[0] = Descriptors.MolWt(mol) / 1000.0  # 分子量
+            mol_features[0] = Descriptors.MolWt(mol) / 1000.0  # Molecular weight
         except:
             pass
             
         try:
-            mol_features[1] = Descriptors.NumHAcceptors(mol) / 20.0  # 水素結合アクセプター数
+            mol_features[1] = Descriptors.NumHAcceptors(mol) / 20.0  # Hydrogen bond acceptors
         except:
             pass
             
         try:
-            mol_features[2] = Descriptors.NumHDonors(mol) / 10.0  # 水素結合ドナー数
+            mol_features[2] = Descriptors.NumHDonors(mol) / 10.0  # Hydrogen bond donors
         except:
             pass
             
         try:
-            mol_features[3] = Descriptors.TPSA(mol) / 200.0  # トポロジカル極性表面積
+            mol_features[3] = Descriptors.TPSA(mol) / 200.0  # Topological polar surface area
         except:
             pass
         
-        # エッジが存在するか確認
+        # Check if edges exist
         if not edge_indices:
-            # 単一原子分子の場合や結合情報が取得できない場合、セルフループを追加
+            # For single-atom molecules or cases where bond info can't be retrieved, add self-loops
             for i in range(num_atoms):
                 edge_indices.append([i, i])
                 
                 bond_feature = [0] * len(BOND_FEATURES)
                 bond_feature[BOND_FEATURES[Chem.rdchem.BondType.SINGLE]] = 1
                 
-                # ダミーの追加特徴量
+                # Dummy additional features
                 additional_bond_features = [0.0, 0.0, 0.0]
                 bond_feature.extend(additional_bond_features)
                 edge_attrs.append(bond_feature)
         
-        # PyTorch Geometricのデータ形式に変換
+        # Convert to PyTorch Geometric data format
         x = torch.FloatTensor(x)
         edge_index = torch.LongTensor(edge_indices).t().contiguous()
         edge_attr = torch.FloatTensor(edge_attrs)
         global_attr = torch.FloatTensor(mol_features)
         
-        # グラフデータを作成
+        # Create graph data
         graph_data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, global_attr=global_attr)
         
-        # キャッシュに保存
+        # Save to cache
         self.graph_cache[mol_file] = graph_data
         
-        # ディスクキャッシュにも保存
+        # Also save to disk cache
         try:
             with open(cache_file, 'wb') as f:
                 pickle.dump(graph_data, f)
@@ -1248,11 +1247,11 @@ class DMPNNMoleculeDataset(Dataset):
         return graph_data
     
     def _preprocess_spectrum(self, spectrum):
-        """スペクトルの前処理"""
-        # スペクトルをPyTorchテンソルに変換
+        """Preprocess spectrum"""
+        # Convert spectrum to PyTorch tensor
         spec_tensor = torch.FloatTensor(spectrum)
         
-        # 信号処理を適用
+        # Apply signal processing
         processed_spec = process_spec(spec_tensor.unsqueeze(0), self.transform, self.normalization)
         
         return processed_spec.squeeze(0).numpy()
@@ -1264,21 +1263,21 @@ class DMPNNMoleculeDataset(Dataset):
         mol_id = self.valid_mol_ids[idx]
         mol_file = os.path.join(self.mol_files_path, f"ID{mol_id}.MOL")
         
-        # RDKitの警告を抑制
+        # Suppress RDKit warnings
         RDLogger.DisableLog('rdApp.*')
         
         try:
-            # MOLファイルからグラフ表現を生成
+            # Generate graph representation from MOL file
             graph_data = self._mol_to_graph(mol_file)
             
-            # MSPデータからマススペクトルを取得
+            # Get mass spectrum from MSP data
             mass_spectrum = self.msp_data.get(mol_id, np.zeros(MAX_MZ))
             mass_spectrum = self._preprocess_spectrum(mass_spectrum)
             
-            # フラグメントパターンを取得
+            # Get fragment pattern
             fragment_pattern = self.fragment_patterns.get(mol_id, np.zeros(NUM_FRAGS))
             
-            # 前駆体m/zの計算
+            # Calculate precursor m/z
             peaks = np.nonzero(mass_spectrum)[0]
             if len(peaks) > 0:
                 prec_mz = np.max(peaks)
@@ -1287,17 +1286,17 @@ class DMPNNMoleculeDataset(Dataset):
                 
             prec_mz_bin = prec_mz
             
-            # データ拡張（トレーニング時のみ）
+            # Data augmentation (training only)
             if self.augment and np.random.random() < 0.2:
-                # ノイズ追加
+                # Add noise
                 noise_amplitude = 0.01
                 graph_data.x = graph_data.x + torch.randn_like(graph_data.x) * noise_amplitude
                 graph_data.edge_attr = graph_data.edge_attr + torch.randn_like(graph_data.edge_attr) * noise_amplitude
         
         except Exception as e:
-            # エラー発生時のフォールバック処理
-            logger.warning(f"分子ID {mol_id} の処理中にエラー: {str(e)}")
-            # 最小限のグラフを生成
+            # Fallback handling for errors
+            logger.warning(f"Error processing molecule ID {mol_id}: {str(e)}")
+            # Generate minimal graph
             x = torch.zeros((1, len(ATOM_FEATURES)+12), dtype=torch.float)
             edge_index = torch.tensor([[0], [0]], dtype=torch.long)
             edge_attr = torch.zeros((1, len(BOND_FEATURES)+3), dtype=torch.float)
@@ -1319,7 +1318,7 @@ class DMPNNMoleculeDataset(Dataset):
         }
 
 def collate_batch(batch):
-    """バッチデータの結合"""
+    """Collate batch data"""
     graph_data = [item['graph_data'] for item in batch]
     mass_spectrum = torch.stack([item['mass_spectrum'] for item in batch])
     fragment_pattern = torch.stack([item['fragment_pattern'] for item in batch])
@@ -1327,7 +1326,7 @@ def collate_batch(batch):
     prec_mz = torch.tensor([item['prec_mz'] for item in batch], dtype=torch.float32)
     prec_mz_bin = torch.tensor([item['prec_mz_bin'] for item in batch], dtype=torch.long)
     
-    # バッチ作成
+    # Create batch
     batched_graphs = Batch.from_data_list(graph_data)
     
     return {
@@ -1339,83 +1338,115 @@ def collate_batch(batch):
         'prec_mz_bin': prec_mz_bin
     }
 
-# ===== 損失関数 =====
-def cosine_similarity_loss(y_pred, y_true, important_mz=None, important_weight=3.0):
-    """ピークと重要なm/z値を重視したコサイン類似度損失関数"""
-    # 正規化
-    y_pred_norm = F.normalize(y_pred, p=2, dim=1)
-    y_true_norm = F.normalize(y_true, p=2, dim=1)
+# ===== Loss Functions =====
+def dmpnn_optimized_spectrum_loss(y_pred, y_true, fragment_pred=None, fragment_true=None, 
+                                mol_graphs=None, mass_values=None):
+    """
+    DMPNN-optimized mass spectrum prediction loss function
+    """
+    # Weight coefficients
+    w1, w2, w3, w4 = 0.35, 0.30, 0.20, 0.15
     
-    # 特徴的なm/zの重み付け
-    if important_mz is not None:
-        weights = torch.ones_like(y_pred)
-        for mz in important_mz:
-            if mz < y_pred.size(1):
-                weights[:, mz] = important_weight
+    # === 1. Wasserstein distance component (distribution similarity, tolerant to peak shifts) ===
+    def wasserstein_distance_1d(p, q):
+        # Integral of absolute difference between cumulative distribution functions
+        p_cdf = torch.cumsum(p, dim=1)
+        q_cdf = torch.cumsum(q, dim=1)
+        return torch.mean(torch.abs(p_cdf - q_cdf), dim=1).mean()
+    
+    w_loss = wasserstein_distance_1d(F.softmax(y_pred, dim=1), F.softmax(y_true, dim=1))
+    
+    # === 2. Peak pattern loss (Jaccard/F1 score) ===
+    def peak_pattern_loss(y_pred, y_true, threshold=0.05):
+        # Peak detection (relative intensity threshold)
+        true_peaks = (y_true > threshold * torch.max(y_true, dim=1, keepdim=True)[0]).float()
+        pred_peaks = (y_pred > threshold * torch.max(y_pred, dim=1, keepdim=True)[0]).float()
         
-        # 重み付きベクトルで正規化
-        y_pred_weighted = y_pred * weights
-        y_true_weighted = y_true * weights
+        # Calculate precision and recall
+        intersection = torch.sum(true_peaks * pred_peaks, dim=1)
+        precision = intersection / (torch.sum(pred_peaks, dim=1) + 1e-6)
+        recall = intersection / (torch.sum(true_peaks, dim=1) + 1e-6)
         
-        y_pred_norm = F.normalize(y_pred_weighted, p=2, dim=1)
-        y_true_norm = F.normalize(y_true_weighted, p=2, dim=1)
+        # F1 score
+        f1 = 2 * precision * recall / (precision + recall + 1e-6)
+        return 1.0 - torch.mean(f1)
     
-    # コサイン類似度（-1〜1の範囲）
-    cosine = torch.sum(y_pred_norm * y_true_norm, dim=1)
+    pattern_loss = peak_pattern_loss(y_pred, y_true)
     
-    # 損失を1 - cosineにして、0〜2の範囲に
-    loss = 1.0 - cosine
+    # === 3. Intensity order preservation loss (rank correlation) ===
+    def rank_correlation_loss(y_pred, y_true, top_k=20):
+        batch_size = y_true.size(0)
+        rank_loss = 0.0
+        
+        for i in range(batch_size):
+            # Focus on top-k peaks only
+            true_values, true_indices = torch.topk(y_true[i], k=min(top_k, y_true.size(1)))
+            pred_at_indices = y_pred[i][true_indices]
+            
+            # Predicted ranks
+            pred_ranks = torch.argsort(torch.argsort(pred_at_indices, descending=True))
+            true_ranks = torch.arange(true_indices.size(0), device=y_pred.device)
+            
+            # Spearman rank correlation coefficient (difference from 1)
+            n = true_ranks.size(0)
+            if n > 1:  # Need at least 2 peaks
+                # Sum of squared rank differences
+                rank_diff_sq = torch.sum((true_ranks.float() - pred_ranks.float())**2)
+                # Spearman coefficient: 1 - 6*Σd²/(n³-n)
+                spearman = 1.0 - (6.0 * rank_diff_sq) / (n**3 - n)
+                rank_loss += (1.0 - spearman)
+        
+        return rank_loss / batch_size
     
-    return loss.mean()
+    rank_loss = rank_correlation_loss(y_pred, y_true)
+    
+    # === 4. Fragment mechanism consistency loss ===
+    def fragment_consistency_loss(y_pred, fragment_pred, fragment_true):
+        if fragment_pred is None or fragment_true is None:
+            return torch.tensor(0.0, device=y_pred.device)
+        
+        # Fragment pattern prediction loss (BCE)
+        frag_bce = F.binary_cross_entropy_with_logits(fragment_pred, fragment_true)
+        
+        # Consistency between fragment prediction and actual spectrum prediction
+        # Evaluate correlation between fragment presence and spectrum peak existence
+        sig_fragments = torch.sigmoid(fragment_pred)
+        
+        # Check if fragment prediction can explain spectrum
+        # Simplified mapping from fragments to spectrum (actual relationship is more complex)
+        batch_size = y_pred.size(0)
+        consist_loss = 0.0
+        
+        for i in range(batch_size):
+            # Evaluate association between top fragments and spectrum peaks
+            # Simplified using correlation coefficient
+            top_frags = (sig_fragments[i] > 0.5).float()
+            spec_peaks = (y_pred[i] > 0.1 * torch.max(y_pred[i])).float()
+            
+            # Evaluate if ratio of fragment count to peak count is appropriate
+            frag_count = torch.sum(top_frags)
+            peak_count = torch.sum(spec_peaks)
+            
+            if frag_count > 0 and peak_count > 0:
+                # Check if fragment count to peak count ratio is within expected range
+                ratio = peak_count / frag_count
+                # Expected range typically 0.5-2.0
+                ratio_loss = torch.abs(torch.log(ratio))  # log(1)=0 is optimal
+                consist_loss += ratio_loss
+        
+        return frag_bce + 0.2 * (consist_loss / batch_size)
+    
+    mech_loss = fragment_consistency_loss(y_pred, fragment_pred, fragment_true)
+    
+    # Integrate loss components
+    total_loss = w1 * w_loss + w2 * pattern_loss + w3 * rank_loss + w4 * mech_loss
+    
+    return total_loss
 
-def combined_loss(y_pred, y_true, fragment_pred=None, fragment_true=None, 
-                 alpha=0.2, beta=0.6, epsilon=0.2):
-    """高速化された損失関数"""
-    # バッチサイズのチェックと調整
-    if y_pred.shape[0] != y_true.shape[0]:
-        min_batch_size = min(y_pred.shape[0], y_true.shape[0])
-        y_pred = y_pred[:min_batch_size]
-        y_true = y_true[:min_batch_size]
-    
-    # 特徴数のチェックと調整
-    if y_pred.shape[1] != y_true.shape[1]:
-        min_size = min(y_pred.shape[1], y_true.shape[1])
-        y_pred = y_pred[:, :min_size]
-        y_true = y_true[:, :min_size]
-    
-    # 1. MSE損失（ピーク重視）
-    peak_mask = (y_true > 0).float()
-    mse_weights = peak_mask * 10.0 + 1.0
-    
-    # 重要なm/z値にさらに重みを付ける
-    for mz in IMPORTANT_MZ:
-        if mz < y_true.size(1):
-            mse_weights[:, mz] *= 3.0
-    
-    mse_loss = torch.mean(mse_weights * (y_pred - y_true) ** 2)
-    
-    # 2. コサイン類似度損失
-    cosine_loss = cosine_similarity_loss(y_pred, y_true, important_mz=IMPORTANT_MZ)
-    
-    # 主要な損失関数の組み合わせ
-    main_loss = alpha * mse_loss + beta * cosine_loss
-    
-    # フラグメントパターン予測がある場合
-    if fragment_pred is not None and fragment_true is not None:
-        if fragment_pred.shape[0] != fragment_true.shape[0]:
-            min_batch_size = min(fragment_pred.shape[0], fragment_true.shape[0])
-            fragment_pred = fragment_pred[:min_batch_size]
-            fragment_true = fragment_true[:min_batch_size]
-        
-        fragment_loss = F.binary_cross_entropy_with_logits(fragment_pred, fragment_true)
-        return main_loss + epsilon * fragment_loss
-    
-    return main_loss
-
-# ===== トレーニングと評価関数 =====
+# ===== Training and Evaluation Functions =====
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, device, num_epochs,
                eval_interval=2, patience=10, grad_clip=1.0, checkpoint_dir=CHECKPOINT_DIR):
-    """最適化されたモデルのトレーニング（チェックポイント機能付き）"""
+    """Optimized model training with checkpointing"""
     train_losses = []
     val_losses = []
     val_cosine_similarities = []
@@ -1423,10 +1454,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     early_stopping_counter = 0
     start_epoch = 0
     
-    # チェックポイントディレクトリの作成
+    # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)
     
-    # 既存のチェックポイントがあれば読み込む
+    # Load existing checkpoint if available
     latest_checkpoint = None
     for file in os.listdir(checkpoint_dir):
         if file.startswith("checkpoint_epoch_") and file.endswith(".pth"):
@@ -1440,13 +1471,13 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     
     if latest_checkpoint:
         checkpoint_path = os.path.join(checkpoint_dir, latest_checkpoint)
-        logger.info(f"チェックポイントを読み込み: {checkpoint_path}")
+        logger.info(f"Loading checkpoint: {checkpoint_path}")
         try:
             checkpoint = torch.load(checkpoint_path, map_location=device)
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             
-            # 最適化情報を明示的にデバイスに移動
+            # Explicitly move optimizer states to device
             for state in optimizer.state.values():
                 for k, v in state.items():
                     if isinstance(v, torch.Tensor):
@@ -1457,62 +1488,62 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             val_cosine_similarities = checkpoint.get('val_cosine_similarities', [])
             best_cosine = checkpoint.get('best_cosine', 0.0)
             early_stopping_counter = checkpoint.get('early_stopping_counter', 0)
-            start_epoch = checkpoint['epoch'] + 1  # 次のエポックから開始
+            start_epoch = checkpoint['epoch'] + 1  # Start from next epoch
             
-            # スケジューラの復元
+            # Restore scheduler
             if 'scheduler_state_dict' in checkpoint and scheduler is not None:
                 try:
                     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 except:
-                    logger.warning("スケジューラの状態を復元できませんでした")
+                    logger.warning("Could not restore scheduler state")
                     
-            # メモリクリーンアップ
+            # Memory cleanup
             del checkpoint
             aggressive_memory_cleanup()
         except Exception as e:
-            logger.error(f"チェックポイント読み込みエラー: {e}")
+            logger.error(f"Checkpoint loading error: {e}")
             start_epoch = 0
     
-    # モデルをデバイスに明示的に転送
+    # Explicitly move model to device
     model = model.to(device)
     
-    # 合計バッチ数の計算
+    # Calculate total batches
     total_steps = len(train_loader) * (num_epochs - start_epoch)
-    logger.info(f"トレーニング開始: 総ステップ数 = {total_steps}, 開始エポック = {start_epoch + 1}")
+    logger.info(f"Training start: Total steps = {total_steps}, Starting epoch = {start_epoch + 1}")
     
-    # バッチ処理中の定期的なメモリ管理
+    # Periodic memory management during batch processing
     total_batches = len(train_loader)
-    memory_check_interval = max(1, total_batches // 10)  # 10回程度チェック
+    memory_check_interval = max(1, total_batches // 10)  # Check about 10 times
     
     for epoch in range(start_epoch, num_epochs):
-        # 4エポックごとに強力なメモリクリーンアップを実行
+        # Run aggressive memory cleanup every 4 epochs
         if epoch % 4 == 0:
-            logger.info(f"Epoch {epoch+1}/{num_epochs} - 定期的なメモリクリーンアップを実行")
+            logger.info(f"Epoch {epoch+1}/{num_epochs} - Running periodic memory cleanup")
             aggressive_memory_cleanup(force_sync=True, purge_cache=True)
         
-        # 訓練モード
+        # Training mode
         model.train()
         epoch_loss = 0
         batch_count = 0
         
-        # プログレスバーで進捗管理
+        # Progress bar for monitoring
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", position=0, leave=True)
         
         for batch_idx, batch in enumerate(train_pbar):
             try:
-                # 定期的なメモリチェック
+                # Periodic memory check
                 if batch_idx % memory_check_interval == 0:
                     memory_cleared = aggressive_memory_cleanup(percent=80)
                     if memory_cleared and batch_idx > 0:
-                        logger.info("メモリ使用量を削減しました")
+                        logger.info("Reduced memory usage")
                 
-                # データをGPUに転送
+                # Transfer data to GPU
                 processed_batch = {}
                 for k, v in batch.items():
                     if isinstance(v, torch.Tensor):
                         processed_batch[k] = v.to(device, non_blocking=True)
                     elif k == 'graph':
-                        # グラフデータは別途処理
+                        # Process graph data separately
                         v.x = v.x.to(device, non_blocking=True)
                         v.edge_index = v.edge_index.to(device, non_blocking=True)
                         v.edge_attr = v.edge_attr.to(device, non_blocking=True)
@@ -1523,51 +1554,54 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                     else:
                         processed_batch[k] = v
                 
-                # 勾配をゼロに初期化
-                optimizer.zero_grad(set_to_none=True)  # メモリ効率のためNoneに設定
+                # Zero gradients
+                optimizer.zero_grad(set_to_none=True)  # Set to None for memory efficiency
                 
-                # 順伝播（AMPなし）
+                # Forward pass
                 output, fragment_pred = model(processed_batch)
-                loss = criterion(output, processed_batch['spec'], fragment_pred, processed_batch['fragment_pattern'])
+                loss = criterion(output, processed_batch['spec'], 
+                                fragment_pred, processed_batch['fragment_pattern'],
+                                processed_batch.get('graph', None), 
+                                processed_batch.get('prec_mz_bin', None))
                 
-                # 逆伝播
+                # Backward pass
                 loss.backward()
                 
-                # 勾配クリッピング
+                # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
                 
-                # オプティマイザステップ
+                # Optimizer step
                 optimizer.step()
                 
-                # OneCycleLRスケジューラーの更新
+                # Update OneCycleLR scheduler
                 if isinstance(scheduler, torch.optim.lr_scheduler.OneCycleLR):
                     scheduler.step()
                 
-                # 損失を追跡
+                # Track loss
                 current_loss = loss.item()
                 epoch_loss += current_loss
                 batch_count += 1
                 
-                # プログレスバーの更新
+                # Update progress bar
                 train_pbar.set_postfix({
                     'loss': f"{current_loss:.4f}",
                     'avg_loss': f"{epoch_loss/batch_count:.4f}",
                     'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
                 })
                 
-                # バッチごとにメモリ解放
+                # Free memory after each batch
                 del loss, output, fragment_pred, processed_batch
                 torch.cuda.empty_cache()
                 
-                # 非常に大規模なデータセットでは定期的にキャッシュをクリア
+                # For very large datasets, periodically clear cache
                 if len(train_loader.dataset) > 100000 and batch_idx % (memory_check_interval * 2) == 0:
                     if hasattr(train_loader.dataset, 'graph_cache'):
-                        # キャッシュサイズが大きくなりすぎたらクリア
+                        # Clear cache if it gets too large
                         if len(train_loader.dataset.graph_cache) > 5000:
                             train_loader.dataset.graph_cache.clear()
                             gc.collect()
                 
-                # バッチチェックポイント（1000バッチごと）
+                # Batch checkpoint (every 1000 batches)
                 if (batch_idx + 1) % 1000 == 0:
                     batch_checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch+1}_batch_{batch_idx+1}.pth")
                     torch.save({
@@ -1582,28 +1616,28 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                         'best_cosine': best_cosine,
                         'early_stopping_counter': early_stopping_counter
                     }, batch_checkpoint_path)
-                    logger.info(f"バッチチェックポイントを保存: {batch_checkpoint_path}")
+                    logger.info(f"Saved batch checkpoint: {batch_checkpoint_path}")
             
             except RuntimeError as e:
                 if "CUDA out of memory" in str(e):
-                    logger.error(f"CUDAメモリ不足: {str(e)}")
-                    # 緊急メモリクリーンアップ
+                    logger.error(f"CUDA out of memory: {str(e)}")
+                    # Emergency memory cleanup
                     aggressive_memory_cleanup(force_sync=True, purge_cache=True)
                     continue
                 else:
-                    print(f"バッチ処理エラー: {str(e)}")
-                    # スタックトレースを出力（デバッグに役立つ）
+                    print(f"Batch processing error: {str(e)}")
+                    # Print stack trace (useful for debugging)
                     import traceback
                     traceback.print_exc()
                     continue
         
-        # エポック終了時の評価
+        # End of epoch evaluation
         if batch_count > 0:
             avg_train_loss = epoch_loss / batch_count
             train_losses.append(avg_train_loss)
-            logger.info(f"Epoch {epoch+1}/{num_epochs} - 平均訓練損失: {avg_train_loss:.4f}")
+            logger.info(f"Epoch {epoch+1}/{num_epochs} - Average training loss: {avg_train_loss:.4f}")
             
-            # エポックチェックポイントの保存
+            # Save epoch checkpoint
             checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pth")
             torch.save({
                 'epoch': epoch,
@@ -1616,14 +1650,14 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 'best_cosine': best_cosine,
                 'early_stopping_counter': early_stopping_counter
             }, checkpoint_path)
-            logger.info(f"エポックチェックポイントを保存: {checkpoint_path}")
+            logger.info(f"Saved epoch checkpoint: {checkpoint_path}")
             
-            # 定期的な検証（すべてのエポックで行わない）
+            # Periodic validation (not every epoch)
             if (epoch + 1) % eval_interval == 0 or epoch == num_epochs - 1:
-                # 評価前にメモリクリーンアップ
+                # Memory cleanup before evaluation
                 aggressive_memory_cleanup()
                 
-                # 評価モードで検証
+                # Evaluate in evaluation mode
                 val_metrics = evaluate_model(model, val_loader, criterion, device)
                 val_loss = val_metrics['loss']
                 cosine_sim = val_metrics['cosine_similarity']
@@ -1631,55 +1665,55 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 val_losses.append(val_loss)
                 val_cosine_similarities.append(cosine_sim)
                 
-                logger.info(f"Epoch {epoch+1}/{num_epochs} - 検証損失: {val_loss:.4f}, "
-                            f"コサイン類似度: {cosine_sim:.4f}")
+                logger.info(f"Epoch {epoch+1}/{num_epochs} - Validation loss: {val_loss:.4f}, "
+                            f"Cosine similarity: {cosine_sim:.4f}")
                 
-                # ReduceLROnPlateauスケジューラーの更新
+                # Update ReduceLROnPlateau scheduler
                 if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                     scheduler.step(val_loss)
                 
-                # 最良モデルの保存
+                # Save best model
                 if cosine_sim > best_cosine:
                     best_cosine = cosine_sim
                     early_stopping_counter = 0
                     best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
                     torch.save(model.state_dict(), best_model_path)
-                    logger.info(f"新しい最良モデル保存: コサイン類似度 = {cosine_sim:.4f}")
+                    logger.info(f"Saved new best model: Cosine similarity = {cosine_sim:.4f}")
                 else:
                     early_stopping_counter += 1
-                    logger.info(f"早期停止カウンター: {early_stopping_counter}/{patience}")
+                    logger.info(f"Early stopping counter: {early_stopping_counter}/{patience}")
                     
-                # 早期停止
+                # Early stopping
                 if early_stopping_counter >= patience:
-                    logger.info(f"早期停止: {epoch+1}エポック後")
+                    logger.info(f"Early stopping after {epoch+1} epochs")
                     break
             
-            # 学習中の損失推移をプロットして保存（5エポックごと）
+            # Plot learning curves (every 5 epochs)
             if (epoch + 1) % 5 == 0:
                 try:
                     plot_training_progress(train_losses, val_losses, val_cosine_similarities, best_cosine)
                 except Exception as e:
-                    logger.error(f"プロット作成エラー: {str(e)}")
+                    logger.error(f"Plot creation error: {str(e)}")
         else:
-            logger.warning("このエポックで成功したバッチ処理がありません。")
+            logger.warning("No successful batch processing in this epoch.")
             train_losses.append(float('inf'))
             
-    # 最終的な学習曲線の保存
+    # Save final learning curves
     try:
         plot_training_progress(train_losses, val_losses, val_cosine_similarities, best_cosine)
     except Exception as e:
-        logger.error(f"最終プロット作成エラー: {str(e)}")
+        logger.error(f"Final plot creation error: {str(e)}")
     
     return train_losses, val_losses, val_cosine_similarities, best_cosine
 
 def plot_training_progress(train_losses, val_losses, val_cosine_similarities, best_cosine):
-    """トレーニング進捗の可視化"""
+    """Visualize training progress"""
     plt.figure(figsize=(12, 5))
     
     plt.subplot(1, 2, 1)
     plt.plot(train_losses, label='Training Loss')
-    if val_losses:  # 検証損失が存在する場合
-        # エポック間隔を調整
+    if val_losses:  # If validation losses exist
+        # Adjust epoch intervals
         val_epochs = np.linspace(0, len(train_losses)-1, len(val_losses))
         plt.plot(val_epochs, val_losses, label='Validation Loss')
     plt.xlabel('Epoch')
@@ -1688,7 +1722,7 @@ def plot_training_progress(train_losses, val_losses, val_cosine_similarities, be
     plt.title('Loss Curves')
     
     plt.subplot(1, 2, 2)
-    if val_cosine_similarities:  # コサイン類似度が存在する場合
+    if val_cosine_similarities:  # If cosine similarities exist
         val_epochs = np.linspace(0, len(train_losses)-1, len(val_cosine_similarities))
         plt.plot(val_epochs, val_cosine_similarities, label='Validation Cosine Similarity')
         plt.axhline(y=best_cosine, color='r', linestyle='--', label=f'Best: {best_cosine:.4f}')
@@ -1702,11 +1736,11 @@ def plot_training_progress(train_losses, val_losses, val_cosine_similarities, be
     plt.close()
 
 def visualize_results(test_results, num_samples=10):
-    """テスト結果の可視化（離散化予測を含む）"""
-    # 1つの大きな図に全サンプルをまとめる
+    """Visualize test results (including discretized predictions)"""
+    # Create a large figure with all samples
     plt.figure(figsize=(16, num_samples*4))
     
-    # サンプルのインデックスをランダムに選択
+    # Randomly select sample indices
     if 'mol_ids' in test_results and len(test_results['mol_ids']) > 0:
         sample_indices = np.random.choice(len(test_results['mol_ids']), 
                                          min(num_samples, len(test_results['mol_ids'])), 
@@ -1717,46 +1751,46 @@ def visualize_results(test_results, num_samples=10):
                                          replace=False)
     
     for i, idx in enumerate(sample_indices):
-        # 類似度を計算
+        # Calculate similarity
         true_vector = test_results['y_true'][idx].reshape(1, -1).cpu().numpy()
         discrete_vector = test_results['y_pred_discrete'][idx].reshape(1, -1).cpu().numpy()
         discrete_sim = cosine_similarity(true_vector, discrete_vector)[0][0]
         
-        # 1. 真のスペクトル
+        # 1. True spectrum
         plt.subplot(num_samples, 2, 2*i + 1)
         true_spec = test_results['y_true'][idx].numpy()
         
-        # 原スペクトルを相対強度（%）に変換
+        # Convert original spectrum to relative intensity (%)
         if np.max(true_spec) > 0:
             true_spec = true_spec / np.max(true_spec) * 100
         
-        # 非ゼロの位置を強調
+        # Highlight non-zero positions
         nonzero_indices = np.nonzero(true_spec)[0]
         if len(nonzero_indices) > 0:
             plt.vlines(nonzero_indices, [0] * len(nonzero_indices), 
                      true_spec[nonzero_indices], colors='b', linewidths=1)
             
-        # タイトルの設定
+        # Set title
         mol_id_str = f" - ID: {test_results['mol_ids'][idx]}" if 'mol_ids' in test_results else ""
-        plt.title(f"測定スペクトル{mol_id_str}")
+        plt.title(f"Measured Spectrum{mol_id_str}")
         plt.xlabel("m/z")
-        plt.ylabel("相対強度 (%)")
-        plt.ylim([0, 105])  # 最大値100%に少し余裕を持たせる
+        plt.ylabel("Relative Intensity (%)")
+        plt.ylim([0, 105])  # Add small margin above 100%
         
-        # 2. 離散化した予測スペクトル
+        # 2. Discretized prediction spectrum
         plt.subplot(num_samples, 2, 2*i + 2)
         discrete_spec = test_results['y_pred_discrete'][idx].numpy()
         
-        # 非ゼロの位置を強調
+        # Highlight non-zero positions
         nonzero_indices = np.nonzero(discrete_spec)[0]
         if len(nonzero_indices) > 0:
             plt.vlines(nonzero_indices, [0] * len(nonzero_indices), 
                      discrete_spec[nonzero_indices], colors='g', linewidths=1)
             
-        plt.title(f"予測スペクトル - 類似度: {discrete_sim:.4f}")
+        plt.title(f"Predicted Spectrum - Similarity: {discrete_sim:.4f}")
         plt.xlabel("m/z")
-        plt.ylabel("相対強度 (%)")
-        plt.ylim([0, 105])  # 最大値100%に少し余裕を持たせる
+        plt.ylabel("Relative Intensity (%)")
+        plt.ylim([0, 105])  # Add small margin above 100%
     
     plt.tight_layout()
     plt.savefig('dmpnn_spectrum_comparison.png')
@@ -1765,19 +1799,19 @@ def visualize_results(test_results, num_samples=10):
 def tiered_training(model, train_ids, val_loader, criterion, optimizer, scheduler, device, 
                   mol_files_path, msp_data, transform, normalization, cache_dir, 
                   checkpoint_dir=CHECKPOINT_DIR, batch_size=16, patience=5):
-    """段階的トレーニング（大規模データセット用）"""
-    logger.info("段階的トレーニングを開始")
+    """Tiered training for large datasets"""
+    logger.info("Starting tiered training")
     
-    # データセットサイズに基づくティア定義
+    # Define tiers based on dataset size
     if len(train_ids) > 100000:
         train_tiers = [
-            train_ids[:10000],    # 1万サンプルから開始
-            train_ids[:30000],    # 次に3万
-            train_ids[:60000],    # 次に6万
-            train_ids[:100000],   # 次に10万
-            train_ids             # 最後に全データ
+            train_ids[:10000],    # Start with 10k samples
+            train_ids[:30000],    # Then 30k
+            train_ids[:60000],    # Then 60k
+            train_ids[:100000],   # Then 100k
+            train_ids             # Finally all data
         ]
-        tier_epochs = [3, 3, 3, 3, 3]  # ティアごとのエポック数
+        tier_epochs = [3, 3, 3, 3, 3]  # Epochs per tier
     elif len(train_ids) > 50000:
         train_tiers = [
             train_ids[:10000], 
@@ -1786,7 +1820,7 @@ def tiered_training(model, train_ids, val_loader, criterion, optimizer, schedule
         ]
         tier_epochs = [3, 4, 8]
     else:
-        # 小さなデータセットは段階を少なく
+        # Fewer tiers for smaller datasets
         train_tiers = [
             train_ids[:5000] if len(train_ids) > 5000 else train_ids[:len(train_ids)//2],
             train_ids
@@ -1798,58 +1832,58 @@ def tiered_training(model, train_ids, val_loader, criterion, optimizer, schedule
     all_val_losses = []
     all_val_cosine_similarities = []
     
-    # 進行状況を表示するために各ティアにプレフィックスを追加
+    # Add prefix to each tier for progress reporting
     tier_prefixes = [f"Tier {i+1}/{len(train_tiers)}" for i in range(len(train_tiers))]
     
-    # 各ティアを処理
+    # Process each tier
     for tier_idx, (tier_ids, tier_prefix) in enumerate(zip(train_tiers, tier_prefixes)):
-        tier_name = f"{tier_prefix} ({len(tier_ids)} サンプル)"
-        logger.info(f"=== {tier_name} のトレーニングを開始 ===")
+        tier_name = f"{tier_prefix} ({len(tier_ids)} samples)"
+        logger.info(f"=== Starting training for {tier_name} ===")
         
-        # ティア間でメモリクリーンアップ
+        # Memory cleanup between tiers
         aggressive_memory_cleanup(force_sync=True, purge_cache=True)
         
-        # このティア用のデータセット作成
+        # Create dataset for this tier
         tier_dataset = DMPNNMoleculeDataset(
             tier_ids, mol_files_path, msp_data, 
             transform=transform, normalization=normalization,
             augment=True, cache_dir=cache_dir
         )
         
-        # ティアサイズに基づいてバッチサイズを調整
+        # Adjust batch size based on tier size
         if len(tier_ids) <= 10000:
-            tier_batch_size = batch_size  # 小さいティアでは指定のバッチサイズ
+            tier_batch_size = batch_size  # Specified batch size for small tiers
         elif len(tier_ids) <= 30000:
-            tier_batch_size = max(8, batch_size // 2)  # 中間ティア
+            tier_batch_size = max(8, batch_size // 2)  # Medium tiers
         elif len(tier_ids) <= 60000:
-            tier_batch_size = max(4, batch_size // 3)  # 大きいティア
+            tier_batch_size = max(4, batch_size // 3)  # Large tiers
         else:
-            tier_batch_size = max(2, batch_size // 4)  # 非常に大きいティア
+            tier_batch_size = max(2, batch_size // 4)  # Very large tiers
         
-        logger.info(f"ティア {tier_idx+1} のバッチサイズ: {tier_batch_size}")
+        logger.info(f"Tier {tier_idx+1} batch size: {tier_batch_size}")
         
-        # このティア用のデータローダを作成
+        # Create data loader for this tier
         tier_loader = DataLoader(
             tier_dataset, 
             batch_size=tier_batch_size,
             shuffle=True, 
             collate_fn=collate_batch,
-            num_workers=0,  # シングルプロセス
+            num_workers=0,  # Single process
             pin_memory=True,
             drop_last=True
         )
         
-        # オプティマイザの学習率を調整
+        # Adjust optimizer learning rate
         for param_group in optimizer.param_groups:
             if tier_idx == 0:
-                param_group['lr'] = 0.001  # 小さいデータセット用に高い学習率
+                param_group['lr'] = 0.001  # Higher learning rate for small datasets
             else:
-                param_group['lr'] = 0.0008 * (0.8 ** tier_idx)  # 大きいティア向けに学習率を減少
+                param_group['lr'] = 0.0008 * (0.8 ** tier_idx)  # Decrease learning rate for larger tiers
         
-        # このティアの忍耐値を計算（前半のティアは早く次に進む）
+        # Calculate patience for this tier (earlier tiers progress faster)
         tier_patience = max(2, patience // 2) if tier_idx < len(train_tiers) - 1 else patience
         
-        # このティア用のスケジューラを作成（OneCycleLR）
+        # Create scheduler for this tier (OneCycleLR)
         steps_per_epoch = len(tier_loader)
         tier_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
@@ -1861,7 +1895,7 @@ def tiered_training(model, train_ids, val_loader, criterion, optimizer, schedule
             final_div_factor=100.0
         )
         
-        # 指定されたエポック数でこのティアをトレーニング
+        # Train this tier for specified epochs
         train_losses, val_losses, val_cosine_similarities, tier_best_cosine = train_model(
             model=model,
             train_loader=tier_loader,
@@ -1871,93 +1905,93 @@ def tiered_training(model, train_ids, val_loader, criterion, optimizer, schedule
             scheduler=tier_scheduler,
             device=device,
             num_epochs=tier_epochs[tier_idx],
-            eval_interval=1,  # 毎エポック評価
+            eval_interval=1,  # Evaluate every epoch
             patience=tier_patience,
             grad_clip=1.0,
             checkpoint_dir=os.path.join(checkpoint_dir, f"tier{tier_idx+1}")
         )
         
-        # 全体の最良性能を更新
+        # Update overall best performance
         best_cosine = max(best_cosine, tier_best_cosine)
         
-        # 損失と類似度を記録
+        # Record losses and similarities
         all_train_losses.extend(train_losses)
         all_val_losses.extend(val_losses)
         all_val_cosine_similarities.extend(val_cosine_similarities)
         
-        # ティア間でキャッシュをクリア
+        # Clear cache between tiers
         aggressive_memory_cleanup(force_sync=True, purge_cache=True)
         del tier_dataset, tier_loader
         gc.collect()
         torch.cuda.empty_cache()
         
-        # ティアチェックポイントを保存
+        # Save tier checkpoint
         tier_checkpoint_path = os.path.join(checkpoint_dir, f"tier{tier_idx+1}_model.pth")
         torch.save(model.state_dict(), tier_checkpoint_path)
-        logger.info(f"ティア {tier_idx+1} チェックポイント保存: {tier_checkpoint_path}")
+        logger.info(f"Saved tier {tier_idx+1} checkpoint: {tier_checkpoint_path}")
         
-        # ティア間でシステムのメモリを安定化
-        logger.info(f"ティア {tier_idx+1} 完了、次のティアの前にメモリを安定化")
-        time.sleep(5)  # 短い休憩を入れてシステムを安定化
+        # Stabilize system memory between tiers
+        logger.info(f"Tier {tier_idx+1} complete, stabilizing memory before next tier")
+        time.sleep(5)  # Short break to stabilize system
     
-    # 全ティアの学習曲線を保存
+    # Save learning curves for all tiers
     try:
         final_plot_path = os.path.join(checkpoint_dir, "tiered_learning_curves.png")
         plot_training_progress(all_train_losses, all_val_losses, all_val_cosine_similarities, 
                               best_cosine)
-        logger.info(f"段階的トレーニングの学習曲線を保存: {final_plot_path}")
+        logger.info(f"Saved tiered training learning curves: {final_plot_path}")
     except Exception as e:
-        logger.error(f"プロット作成エラー: {str(e)}")
+        logger.error(f"Plot creation error: {str(e)}")
     
     return all_train_losses, all_val_losses, all_val_cosine_similarities, best_cosine
 
-# ===== メイン関数 =====
+# ===== Main Function =====
 def main():
-    """メイン関数：データ読み込み、モデル作成、トレーニング、評価を実行"""
-    # 開始メッセージ
-    logger.info("============= DMPNN質量スペクトル予測モデルの実行開始 =============")
+    """Main function: Load data, create model, train, evaluate"""
+    # Start message
+    logger.info("============= Starting DMPNN Mass Spectrum Prediction Model =============")
     
-    # CUDA設定
-    torch.backends.cudnn.benchmark = True  # CUDNN最適化を有効化
+    # CUDA settings
+    torch.backends.cudnn.benchmark = True  # Enable CUDNN optimization
     
-    # GPUメモリ使用状況を確認
+    # Check GPU memory usage
     if torch.cuda.is_available():
-        logger.info(f"使用中のGPU: {torch.cuda.get_device_name(0)}")
-        logger.info(f"GPU総メモリ: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
-        logger.info(f"利用可能メモリ: {torch.cuda.mem_get_info()[0] / 1024**3:.2f} GB")
+        logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        logger.info(f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+        logger.info(f"Available memory: {torch.cuda.mem_get_info()[0] / 1024**3:.2f} GB")
     
-    # MSPファイルを解析（キャッシュ対応）
-    logger.info("MSPファイルを解析中...")
+    # Parse MSP file (with caching)
+    logger.info("Parsing MSP file...")
     msp_data = parse_msp_file(MSP_FILE_PATH, cache_dir=CACHE_DIR)
-    logger.info(f"MSPファイルから{len(msp_data)}個の化合物データを読み込みました")
+    logger.info(f"Loaded {len(msp_data)} compound data from MSP file")
     
-    # 利用可能なMOLファイルを確認
+    # Check available MOL files
     mol_ids = []
     mol_files = os.listdir(MOL_FILES_PATH)
-    logger.info(f"MOLファイル総数: {len(mol_files)}")
+    logger.info(f"Total MOL files: {len(mol_files)}")
     
-    # キャッシュファイルのパス
+    # Cache file path
     mol_id_cache_file = os.path.join(CACHE_DIR, "dmpnn_valid_mol_ids.pkl")
     
-    # キャッシュが存在するか確認
+    # Check if cache exists
     if os.path.exists(mol_id_cache_file):
-        logger.info(f"キャッシュからmol_idsを読み込み中: {mol_id_cache_file}")
+        logger.info(f"Loading mol_ids from cache: {mol_id_cache_file}")
         with open(mol_id_cache_file, 'rb') as f:
             mol_ids = pickle.load(f)
-        logger.info(f"キャッシュから{len(mol_ids)}個の有効なmol_idsを読み込みました")
+        logger.info(f"Loaded {len(mol_ids)} valid mol_ids from cache")
     else:
-        # 複数のチャンクで処理して進捗表示
+        # Process in multiple chunks with progress display
         chunk_size = 5000
         for i in range(0, len(mol_files), chunk_size):
             chunk = mol_files[i:min(i+chunk_size, len(mol_files))]
-            logger.info(f"MOLファイル処理中: {i+1}-{i+len(chunk)}/{len(mol_files)}")
+            logger.info(f"Processing MOL files: {i+1}-{i+len(chunk)}/{len(mol_files)}")
             
             for filename in chunk:
                 if filename.startswith("ID") and filename.endswith(".MOL"):
                     try:
                         mol_id = int(filename[2:-4])  # "ID300001.MOL" → 300001
                         if mol_id in msp_data:
-                            # 非金属以外の原子を含むかチェック
+                            # Check for non-metal atoms
                             mol_file = os.path.join(MOL_FILES_PATH, filename)
                             mol = Chem.MolFromMolFile(mol_file, sanitize=False)
                             if mol is not None and not contains_metal(mol):
@@ -1965,26 +1999,26 @@ def main():
                     except:
                         continue
                         
-        # キャッシュに保存            
-        logger.info(f"mol_idsをキャッシュに保存中: {mol_id_cache_file} (合計: {len(mol_ids)}件)")
+        # Save to cache            
+        logger.info(f"Saving mol_ids to cache: {mol_id_cache_file} (Total: {len(mol_ids)})")
         with open(mol_id_cache_file, 'wb') as f:
             pickle.dump(mol_ids, f)
     
-    logger.info(f"MOLファイルとMSPデータが揃っている非金属化合物: {len(mol_ids)}個")
+    logger.info(f"Non-metal compounds with both MOL and MSP data: {len(mol_ids)}")
     
-    # データ分割 (訓練:検証:テスト = 80:10:10)
+    # Data split (train:validation:test = 80:10:10)
     train_ids, test_ids = train_test_split(mol_ids, test_size=0.2, random_state=42)
     val_ids, test_ids = train_test_split(test_ids, test_size=0.5, random_state=42)
     
-    logger.info(f"訓練データ: {len(train_ids)}個")
-    logger.info(f"検証データ: {len(val_ids)}個")
-    logger.info(f"テストデータ: {len(test_ids)}個")
+    logger.info(f"Training data: {len(train_ids)}")
+    logger.info(f"Validation data: {len(val_ids)}")
+    logger.info(f"Test data: {len(test_ids)}")
     
-    # ハイパーパラメータ
-    transform = "log10over3"  # スペクトル変換タイプ
-    normalization = "l1"      # 正規化タイプ
+    # Hyperparameters
+    transform = "log10over3"  # Spectrum transformation type
+    normalization = "l1"      # Normalization type
     
-    # データセット作成 - 段階的トレーニングを使用するため訓練データセットは後で作成
+    # Create datasets - train dataset will be created later for tiered training
     val_dataset = DMPNNMoleculeDataset(
         val_ids, MOL_FILES_PATH, msp_data,
         transform=transform, normalization=normalization,
@@ -1997,26 +2031,26 @@ def main():
         augment=False, cache_dir=CACHE_DIR
     )
     
-    logger.info(f"有効な検証データ: {len(val_dataset)}個")
-    logger.info(f"有効なテストデータ: {len(test_dataset)}個")
+    logger.info(f"Valid validation data: {len(val_dataset)}")
+    logger.info(f"Valid test data: {len(test_dataset)}")
     
-    # GPU使用量を最適化するためのバッチサイズ調整
+    # Optimize batch size based on GPU memory usage
     if len(train_ids) > 100000:
-        batch_size = 8  # 非常に大きなデータセット用
+        batch_size = 8  # For very large datasets
     elif len(train_ids) > 50000:
-        batch_size = 12  # 大きなデータセット用
+        batch_size = 12  # For large datasets
     else:
-        batch_size = 16  # 通常サイズのデータセット用
+        batch_size = 16  # For normal sized datasets
         
-    logger.info(f"バッチサイズ: {batch_size}")
+    logger.info(f"Batch size: {batch_size}")
     
-    # データローダー作成 - 段階的トレーニングのため訓練ローダーは作成しない
+    # Create data loaders - train loader will be created during tiered training
     val_loader = DataLoader(
         val_dataset, 
         batch_size=batch_size,
         shuffle=False, 
         collate_fn=collate_batch,
-        num_workers=0,  # シングルプロセス
+        num_workers=0,  # Single process
         pin_memory=True,
         drop_last=True
     )
@@ -2026,73 +2060,73 @@ def main():
         batch_size=batch_size,
         shuffle=False, 
         collate_fn=collate_batch,
-        num_workers=0,  # シングルプロセス
+        num_workers=0,  # Single process
         pin_memory=True,
         drop_last=True
     )
     
-    # モデルの次元を決定
+    # Determine model dimensions
     sample = val_dataset[0]
     node_fdim = sample['graph_data'].x.shape[1]
     edge_fdim = sample['graph_data'].edge_attr.shape[1]
     
-    # データセットサイズに基づいて次元を調整
+    # Adjust dimensions based on dataset size
     if len(train_ids) > 100000:
-        hidden_size = 64  # 非常に大きなデータセット用に縮小
+        hidden_size = 64  # Reduced size for very large datasets
     else:
-        hidden_size = 128  # 通常サイズのデータセット用
+        hidden_size = 128  # Normal size for regular datasets
         
     out_channels = MAX_MZ
     
-    # モデルの初期化前にメモリ確保
+    # Memory allocation before model initialization
     aggressive_memory_cleanup(force_sync=True, purge_cache=True)
     
-    # デバイスの設定
+    # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"使用デバイス: {device}")
+    logger.info(f"Using device: {device}")
     
-    # モデルの初期化
+    # Initialize model
     model = DMPNNMSPredictor(
         node_fdim=node_fdim,
         edge_fdim=edge_fdim,
         hidden_size=hidden_size,
-        depth=3,  # DMPNNの深さ
+        depth=3,  # DMPNN depth
         output_dim=out_channels,
         global_features_dim=16,
         num_fragments=NUM_FRAGS,
-        bidirectional=True,     # 双方向予測を使用
-        gate_prediction=True,   # ゲート予測を使用
-        prec_mass_offset=10     # 前駆体質量オフセット
+        bidirectional=True,     # Use bidirectional prediction
+        gate_prediction=True,   # Use gate prediction
+        prec_mass_offset=10     # Precursor mass offset
     ).to(device)
     
-    # 総パラメータ数の計算
+    # Calculate total parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"総パラメータ数: {total_params:,}")
-    logger.info(f"学習可能パラメータ数: {trainable_params:,}")
+    logger.info(f"Total parameters: {total_params:,}")
+    logger.info(f"Trainable parameters: {trainable_params:,}")
     
-    # 損失関数、オプティマイザー、スケジューラーの設定
-    criterion = combined_loss
+    # Loss function, optimizer, scheduler
+    criterion = dmpnn_optimized_spectrum_loss  # Using our new optimized loss function
     optimizer = torch.optim.AdamW(
         model.parameters(), 
-        lr=0.001,       # 初期学習率
-        weight_decay=1e-6,  # 重み減衰
-        eps=1e-8        # 数値安定性用
+        lr=0.001,       # Initial learning rate
+        weight_decay=1e-6,  # Weight decay
+        eps=1e-8        # For numerical stability
     )
     
-    # ダミースケジューラー（段階的トレーニングでは各ティアで再定義）
+    # Dummy scheduler (will be redefined for each tier in tiered training)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
     
-    # エポック数とその他のトレーニングパラメータ
-    patience = 7     # 忍耐値
+    # Training parameters
+    patience = 7     # Patience value
     
-    logger.info(f"モデルトレーニング設定: 忍耐値={patience}, バッチサイズ={batch_size}")
-    logger.info("段階的トレーニングを使用してモデルのトレーニングを開始します...")
+    logger.info(f"Model training settings: patience={patience}, batch_size={batch_size}")
+    logger.info("Starting model training using tiered approach...")
     
-    # CPU、GPUキャッシュをクリア
+    # Clear CPU, GPU cache
     aggressive_memory_cleanup(force_sync=True, purge_cache=True)
     
-    # 段階的トレーニングを使用
+    # Use tiered training
     train_losses, val_losses, val_cosine_similarities, best_cosine = tiered_training(
         model=model,
         train_ids=train_ids,
@@ -2111,114 +2145,57 @@ def main():
         patience=patience
     )
     
-    logger.info(f"トレーニング完了！ 最良コサイン類似度: {best_cosine:.4f}")
+    logger.info(f"Training complete! Best cosine similarity: {best_cosine:.4f}")
     
-    # キャッシュクリア
+    # Clear cache
     aggressive_memory_cleanup(force_sync=True, purge_cache=True)
     
-    # 最良モデルを読み込む
+    # Load best model
     try:
         best_model_path = os.path.join(CACHE_DIR, "checkpoints", 'best_model.pth')
         if not os.path.exists(best_model_path):
-            # tier5_model.pthを明示的に探す
+            # Explicitly look for tier5_model.pth
             tier5_model_path = os.path.join(CACHE_DIR, "checkpoints", "tier5_model.pth")
             if os.path.exists(tier5_model_path):
                 best_model_path = tier5_model_path
             else:
-                # tier5が無い場合は利用可能な最後のティアモデルを探す
+                # If tier5 doesn't exist, find the last available tier model
                 tier_models = [f for f in os.listdir(os.path.join(CACHE_DIR, "checkpoints")) 
                             if f.startswith("tier") and f.endswith("_model.pth")]
                 if tier_models:
-                    # 番号で並べ替えて最大のティアを選択
+                    # Sort by tier number and select the highest
                     tier_numbers = [int(m.split("tier")[1].split("_")[0]) for m in tier_models]
                     max_tier_idx = tier_numbers.index(max(tier_numbers))
                     best_model_path = os.path.join(CACHE_DIR, "checkpoints", tier_models[max_tier_idx])
         
         model.load_state_dict(torch.load(best_model_path, map_location=device))
-        logger.info(f"最良モデルを読み込みました: {best_model_path}")
+        logger.info(f"Loaded best model: {best_model_path}")
     except Exception as e:
-        logger.error(f"モデル読み込みエラー: {e}")
+        logger.error(f"Model loading error: {e}")
     
-    # テストデータでの評価
+    # Evaluation on test data
     try:
-        # テスト前にメモリ解放
+        # Free memory before testing
         aggressive_memory_cleanup(force_sync=True, purge_cache=True)
         
-        logger.info("テストデータでの評価を開始します...")
+        logger.info("Starting evaluation on test data...")
         test_results = eval_model(model, test_loader, device, transform=transform)
-        logger.info(f"テストデータ平均コサイン類似度 (元の予測): {test_results['cosine_similarity']:.4f}")
-        logger.info(f"テストデータ平均コサイン類似度 (離散化後): {test_results['discrete_cosine_similarity']:.4f}")
+        logger.info(f"Test data average cosine similarity (original prediction): {test_results['cosine_similarity']:.4f}")
+        logger.info(f"Test data average cosine similarity (after discretization): {test_results['discrete_cosine_similarity']:.4f}")
         
-        # 予測結果の可視化
+        # Visualize prediction results
         visualize_results(test_results, num_samples=10)
-        logger.info("予測結果の可視化を保存しました: dmpnn_spectrum_comparison.png")
+        logger.info("Saved prediction visualization: dmpnn_spectrum_comparison.png")
         
-        # 性能比較グラフの保存
-        plt.figure(figsize=(10, 6))
-        plt.bar(['元の予測', '離散化予測'], 
-               [test_results['cosine_similarity'], test_results['discrete_cosine_similarity']], 
-               color=['blue', 'green'])
-        plt.title('コサイン類似度の比較')
-        plt.ylabel('平均コサイン類似度')
-        plt.grid(axis='y', alpha=0.3)
-        plt.savefig('dmpnn_similarity_comparison.png')
-        plt.close()
-        logger.info("コサイン類似度比較グラフを保存しました: dmpnn_similarity_comparison.png")
+
     except Exception as e:
-        logger.error(f"テスト評価エラー: {e}")
+        logger.error(f"Test evaluation error: {e}")
         import traceback
         traceback.print_exc()
     
-    # 追加の結果分析
-    try:
-        # スムーズな予測と離散化した予測の類似度分布の比較
-        smooth_similarities = []
-        discrete_similarities = []
-        
-        for i in range(len(test_results['y_true'])):
-            true_vector = test_results['y_true'][i].reshape(1, -1).cpu().numpy()
-            
-            # スムーズな予測との類似度
-            pred_vector = test_results['y_pred'][i].reshape(1, -1).cpu().numpy()
-            smooth_sim = cosine_similarity(true_vector, pred_vector)[0][0]
-            smooth_similarities.append(smooth_sim)
-            
-            # 離散化した予測との類似度
-            discrete_vector = test_results['y_pred_discrete'][i].reshape(1, -1).cpu().numpy()
-            discrete_sim = cosine_similarity(true_vector, discrete_vector)[0][0]
-            discrete_similarities.append(discrete_sim)
-        
-        # 類似度分布のヒストグラム
-        plt.figure(figsize=(12, 6))
-        
-        plt.subplot(1, 2, 1)
-        plt.hist(smooth_similarities, bins=20, alpha=0.7, color='blue')
-        plt.axvline(x=test_results['cosine_similarity'], color='r', linestyle='--', 
-                    label=f'平均: {test_results["cosine_similarity"]:.4f}')
-        plt.xlabel('コサイン類似度')
-        plt.ylabel('サンプル数')
-        plt.title('元の予測の類似度分布')
-        plt.legend()
-        plt.grid(alpha=0.3)
-        
-        plt.subplot(1, 2, 2)
-        plt.hist(discrete_similarities, bins=20, alpha=0.7, color='green')
-        plt.axvline(x=test_results['discrete_cosine_similarity'], color='r', linestyle='--', 
-                    label=f'平均: {test_results["discrete_cosine_similarity"]:.4f}')
-        plt.xlabel('コサイン類似度')
-        plt.ylabel('サンプル数')
-        plt.title('離散化予測の類似度分布')
-        plt.legend()
-        plt.grid(alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig('dmpnn_similarity_distributions.png')
-        logger.info("類似度分布を保存しました: dmpnn_similarity_distributions.png")
-        plt.close()
-    except Exception as e:
-        logger.error(f"追加分析中にエラー: {str(e)}")
+
     
-    logger.info("============= DMPNN質量スペクトル予測モデルの実行終了 =============")
+    logger.info("============= DMPNN Mass Spectrum Prediction Model Execution Complete =============")
     return model, train_losses, val_losses, val_cosine_similarities, test_results
 
 if __name__ == "__main__":
