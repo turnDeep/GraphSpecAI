@@ -114,7 +114,12 @@ class Fragment:
         adjusted_mass = exact_mass - (hydrogen_mass * self.lost_hydrogens)
         
         # m/z値を計算（電荷で割る）
-        mz = adjusted_mass / self.charge
+        if self.charge == 0:
+            # If charge is zero, m/z is undefined. Returning 0.0 as a placeholder.
+            # A domain-specific handling might be to raise an error or return adjusted_mass.
+            mz = 0.0
+        else:
+            mz = adjusted_mass / self.charge
         
         return mz
     
@@ -158,10 +163,17 @@ class Fragment:
         
         # 1. 電子供与基/吸引基の存在をチェック
         donors = ['NH2', 'OH', 'OCH3', 'CH3']
-        acceptors = ['NO2', 'CN', 'CF3', 'COOR', 'COR']
-        
-        donor_count = sum(self.mol.HasSubstructMatch(Chem.MolFromSmarts(d)) for d in donors)
-        acceptor_count = sum(self.mol.HasSubstructMatch(Chem.MolFromSmarts(a)) for a in acceptors)
+        acceptors = ['NO2', 'CN', 'CF3', 'COOR', 'COR'] # Assuming 'COOR' and 'COR' are valid SMARTS or will be handled if not.
+                                                       # For RDKit, these might need to be more specific like '[CX3](=O)O[#6]' for COOR.
+                                                       # However, the task is to fix the None check, not validate SMARTS strings themselves.
+
+        # Pre-compile SMARTS patterns and filter out None results
+        donor_mols = [Chem.MolFromSmarts(d) for d in donors]
+        acceptor_mols = [Chem.MolFromSmarts(a) for a in acceptors]
+
+        # Sum matches only for valid Mol objects
+        donor_count = sum(self.mol.HasSubstructMatch(mol_pattern) for mol_pattern in donor_mols if mol_pattern is not None)
+        acceptor_count = sum(self.mol.HasSubstructMatch(mol_pattern) for mol_pattern in acceptor_mols if mol_pattern is not None)
         
         # 電子供与基は正イオン化を促進
         efficiency += 0.05 * donor_count
@@ -355,31 +367,58 @@ class StructureEncoder(nn.Module):
     def forward(self, data):
         """順伝播: 化学構造から潜在表現を生成"""
         # 原子特徴量をエンコード
-        atom_features = self.atom_encoder(data['atom_features'])
-        
-        # 結合特徴量をエンコード
-        bond_features = self.bond_encoder(data['bond_features'])
+        # Make sure data['atom_features'] is a tensor. It is from MoleculeData.
+        encoded_atom_features = self.atom_encoder(data['atom_features']) 
         
         # モチーフ特徴量をエンコード
-        motif_features = self.motif_encoder(data['motif_features'])
-        
-        # GCN層で原子グラフを更新
-        atom_embeddings = atom_features
-        for gcn in self.gcn_layers:
-            atom_embeddings = F.relu(gcn(atom_embeddings, data['edge_index']))
-        
-        # GIN層でモチーフグラフを更新
-        motif_embeddings = motif_features
-        for gin in self.gin_layers:
-            motif_embeddings = F.relu(gin(motif_embeddings, data['motif_edge_index']))
-        
-        # グローバルアテンション適用
-        atom_attn, _ = self.attention(atom_embeddings, atom_embeddings, atom_embeddings)
-        motif_attn, _ = self.attention(motif_embeddings, motif_embeddings, motif_embeddings)
-        
-        # グローバル表現の作成
-        atom_global = torch.mean(atom_attn, dim=0)
-        motif_global = torch.mean(motif_attn, dim=0)
+        encoded_motif_features = self.motif_encoder(data['motif_features'])
+
+        # Atom processing
+        if encoded_atom_features.shape[0] == 0:
+            atom_global = torch.zeros(self.hidden_dim, device=encoded_atom_features.device)
+        else:
+            atom_embeddings = encoded_atom_features
+            # GCN層で原子グラフを更新
+            # TODO: The current GCNConv layers do not utilize edge features (bond information from data['edge_attr']).
+            # For enhanced chemical structure representation, consider replacing GCNConv
+            # with a GNN layer that incorporates edge attributes (e.g., NNConv, GATConv with edge features, or a custom MessagePassing layer).
+            # The data['edge_attr'] is prepared by MoleculeData._build_graph_data and is available.
+            # The self.bond_encoder is also available but its output (encoded_bond_features) would need to be integrated into the GNN message passing.
+            
+            # Only run GCN if there are nodes and edges.
+            # GCNConv typically expects num_nodes > 0. If num_nodes == 0, edge_index will also be (2,0).
+            # If num_nodes > 0 but no edges, GCN can still process node features.
+            if atom_embeddings.shape[0] > 0 and data['edge_index'].shape[1] > 0:
+                 for gcn in self.gcn_layers:
+                    atom_embeddings = F.relu(gcn(atom_embeddings, data['edge_index']))
+            elif atom_embeddings.shape[0] > 0: # Nodes exist but no edges
+                # Pass through atom_embeddings if GCN layers are not run
+                pass # atom_embeddings remains encoded_atom_features or last GCN output
+
+            # グローバルアテンション適用
+            # Input to attention: (N, L, E) where N is batch_size, L is seq_length, E is embedding_dim
+            atom_embeddings_for_attn = atom_embeddings.unsqueeze(0) # (1, num_atoms, hidden_dim)
+            atom_attn_output, _ = self.attention(atom_embeddings_for_attn, atom_embeddings_for_attn, atom_embeddings_for_attn)
+            atom_attn_output = atom_attn_output.squeeze(0) # (num_atoms, hidden_dim)
+            atom_global = torch.mean(atom_attn_output, dim=0)
+
+        # Motif processing
+        if encoded_motif_features.shape[0] == 0:
+            motif_global = torch.zeros(self.hidden_dim, device=encoded_motif_features.device)
+        else:
+            motif_embeddings = encoded_motif_features
+            # GIN層でモチーフグラフを更新 if num_nodes > 0 and edges exist
+            if motif_embeddings.shape[0] > 0 and data['motif_edge_index'].shape[1] > 0:
+                for gin in self.gin_layers:
+                    motif_embeddings = F.relu(gin(motif_embeddings, data['motif_edge_index']))
+            elif motif_embeddings.shape[0] > 0: # Motifs exist but no edges
+                pass # motif_embeddings remains encoded_motif_features or last GIN output
+            
+            # グローバルアテンション適用
+            motif_embeddings_for_attn = motif_embeddings.unsqueeze(0) # (1, num_motifs, hidden_dim)
+            motif_attn_output, _ = self.attention(motif_embeddings_for_attn, motif_embeddings_for_attn, motif_embeddings_for_attn)
+            motif_attn_output = motif_attn_output.squeeze(0) # (num_motifs, hidden_dim)
+            motif_global = torch.mean(motif_attn_output, dim=0)
         
         # 原子とモチーフの表現を結合
         combined = torch.cat([atom_global, motif_global], dim=0)
@@ -715,11 +754,44 @@ class SinusoidalPositionEmbeddings(nn.Module):
 
     def forward(self, time):
         device = time.device
+        
+        if self.dim == 0:
+            return torch.zeros((time.shape[0], 0), device=device)
+
         half_dim = self.dim // 2
-        embeddings = math.log(10000) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-        embeddings = time[:, None] * embeddings[None, :]
-        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+
+        # Handle cases where the formula is problematic (dim < 4)
+        if self.dim < 4: # Covers half_dim = 0 and half_dim = 1
+            # For very small dimensions, the formula for div_term breaks down or is ill-defined.
+            # Returning zeros as a safe fallback.
+            # A more specific embedding could be designed for these small dims if needed.
+            # print(f"Warning: SinusoidalPositionEmbeddings dim {self.dim} is small, returning zeros.")
+            return torch.zeros((time.shape[0], self.dim), device=device)
+
+        # Original formula for div_term, safe now because half_dim > 1
+        # Note: In the original code, 'embeddings' variable was reused. Renaming for clarity.
+        div_term_val = math.log(10000) / (half_dim - 1) 
+        
+        # Exponents for div_term
+        exponents = torch.arange(half_dim, device=device, dtype=torch.float32) * -div_term_val
+        div_term_tensor = torch.exp(exponents)
+
+        # Apply to time
+        # time shape: (batch_size,) -> make it (batch_size, 1) for broadcasting
+        # div_term_tensor shape: (half_dim,) -> make it (1, half_dim) for broadcasting
+        scaled_time = time.unsqueeze(1) * div_term_tensor.unsqueeze(0) # broadcasts to (batch_size, half_dim)
+
+        # Concatenate sin and cos
+        # Result shape: (batch_size, 2 * half_dim)
+        embeddings = torch.cat((torch.sin(scaled_time), torch.cos(scaled_time)), dim=-1)
+
+        # If self.dim is odd, the above produces a tensor of shape (batch_size, self.dim - 1)
+        # Add padding if necessary to match self.dim
+        if self.dim % 2 == 1:
+            # This condition implies embeddings.shape[1] would be self.dim - 1
+            padding = torch.zeros((time.shape[0], 1), device=device)
+            embeddings = torch.cat((embeddings, padding), dim=-1)
+            
         return embeddings
 
 #------------------------------------------------------
@@ -840,7 +912,7 @@ class BidirectionalSelfGrowingModel(nn.Module):
         
         # スペクトル→構造→スペクトル サイクル
         predicted_structure2, spectrum_latent = self.spectrum_to_structure(spectrum)
-        predicted_spectrum2, _ = self.structure_to_spectrum(structure_data)
+        predicted_spectrum2, _ = self.structure_to_spectrum(predicted_structure2)
         
         # 構造サイクル損失
         structure_cycle_loss = F.mse_loss(
@@ -1235,8 +1307,13 @@ def normalize_spectrum(peaks: List[Tuple[int, int]], max_mz: int = SPECTRUM_DIM,
         return spectrum
     
     # 最大強度を見つける
-    max_intensity = max([intensity for mz, intensity in peaks if mz < max_mz])
-    if max_intensity <= 0:
+    valid_intensities = [intensity for mz, intensity in peaks if mz < max_mz]
+    if not valid_intensities:
+        # If no peaks are found below max_mz, return the zero spectrum
+        return spectrum
+    max_intensity = max(valid_intensities)
+    
+    if max_intensity <= 0: # This check might still be relevant if all valid intensities are <= 0
         return spectrum
     
     # 相対強度の閾値を計算
@@ -1421,8 +1498,26 @@ class SelfGrowingTrainer:
                     continue
                 
                 # バッチから教師ありデータを抽出
-                supervised_structures = [batch['structure'][i] for i in supervised_indices]
-                supervised_spectra = torch.stack([batch['spectrum'][i] for i in supervised_indices]).to(self.device)
+                supervised_structures_filtered = []
+                supervised_spectra_to_stack = [] # Renamed to avoid confusion with final tensor
+
+                for i in supervised_indices:
+                    spectrum_item = batch['spectrum'][i]
+                    structure_item = batch['structure'][i] # Assuming structure is always present for supervised
+
+                    if spectrum_item is not None:
+                        # Ensure structure_item is also valid if spectrum_item is valid
+                        # (though the primary concern is spectrum_item being None)
+                        supervised_structures_filtered.append(structure_item)
+                        # Convert numpy array (or other compatible type) to FloatTensor
+                        supervised_spectra_to_stack.append(torch.FloatTensor(spectrum_item))
+                
+                # If, after filtering, there are no valid supervised samples in this batch, skip
+                if not supervised_spectra_to_stack:
+                    continue
+                
+                supervised_spectra = torch.stack(supervised_spectra_to_stack).to(self.device)
+                supervised_structures = supervised_structures_filtered # Use the filtered list of structures
                 
                 # データを辞書にまとめる
                 data = {
@@ -2002,9 +2097,79 @@ def prepare_dataset(msp_data: Dict[str, Dict], mol_data: Dict[str, Chem.Mol],
     labeled_data = dataset[n_unlabeled:]
     
     # 教師ありデータを訓練/検証/テストに分割
-    n_val = int(len(labeled_data) * val_ratio / (1 - unlabeled_ratio))
-    n_test = int(len(labeled_data) * test_ratio / (1 - unlabeled_ratio))
-    n_train = len(labeled_data) - n_val - n_test
+    n_total_labeled = len(labeled_data)
+    
+    # Calculate initial n_val and n_test based on ratios of the labeled_data pool
+    n_val = int(n_total_labeled * val_ratio)
+    n_test = int(n_total_labeled * test_ratio)
+    
+    # Ensure that n_train will not be negative.
+    # If the sum of n_val and n_test exceeds the total number of labeled samples,
+    # it means the provided ratios are too large.
+    # We will cap n_val and n_test. A common strategy is to prioritize training data,
+    # or scale val/test, or raise an error. Here, we ensure train is not negative.
+    # A simple approach: if n_val + n_test > n_total_labeled, it means ratios are too high.
+    # Let's ensure n_train is at least 0.
+    
+    if n_val + n_test > n_total_labeled:
+        # This case implies that val_ratio + test_ratio > 1, which is problematic for the labeled set.
+        # We'll cap n_test first, then n_val, to ensure n_train is not negative.
+        # Or, more simply, calculate n_train first if train_ratio is implicitly defined.
+        # Given val_ratio and test_ratio, train_ratio = 1 - val_ratio - test_ratio.
+        # Let's stick to the plan's logic to adjust if sum is too large.
+
+        current_sum_val_test = n_val + n_test
+        if current_sum_val_test == 0: # Avoid division by zero if both ratios were zero
+            # n_val and n_test are already 0
+            pass
+        elif current_sum_val_test > n_total_labeled: # If sum of val and test exceeds total, scale them down
+            # This situation should ideally be caught by validating ratios earlier (e.g., val_ratio + test_ratio <= 1)
+            # For robustness, let's scale them down to fit, prioritizing making them smaller rather than allowing n_train to be negative.
+            # This part of the planned fix might be overly complex if ratios are assumed to be < 1 for sum.
+            # A simpler fix:
+            # n_val = int(n_total_labeled * val_ratio)
+            # n_test = int(n_total_labeled * test_ratio)
+            # n_train = n_total_labeled - n_val - n_test
+            # if n_train < 0: n_train = 0; # then adjust n_val/n_test or error
+            # Let's use the plan's direct calculation and assertion:
+            pass # The assertion below will catch if n_train becomes negative.
+
+    n_train = n_total_labeled - n_val - n_test
+    
+    # Add an assertion to catch negative n_train during development/testing.
+    # In production, a more graceful error or adjustment might be needed if ratios are user-configurable.
+    if n_train < 0:
+        # This indicates that val_ratio + test_ratio > 1 for the labeled set.
+        # Resetting n_train to 0 and adjusting n_val and n_test to fill n_total_labeled.
+        # This is one strategy; another could be to raise an error.
+        # For now, let's prioritize n_train being non-negative.
+        # If n_train is negative, it means n_val + n_test > n_total_labeled.
+        # Cap n_val and n_test. For simplicity, we can set n_train to 0
+        # and then re-evaluate test and val, or just error out.
+        # The provided plan snippet had an assert.
+        # If val_ratio + test_ratio > 1, n_train will be negative.
+        # Example: n_total_labeled=100, val_ratio=0.7, test_ratio=0.4. n_val=70, n_test=40, n_train = -10.
+        # The plan's adjustment logic:
+        # if n_val + n_test > n_total_labeled:
+        #     if n_val + n_test == 0: ...
+        #     else: scale_factor = n_total_labeled / (n_val + n_test); n_val = int(n_val * scale_factor); n_test = int(n_test * scale_factor)
+        # n_train = n_total_labeled - n_val - n_test
+        # This scaling ensures n_train is not negative if n_val+n_test initially exceeded n_total_labeled.
+
+        # Applying the scaling logic from the plan:
+        if n_val + n_test > n_total_labeled:
+            if (n_val + n_test) == 0: # Should not happen if ratios are positive and n_total_labeled > 0
+                 # This case means n_val and n_test are already 0
+                 pass # n_train will be n_total_labeled
+            else:
+                # Scale down n_val and n_test proportionally to fit n_total_labeled
+                scale_factor = n_total_labeled / (n_val + n_test)
+                n_val = int(n_val * scale_factor)
+                n_test = int(n_test * scale_factor)
+        # Recalculate n_train with potentially scaled n_val and n_test
+        n_train = n_total_labeled - n_val - n_test
+
+    assert n_train >= 0, f"Number of training samples is negative ({n_train}). Check val_ratio and test_ratio."
     
     train_data = labeled_data[:n_train]
     val_data = labeled_data[n_train:n_train+n_val]
