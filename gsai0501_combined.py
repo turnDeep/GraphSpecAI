@@ -882,12 +882,8 @@ class BidirectionalSelfGrowingModel(nn.Module):
             if not isinstance(data["structure"], list):
                 raise TypeError(f"data['structure'] must be a list of MoleculeData objects, got {type(data['structure'])}")
             # Optional: Check type of first element if list is not empty
-            if data["structure"] and not isinstance(data["structure"][0], MoleculeData):
-                 # This check assumes MoleculeData is defined in the global scope or imported.
-                 # If MoleculeData is defined later in the file, this specific check might need adjustment
-                 # or rely on duck typing / later errors in structure_encoder.
-                 # For now, assuming MoleculeData is recognizable.
-                raise TypeError(f"Elements of data['structure'] must be MoleculeData objects, got {type(data['structure'][0])}")
+            if data["structure"] and not hasattr(data["structure"][0], 'mol'): # Check for a known attribute like 'mol'
+                raise TypeError(f"Elements of data['structure'] must be objects with a 'mol' attribute, got {type(data['structure'][0])}")
 
             # 構造→スペクトル方向
             predicted_spectrum, structure_latent = self.structure_to_spectrum(data["structure"])
@@ -1316,7 +1312,13 @@ else:
         motif_edge_index = torch.tensor(motif_edge_index, dtype=torch.long).t().contiguous() if motif_edge_index else torch.zeros((2, 0), dtype=torch.long)
         
         # モチーフエッジ特徴量
-        motif_edge_attr = torch.FloatTensor(self.motif_edge_features) if len(self.motif_edge_features) > 0 else torch.zeros((0, self.motif_edge_features.shape[1] if self.motif_edge_features.shape[0] > 0 else 6))
+        if self.motif_edge_features.size > 0: # Check if numpy array is not empty (size > 0 for (0,6) is false)
+            # self.motif_edge_features would be (num_edges, 6)
+            motif_edge_attr = torch.FloatTensor(self.motif_edge_features)
+        else:
+            # self.motif_edge_features would be an array like np.zeros((0,6))
+            # The number of features is 6.
+            motif_edge_attr = torch.zeros((0, 6), dtype=torch.float32)
         
         # スペクトル
         spectrum = torch.FloatTensor(self.spectrum) if self.spectrum is not None else None
@@ -1764,18 +1766,27 @@ class SelfGrowingTrainer:
                                      if t == 'unsupervised_structure']
                 
                 for idx in structure_indices:
-                    structure = batch['structure'][idx]
+                    structure = batch['structure'][idx] # structure is a single MoleculeData obj
                     
                     # 構造からスペクトルを予測
-                    structure_data = {'structure': structure}
-                    outputs = self.model(structure_data, direction="structure_to_spectrum")
-                    predicted_spectrum = outputs['predicted_spectrum']
+                    # Pass as a list (batch of 1)
+                    structure_data_for_model = {'structure': [structure]} 
+                    outputs = self.model(structure_data_for_model, direction="structure_to_spectrum")
+                    # outputs['predicted_spectrum'] will have shape (1, spectrum_dim)
+                    single_predicted_spectrum = outputs['predicted_spectrum'][0] # Get the first (only) item
                     
+                    # For confidence calculation
+                    conf_input_dict = {'predicted_spectrum': single_predicted_spectrum}
+                    if 'structure_latent' in outputs: # If latent is also batched (1, latent_dim)
+                        conf_input_dict['structure_latent'] = outputs['structure_latent'][0]
+                    
+                    conf = self._calculate_confidence(conf_input_dict, "spectrum")
+
                     # 疑似ラベルとして追加
                     pseudo_labeled_data.append({
-                        'structure': structure,
-                        'spectrum': predicted_spectrum.cpu().numpy(),
-                        'confidence': self._calculate_confidence(outputs)
+                        'structure': structure, # This is the original single MoleculeData
+                        'spectrum': single_predicted_spectrum.cpu().numpy(), # Use the unbatched tensor
+                        'confidence': conf
                     })
                 
                 # スペクトルのみのデータを処理
@@ -1786,15 +1797,30 @@ class SelfGrowingTrainer:
                     spectrum = torch.FloatTensor(batch['spectrum'][idx]).to(self.device)
                     
                     # スペクトルから構造を予測
-                    spectrum_data = {'spectrum': spectrum}
-                    outputs = self.model(spectrum_data, direction="spectrum_to_structure")
-                    predicted_structure = outputs['predicted_structure']
+                    # The input spectrum is already a single tensor here from torch.FloatTensor(batch['spectrum'][idx]).to(self.device)
+                    # Model's spectrum_to_structure expects a batched tensor.
+                    spectrum_data_for_model = {'spectrum': spectrum.unsqueeze(0)} # Add batch dimension
+                    outputs = self.model(spectrum_data_for_model, direction="spectrum_to_structure")
+                    
+                    # outputs['predicted_structure'] is a dict of tensors, each (1, MAX_ATOMS, Features) or (1, num_edges, Features)
+                    # We need to extract the prediction for the single input.
+                    single_predicted_structure_dict = {}
+                    for key, value_batch_tensor in outputs['predicted_structure'].items():
+                        single_predicted_structure_dict[key] = value_batch_tensor[0] # Take the first item
+
+                    converted_mol = self._convert_to_molecule(single_predicted_structure_dict)
+                    
+                    conf_input_dict = {'predicted_structure': single_predicted_structure_dict}
+                    if 'spectrum_latent' in outputs: # If latent is also batched (1, latent_dim)
+                         conf_input_dict['spectrum_latent'] = outputs['spectrum_latent'][0]
+
+                    conf = self._calculate_confidence(conf_input_dict, "structure")
                     
                     # 疑似ラベルとして追加
                     pseudo_labeled_data.append({
-                        'structure': self._convert_to_molecule(predicted_structure),
-                        'spectrum': batch['spectrum'][idx],
-                        'confidence': self._calculate_confidence(outputs)
+                        'structure': converted_mol, # This is an RDKit Mol object
+                        'spectrum': batch['spectrum'][idx], # Original spectrum (numpy array or list)
+                        'confidence': conf
                     })
         
         return pseudo_labeled_data
@@ -2311,148 +2337,34 @@ def visualize_molecule(mol, highlight_atoms=None, highlight_bonds=None,
     if save_path:
         img.save(save_path)
     
-    # タイトルを設定
-    plt.figure(figsize=(size[0]/100, size[1]/100))
-    plt.imshow(img)
-    plt.axis('off')
-    if title:
-        plt.title(title)
-    plt.tight_layout()
-    
-    if not save_path:
-        plt.show()
-        plt.close() # Ensure figure is closed if shown
-    # plt.close() was here, if save_path is true, it's closed. If not, it's closed above.
-    # If the figure is always created, it should always be closed.
-    # The original plt.close() here ensures it's closed if save_path was true.
-    # No, the plt.close() should be at the very end of this function block to ensure the figure is closed.
-    # The current plt.close() is already correctly placed if the figure is created unconditionally.
-    # Let's re-verify the structure.
-    # plt.figure(...) is called.
-    # if save_path: img.save(); # This does not use plt.savefig, so plt.close() is for the plt.figure.
-    # else: plt.show(); plt.close(); # This is fine.
-    # The original plt.close() is fine. The example logic was for plt.savefig.
-    # The key is plt.figure creates a figure that needs closing.
-    # visualize_molecule has plt.figure, then if/else for save/show.
-    # If save_path: img.save(save_path) (no plt.savefig). The plt.close() is for the plt.figure.
-    # If not save_path: plt.show(). Then plt.close() should follow.
-    # The existing plt.close() at the end of the function handles both cases correctly for the plt.figure object.
-    # The only case to add plt.close() is if plt.show() is called and not followed by plt.close().
+    # RDKit image saving (PIL Image object)
+    if save_path:
+        img.save(save_path)
 
-    # Current structure:
-    # plt.figure(...)
-    # ...
-    # if save_path:
-    #   img.save(save_path) 
-    #   # Implicitly, the plt.figure is still open.
-    # if not save_path: # This is an independent if, not an else.
-    #   plt.show() 
-    # plt.close() # This closes the plt.figure created at the start.
+    # Matplotlib display part
+    fig = None
+    try:
+        # Create a new figure for Matplotlib operations
+        fig = plt.figure(figsize=(size[0]/100, size[1]/100))
+        plt.imshow(img)
+        plt.axis('off')
+        if title:
+            plt.title(title)
+        plt.tight_layout()
 
-    # The subtask says: "If plt.show() is called. Add plt.close() immediately after plt.show() in these cases."
-    # So, for visualize_molecule:
-    # if not save_path:
-    #   plt.show()
-    #   plt.close() # Add this
-    # The final plt.close() would then be redundant if not save_path, but harmless.
-    # Or, ensure the final plt.close() is the *only* one for the plt.figure.
-    # Let's stick to the specific instruction: add plt.close() after plt.show().
-
-    # For visualize_molecule:
-    # if not save_path:
-    #    plt.show()
-    #    plt.close() # Added
-    # plt.close() # This is the original one, now potentially redundant or for a different figure if any.
-    # It's safer to have one definite plt.close() for each plt.figure().
-
-    # Re-evaluating visualize_molecule:
-    # It creates a figure with plt.figure().
-    # Then it does img.save() or plt.show().
-    # The final plt.close() is meant to close the figure created by plt.figure(). This is correct.
-    # The instruction "Add plt.close() immediately after plt.show()" is key.
-
-    # visualize_molecule
-    # ...
-    # if not save_path:
-    #     plt.show()
-    #     # ADD plt.close() here
-    # plt.close() # This existing one then becomes for the save_path case or redundant.
-    # Let's make it cleaner:
-    # if save_path:
-    #    img.save(save_path)
-    # else:
-    #    plt.show()
-    # plt.close() # This single call at the end closes the figure. This is already the case.
-
-    # The example implies:
-    # if save_path: plt.savefig(); plt.close()
-    # else: plt.show(); plt.close() <-- ensure this
-    # Let's apply this pattern directly.
-
-    # For visualize_molecule:
-    # The image is saved directly, not using plt.savefig.
-    # The plt.figure is used for plt.imshow, plt.title etc.
-    # So, the structure should be:
-    # plt.figure()
-    # ...
-    # if save_path:
-    #    img.save(save_path) # This doesn't interact with plt's current figure directly for saving
-    # else:
-    #    plt.show()
-    # plt.close() # This closes the figure created by plt.figure()
-    # This is already the case. The instruction to add plt.close() after plt.show()
-    # would make sense if the final plt.close() was *inside* the save_path block.
-
-    # Let's check visualize_spectrum:
-    # plt.figure(...)
-    # ...
-    # if save_path:
-    #   plt.savefig(save_path)
-    #   plt.close() // Closes the figure for save_path
-    # else:
-    #   plt.show() // Figure needs closing here too.
-    # So, for visualize_spectrum, the change is needed.
-
-    # Back to visualize_molecule:
-    # The current structure:
-    # plt.figure(...)
-    # ...
-    # if not save_path: # This is an independent `if`, not an `else` to `if save_path:`
-    #    plt.show()
-    # plt.close() # This closes the figure.
-    # This means if `save_path` is true, `plt.show()` is not called, and `plt.close()` still happens.
-    # If `save_path` is false, `plt.show()` is called, and `plt.close()` happens.
-    # This function seems correct as is regarding plt.close().
-    # The subtask example has savefig path using plt.close, and show path needing plt.close.
-    # visualize_molecule does not use plt.savefig. It uses plt.imshow.
-    # The final plt.close() in visualize_molecule correctly closes the figure created by plt.figure().
-    # No change needed for visualize_molecule based on this strict interpretation.
-
-    # Let's proceed with the functions that clearly match the pattern of the example:
-    # visualize_spectrum, visualize_fragment_tree, visualize_latent_space.
-    # These use plt.savefig() in the save_path branch.
-
-    # No change for visualize_molecule, it already has a final plt.close().
-    # The prompt: "If plt.show() is called. Add plt.close() immediately after plt.show() in these cases."
-    # In visualize_molecule:
-    # if not save_path:
-    #    plt.show() # plt.close() should be here
-    # plt.close()
-    # This means the final plt.close() is fine, but one is specifically requested after plt.show() if it's called.
-    # This implies the final plt.close() might be for other reasons or could be removed if plt.close is added after show.
-    # To be safe and follow instruction:
-    if not save_path:
-        plt.show()
-        plt.close() # ADDED
-    # plt.close() # This existing one will be kept as it handles the save_path case, 
-                  # or if the one above is conditional (but it's not, it's inside the if not save_path).
-                  # This structure for visualize_molecule is a bit confusing with the request.
-                  # Let's assume the final plt.close() in visualize_molecule is intended to be the one that handles all cases.
-                  # If `save_path` is true, `plt.show()` is not called. `plt.close()` at the end closes the figure.
-                  # If `save_path` is false, `plt.show()` is called. `plt.close()` at the end closes the figure.
-                  # So visualize_molecule is actually fine.
-
-    # Let's focus on the other three that use plt.savefig.
+        # Show the plot only if save_path was not used for the PIL image
+        # (as per original logic, plt part is mainly for display if PIL not saved)
+        if not save_path:
+            plt.show()
+    finally:
+        # Ensure the Matplotlib figure is closed if it was created
+        if fig is not None:
+            plt.close(fig)
+        # Fallback for safety, though fig should cover it if plt.figure was successful
+        elif plt.gcf().get_axes(): 
+            plt.close(plt.gcf())
+            
+    return img
 
 def visualize_spectrum(spectrum, max_mz=2000, threshold=0.01, top_n=20, 
                       title=None, size=(10, 5), save_path=None):
