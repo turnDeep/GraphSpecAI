@@ -21,7 +21,7 @@ import seaborn as sns
 import torch
 from PIL import Image
 from rdkit import Chem
-from rdkit.Chem import AllChem, BRICS, Descriptors, Draw, MolToSmiles, MurckoScaffold, rdMolDescriptors
+from rdkit.Chem import AllChem, BRICS, DataStructs, Descriptors, Draw, MolToSmiles, MurckoScaffold, rdMolDescriptors
 from rdkit.Chem.Draw import rdMolDraw2D
 from rdkit.Chem.Scaffolds import MurckoScaffold as MS
 from rdkit.Chem.rdchem import BondType
@@ -30,8 +30,8 @@ from sklearn.metrics import (accuracy_score, confusion_matrix,
                            precision_recall_fscore_support, silhouette_score)
 from torch.utils.data import (ConcatDataset, DataLoader, Dataset, Subset,
                               random_split)
-from torch_geometric.data import Data
-from torch_geometric.nn import GCNConv, GINConv
+from torch_geometric.data import Data, Batch
+from torch_geometric.nn import GCNConv, GINConv, global_mean_pool
 from tqdm import tqdm
 # mpl_toolkits is part of matplotlib but imported this way
 from mpl_toolkits.mplot3d import Axes3D
@@ -45,6 +45,23 @@ import torch.optim as optim
 # デバイス設定
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
+
+# Atom type mapping and constants
+ATOM_TYPE_TO_INDEX = {
+    6: 0,  # C
+    1: 1,  # H
+    7: 2,  # N
+    8: 3,  # O
+    9: 4,  # F
+    16: 5, # S
+    15: 6, # P
+    17: 7, # Cl
+    35: 8, # Br
+    53: 9  # I
+}
+UNKNOWN_ATOM_INDEX_TARGET = -100  # Using -100 for CrossEntropyLoss ignore_index
+NUM_ATOM_CLASSES = 10 # C, H, N, O, F, S, P, Cl, Br, I (matches decoder output)
+
 
 # モデル定数
 HIDDEN_DIM = 256
@@ -100,7 +117,7 @@ class Fragment:
         self.formula = Chem.rdMolDescriptors.CalcMolFormula(mol)
         
         # 電子数や安定性などの特性を計算
-        self.electron_count = sum(atom.GetNumElectrons() for atom in mol.GetAtoms())
+        self.electron_count = sum(atom.GetAtomicNum() - atom.GetFormalCharge() for atom in mol.GetAtoms())
         self.stability = self._calculate_stability()
         self.ionization_efficiency = self._calculate_ionization_efficiency()
         
@@ -352,39 +369,89 @@ class StructureEncoder(nn.Module):
             nn.Linear(hidden_dim, latent_dim)
         )
     
-    def forward(self, data):
+    def forward(self, molecule_data_list: List['MoleculeData']):
         """順伝播: 化学構造から潜在表現を生成"""
-        # 原子特徴量をエンコード
-        atom_features = self.atom_encoder(data['atom_features'])
+        device = self.atom_encoder.weight.device
+
+        if not molecule_data_list:
+            return torch.empty(0, self.latent_dim).to(device)
+
+        pyg_data_list = []
+        for md in molecule_data_list:
+            graph_data = md.graph_data
+            
+            def get_tensor(key, default_shape_fn, dtype=torch.float32):
+                tensor = graph_data.get(key)
+                if tensor is None or tensor.numel() == 0:
+                    if dtype == torch.long:
+                         return default_shape_fn(device).long()
+                    return default_shape_fn(device) # Default to float
+                return tensor.to(device)
+
+            bond_fdim = self.bond_encoder.in_features
+            motif_fdim = self.motif_encoder.in_features
+            motif_edge_attr_fdim = 6 
+
+            data_obj = Data(
+                x=get_tensor('x', lambda dev: torch.empty(0, self.atom_encoder.in_features).to(dev)),
+                edge_index=get_tensor('edge_index', lambda dev: torch.empty(2, 0).to(dev), dtype=torch.long),
+                edge_attr=get_tensor('edge_attr', lambda dev: torch.empty(0, bond_fdim).to(dev)),
+                motif_x=get_tensor('motif_x', lambda dev: torch.empty(0, motif_fdim).to(dev)),
+                motif_edge_index=get_tensor('motif_edge_index', lambda dev: torch.empty(2, 0).to(dev), dtype=torch.long),
+                motif_edge_attr=get_tensor('motif_edge_attr', lambda dev: torch.empty(0, motif_edge_attr_fdim).to(dev))
+            )
+            if data_obj.motif_edge_attr is not None and data_obj.motif_edge_attr.shape[0] == 0:
+                 data_obj.motif_edge_attr = None
+            
+            pyg_data_list.append(data_obj)
+
+        batch = Batch.from_data_list(pyg_data_list)
+
+        atom_features_encoded = self.atom_encoder(batch.x)
         
-        # 結合特徴量をエンコード
-        bond_features = self.bond_encoder(data['bond_features'])
-        
-        # モチーフ特徴量をエンコード
-        motif_features = self.motif_encoder(data['motif_features'])
-        
-        # GCN層で原子グラフを更新
-        atom_embeddings = atom_features
+        if batch.edge_attr is not None and batch.edge_attr.numel() > 0:
+            bond_features_encoded = self.bond_encoder(batch.edge_attr)
+        else:
+            bond_features_encoded = torch.empty(0, self.hidden_dim).to(device)
+
+        if batch.motif_x is not None and batch.motif_x.numel() > 0:
+            motif_features_encoded = self.motif_encoder(batch.motif_x)
+        else:
+            motif_features_encoded = torch.empty(0, self.hidden_dim).to(device)
+
+        atom_embeddings = atom_features_encoded
         for gcn in self.gcn_layers:
-            atom_embeddings = F.relu(gcn(atom_embeddings, data['edge_index']))
+            # As per subtask point 6, edge_attr is not passed to gcn()
+            atom_embeddings = F.relu(gcn(atom_embeddings, batch.edge_index))
         
-        # GIN層でモチーフグラフを更新
-        motif_embeddings = motif_features
-        for gin in self.gin_layers:
-            motif_embeddings = F.relu(gin(motif_embeddings, data['motif_edge_index']))
+        motif_embeddings = motif_features_encoded
+        if batch.motif_x is not None and batch.motif_x.numel() > 0 :
+            current_motif_edge_index = batch.motif_edge_index if batch.motif_edge_index is not None and batch.motif_edge_index.numel() > 0 else torch.empty(2,0).long().to(device)
+            for gin in self.gin_layers:
+                 # As per subtask point 6, edge_attr is not passed to gin()
+                motif_embeddings = F.relu(gin(motif_embeddings, current_motif_edge_index))
+        else:
+             motif_embeddings = torch.empty(0, self.hidden_dim).to(device)
+
+        atom_pooled = global_mean_pool(atom_embeddings, batch.batch)
+        atom_attn_input = atom_pooled.unsqueeze(1) 
+        atom_attn, _ = self.attention(atom_attn_input, atom_attn_input, atom_attn_input)
+        atom_global = torch.mean(atom_attn, dim=1) # Point 7
+
+        if motif_embeddings.numel() > 0:
+            motif_batch_vector = batch.motif_batch if hasattr(batch, 'motif_batch') and batch.motif_batch is not None else None
+            if motif_batch_vector is not None and motif_batch_vector.numel() > 0 :
+                 motif_pooled = global_mean_pool(motif_embeddings, motif_batch_vector)
+                 motif_attn_input = motif_pooled.unsqueeze(1)
+                 motif_attn, _ = self.attention(motif_attn_input, motif_attn_input, motif_attn_input)
+                 motif_global = torch.mean(motif_attn, dim=1) # Point 7
+            else: 
+                 motif_global = torch.zeros(batch.num_graphs, self.hidden_dim, device=device)
+        else:
+            motif_global = torch.zeros(batch.num_graphs, self.hidden_dim, device=device)
         
-        # グローバルアテンション適用
-        atom_attn, _ = self.attention(atom_embeddings, atom_embeddings, atom_embeddings)
-        motif_attn, _ = self.attention(motif_embeddings, motif_embeddings, motif_embeddings)
+        combined = torch.cat([atom_global, motif_global], dim=1) # Point 8
         
-        # グローバル表現の作成
-        atom_global = torch.mean(atom_attn, dim=0)
-        motif_global = torch.mean(motif_attn, dim=0)
-        
-        # 原子とモチーフの表現を結合
-        combined = torch.cat([atom_global, motif_global], dim=0)
-        
-        # 潜在表現に射影
         latent = self.projector(combined)
         
         return latent
@@ -401,7 +468,7 @@ class StructureDecoder(nn.Module):
         self.expander = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim * 2)
+            nn.Linear(hidden_dim, (MAX_ATOMS + MAX_MOTIFS) * self.hidden_dim)
         )
         
         # グラフ生成モジュール
@@ -457,42 +524,62 @@ class StructureDecoder(nn.Module):
     
     def forward(self, latent, max_atoms=MAX_ATOMS):
         """順伝播: 潜在表現から化学構造を生成"""
+        batch_size = latent.size(0)
+        device = latent.device
+
         # 潜在表現を拡張
-        expanded = self.expander(latent)
+        expanded_flat = self.expander(latent) # Shape: (batch_size, (MAX_ATOMS + MAX_MOTIFS) * self.hidden_dim)
+        expanded = expanded_flat.view(batch_size, MAX_ATOMS + MAX_MOTIFS, self.hidden_dim)
         
         # ノード（原子）の特徴量を生成
-        node_hiddens = expanded[:max_atoms, :self.hidden_dim]
+        # Note: max_atoms from args might be different from MAX_ATOMS used in expander's output size.
+        # We will slice up to the max_atoms used in generation, ensuring it does not exceed MAX_ATOMS.
+        current_max_atoms = min(max_atoms, MAX_ATOMS)
+        node_hiddens = expanded[:, :current_max_atoms, :]  # Shape: (batch_size, current_max_atoms, self.hidden_dim)
         
         # ノード（原子）の存在確率
-        node_exists = self.graph_generator['node_existence'](node_hiddens)
+        node_exists = self.graph_generator['node_existence'](node_hiddens) # Output: (batch_size, current_max_atoms, 1)
         
         # ノード（原子）の種類
-        node_types = self.graph_generator['node_type'](node_hiddens)
+        node_types = self.graph_generator['node_type'](node_hiddens) # Output: (batch_size, current_max_atoms, num_node_types)
         
-        # エッジ（結合）の特徴量を生成
-        edge_hiddens = []
-        for i in range(max_atoms):
-            for j in range(i+1, max_atoms):
-                # 両方のノード特徴量を結合
-                combined = torch.cat([node_hiddens[i], node_hiddens[j]], dim=0)
-                edge_hiddens.append(combined)
-        
-        edge_hiddens = torch.stack(edge_hiddens) if edge_hiddens else torch.zeros((0, self.hidden_dim * 2))
-        
-        # エッジ（結合）の存在確率
-        edge_exists = self.graph_generator['edge_existence'](edge_hiddens)
-        
-        # エッジ（結合）の種類
-        edge_types = self.graph_generator['edge_type'](edge_hiddens)
-        
+        # エッジ（結合）の特徴量を生成 (Batch-aware)
+        if current_max_atoms < 2:
+            # Ensure correct shape for empty edge features, matching expected input dim for subsequent layers
+            edge_hiddens = torch.empty(batch_size, 0, self.hidden_dim * 2, device=device)
+            # Correspondingly, edge_exists and edge_types should also be empty but correctly shaped.
+            # For edge_existence, output is (batch_size, num_edges, 1)
+            edge_exists = torch.empty(batch_size, 0, 1, device=device)
+            # For edge_type, output is (batch_size, num_edges, num_edge_types)
+            # Assuming num_edge_types is the output dim of self.graph_generator['edge_type']'s last linear layer
+            num_edge_types = self.graph_generator['edge_type'][-1].out_features
+            edge_types = torch.empty(batch_size, 0, num_edge_types, device=device)
+        else:
+            idx_i, idx_j = torch.triu_indices(current_max_atoms, current_max_atoms, offset=1, device=device)
+            h_i = node_hiddens[:, idx_i, :]  # Shape: (batch_size, num_edges, hidden_dim)
+            h_j = node_hiddens[:, idx_j, :]  # Shape: (batch_size, num_edges, hidden_dim)
+            edge_hiddens = torch.cat([h_i, h_j], dim=-1) # Shape: (batch_size, num_edges, hidden_dim * 2)
+            
+            # エッジ（結合）の存在確率
+            edge_exists = self.graph_generator['edge_existence'](edge_hiddens) # Output: (batch_size, num_edges, 1)
+            
+            # エッジ（結合）の種類
+            edge_types = self.graph_generator['edge_type'](edge_hiddens) # Output: (batch_size, num_edges, num_edge_types)
+
         # モチーフの特徴量を生成
-        motif_hiddens = expanded[max_atoms:, :self.hidden_dim]
-        
-        # モチーフの存在確率
-        motif_exists = self.motif_generator['motif_existence'](motif_hiddens)
-        
-        # モチーフの種類
-        motif_types = self.motif_generator['motif_type'](motif_hiddens)
+        # Ensure MAX_MOTIFS is used for slicing consistently with expander
+        if MAX_MOTIFS > 0:
+            motif_hiddens = expanded[:, MAX_ATOMS : MAX_ATOMS + MAX_MOTIFS, :] # Shape: (batch_size, MAX_MOTIFS, self.hidden_dim)
+            # モチーフの存在確率
+            motif_exists = self.motif_generator['motif_existence'](motif_hiddens) # Output: (batch_size, MAX_MOTIFS, 1)
+            # モチーフの種類
+            motif_types = self.motif_generator['motif_type'](motif_hiddens) # Output: (batch_size, MAX_MOTIFS, num_motif_types)
+        else:
+            # Handle case with no motifs
+            motif_hiddens = torch.empty(batch_size, 0, self.hidden_dim, device=device)
+            motif_exists = torch.empty(batch_size, 0, 1, device=device)
+            num_motif_types = self.motif_generator['motif_type'][-1].out_features
+            motif_types = torch.empty(batch_size, 0, num_motif_types, device=device)
         
         return {
             'node_exists': node_exists,
@@ -784,15 +871,35 @@ class BidirectionalSelfGrowingModel(nn.Module):
     
     def forward(self, data, direction="bidirectional"):
         """順伝播"""
+        if not isinstance(data, dict):
+            raise TypeError(f"Input 'data' must be a dictionary, got {type(data)}")
+
         results = {}
         
         if direction in ["structure_to_spectrum", "bidirectional"]:
+            if "structure" not in data:
+                raise ValueError("Missing 'structure' key in data for structure_to_spectrum")
+            if not isinstance(data["structure"], list):
+                raise TypeError(f"data['structure'] must be a list of MoleculeData objects, got {type(data['structure'])}")
+            # Optional: Check type of first element if list is not empty
+            if data["structure"] and not isinstance(data["structure"][0], MoleculeData):
+                 # This check assumes MoleculeData is defined in the global scope or imported.
+                 # If MoleculeData is defined later in the file, this specific check might need adjustment
+                 # or rely on duck typing / later errors in structure_encoder.
+                 # For now, assuming MoleculeData is recognizable.
+                raise TypeError(f"Elements of data['structure'] must be MoleculeData objects, got {type(data['structure'][0])}")
+
             # 構造→スペクトル方向
             predicted_spectrum, structure_latent = self.structure_to_spectrum(data["structure"])
             results["predicted_spectrum"] = predicted_spectrum
             results["structure_latent"] = structure_latent
         
         if direction in ["spectrum_to_structure", "bidirectional"]:
+            if "spectrum" not in data:
+                raise ValueError("Missing 'spectrum' key in data for spectrum_to_structure")
+            if not isinstance(data["spectrum"], torch.Tensor):
+                raise TypeError(f"data['spectrum'] must be a PyTorch tensor, got {type(data['spectrum'])}")
+
             # スペクトル→構造方向
             predicted_structure, spectrum_latent = self.spectrum_to_structure(data["spectrum"])
             results["predicted_structure"] = predicted_structure
@@ -1183,7 +1290,11 @@ class MoleculeData:
         edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous() if edge_index else torch.zeros((2, 0), dtype=torch.long)
         
         # 結合特徴量
-        edge_attr = torch.FloatTensor(self.bond_features) if len(self.bond_features) > 0 else torch.zeros((0, self.bond_features.shape[1] if self.bond_features.shape[0] > 0 else 7))
+        if len(self.bond_features) > 0:
+    edge_attr = torch.FloatTensor(self.bond_features)
+else:
+    # Assuming bond_feature_dim is 7 (bond_type_oh[4] + 3 flags)
+    edge_attr = torch.zeros((0, 7), dtype=torch.float32)
         
         # モチーフインデックス
         motif_index = []
@@ -1343,9 +1454,28 @@ def collate_fn(batch):
             batch_dict[key].append(data[key])
     
     # スペクトルをスタック（あれば）
-    spectra = [item for item in batch_dict['spectrum'] if item is not None]
-    if spectra:
-        batch_dict['spectrum_tensor'] = torch.stack(spectra)
+    spectra_processed = []
+    # batch_dict['spectrum'] contains a list of items, where each item can be a spectrum or None
+    for item in batch_dict['spectrum']: 
+        if item is not None:
+            if isinstance(item, np.ndarray):
+                spectra_processed.append(torch.FloatTensor(item))
+            elif isinstance(item, torch.Tensor):
+                # Ensure it's a FloatTensor if it's not already
+                spectra_processed.append(item.float() if not item.is_floating_point() else item)
+            # Add other potential type checks if necessary, e.g. for lists of numbers
+            # else:
+            #     # Potentially handle other types or raise an error
+            #     pass # For now, only ndarray and Tensor are explicitly handled as per plan
+
+    if spectra_processed:
+        try:
+            batch_dict['spectrum_tensor'] = torch.stack(spectra_processed)
+        except Exception as e:
+            # Log error or handle cases where stacking might fail (e.g. inconsistent tensor shapes)
+            # For now, re-raise or set to None as per original logic for failure
+            print(f"Error stacking spectra in collate_fn: {e}") # Or use logger
+            batch_dict['spectrum_tensor'] = None 
     else:
         batch_dict['spectrum_tensor'] = None
     
@@ -1405,6 +1535,32 @@ class SelfGrowingTrainer:
         
         # 拡散モデルのウェイト
         self.diffusion_weight = config.get('diffusion_weight', 0.1)
+
+    def _create_structural_targets(self, molecule_data_list: List[MoleculeData], max_atoms_target: int, device: torch.device) -> Dict[str, torch.Tensor]:
+        batch_node_exists = []
+        batch_node_types = []
+
+        for md in molecule_data_list:
+            num_actual_atoms = md.mol.GetNumAtoms()
+            
+            # Node exists target
+            node_exists_single = torch.zeros(max_atoms_target, 1, device=device)
+            if num_actual_atoms > 0: # Ensure slicing is valid
+                node_exists_single[:min(num_actual_atoms, max_atoms_target)] = 1.0
+            batch_node_exists.append(node_exists_single)
+
+            # Node types target
+            node_types_single = torch.full((max_atoms_target,), UNKNOWN_ATOM_INDEX_TARGET, dtype=torch.long, device=device) 
+            for i in range(min(num_actual_atoms, max_atoms_target)): # Iterate up to padding limit
+                atom = md.mol.GetAtomWithIdx(i)
+                atomic_num = atom.GetAtomicNum()
+                node_types_single[i] = ATOM_TYPE_TO_INDEX.get(atomic_num, UNKNOWN_ATOM_INDEX_TARGET)
+            batch_node_types.append(node_types_single)
+
+        return {
+            'node_exists': torch.stack(batch_node_exists), # (B, max_atoms_target, 1)
+            'node_types': torch.stack(batch_node_types)    # (B, max_atoms_target)
+        }
     
     def train_supervised(self, dataloader, epochs=1):
         """教師あり学習"""
@@ -1436,22 +1592,27 @@ class SelfGrowingTrainer:
                 
                 # 損失計算
                 loss_s2p = F.mse_loss(outputs['predicted_spectrum'], supervised_spectra)
+
+                # Create structural targets
+                structural_targets = self._create_structural_targets(supervised_structures, MAX_ATOMS, self.device)
+                target_node_exists = structural_targets['node_exists']
+                target_node_types = structural_targets['node_types']
+
+                predicted_structure = outputs['predicted_structure']
                 
-                structure_losses = []
-                for i, structure_output in enumerate(outputs['predicted_structure']):
-                    # 構造に関する損失を計算
-                    node_exists_loss = F.binary_cross_entropy(
-                        structure_output['node_exists'],
-                        torch.tensor([s['node_exists'] for s in supervised_structures], device=self.device)
-                    )
-                    node_types_loss = F.cross_entropy(
-                        structure_output['node_types'],
-                        torch.tensor([s['node_types'] for s in supervised_structures], device=self.device)
-                    )
-                    structure_loss = node_exists_loss + node_types_loss
-                    structure_losses.append(structure_loss)
+                node_exists_loss = F.binary_cross_entropy(
+                    predicted_structure['node_exists'],
+                    target_node_exists
+                )
                 
-                loss_p2s = sum(structure_losses) / len(structure_losses) if structure_losses else 0
+                predicted_node_types_for_loss = predicted_structure['node_types'].permute(0, 2, 1)
+                node_types_loss = F.cross_entropy(
+                    predicted_node_types_for_loss,
+                    target_node_types,
+                    ignore_index=UNKNOWN_ATOM_INDEX_TARGET
+                )
+                
+                loss_p2s = node_exists_loss + node_types_loss
                 
                 # 合計損失
                 loss = loss_s2p + loss_p2s
@@ -1465,15 +1626,16 @@ class SelfGrowingTrainer:
                 
                 # メトリクスに追加
                 self.metrics['structure_to_spectrum_loss'].append(loss_s2p.item())
-                self.metrics['spectrum_to_structure_loss'].append(loss_p2s.item())
-            
-            avg_epoch_loss = epoch_loss / len(dataloader)
+                # Ensure loss_p2s is a scalar item for logging
+                self.metrics['spectrum_to_structure_loss'].append(loss_p2s.item() if torch.is_tensor(loss_p2s) else loss_p2s)
+
+            avg_epoch_loss = epoch_loss / len(dataloader) if len(dataloader) > 0 else 0.0
             total_loss += avg_epoch_loss
             
             logger.info(f"Supervised Epoch {epoch+1}/{epochs} Loss: {avg_epoch_loss:.4f}")
         
         # 平均損失を返す
-        return total_loss / epochs
+        return total_loss / epochs if epochs > 0 else 0.0
     
     def train_cycle_consistency(self, dataloader, epochs=1):
         """サイクル一貫性を使った自己教師あり学習"""
@@ -1649,36 +1811,77 @@ class SelfGrowingTrainer:
         
         return filtered_data
     
-    def _calculate_confidence(self, outputs):
-        """予測の信頼度を計算"""
-        # ここでは単純な例として、予測値の確率分布のエントロピーを使用
-        # 実際のアプリケーションでは、より洗練された信頼度の計算が必要
-        if 'predicted_spectrum' in outputs:
+    def _calculate_confidence(self, single_prediction_output: Dict, prediction_type: str) -> float:
+        """予測の信頼度を計算 (単一の予測結果に対して)"""
+        if prediction_type == "spectrum":
             # スペクトル予測の場合
-            spectrum = outputs['predicted_spectrum']
-            entropy = -(spectrum * torch.log(spectrum + 1e-10)).sum()
-            max_entropy = -torch.log(torch.tensor(1.0 / spectrum.size(0)))
+            # single_prediction_output is {'predicted_spectrum': single_spectrum_tensor}
+            single_spectrum_tensor = single_prediction_output['predicted_spectrum'] # Shape: (spectrum_dim,)
+            if single_spectrum_tensor.numel() == 0: # Handle empty spectrum
+                return 0.0
+            entropy = -(single_spectrum_tensor * torch.log(single_spectrum_tensor + 1e-9)).sum() # Use 1e-9 for stability
+            max_entropy = -torch.log(torch.tensor(1.0 / single_spectrum_tensor.size(0), device=single_spectrum_tensor.device))
+            if max_entropy == 0: # Avoid division by zero if spectrum_dim is 1 (though unlikely for spectra)
+                return 0.0 if entropy > 0 else 1.0
             confidence = 1.0 - (entropy / max_entropy)
-        else:
+            return confidence.item()
+
+        elif prediction_type == "structure":
             # 構造予測の場合
-            structure = outputs['predicted_structure']
-            node_exists = structure['node_exists']
-            node_exists_entropy = -(node_exists * torch.log(node_exists + 1e-10) + 
-                                   (1 - node_exists) * torch.log(1 - node_exists + 1e-10)).mean()
-            confidence = torch.exp(-node_exists_entropy).item()
-        
-        return confidence.item()
+            # single_prediction_output is {'predicted_structure': single_predicted_structure_dict}
+            single_predicted_structure_dict = single_prediction_output['predicted_structure']
+            node_exists = single_predicted_structure_dict['node_exists'] # Shape: (MAX_ATOMS, 1) or (MAX_ATOMS,)
+            
+            if node_exists.numel() == 0: # Handle empty node_exists (e.g. MAX_ATOMS = 0, though unlikely)
+                return 0.0
+
+            # Ensure node_exists is 1D for entropy calculation if it's (N,1)
+            if node_exists.ndim > 1 and node_exists.shape[-1] == 1:
+                node_exists = node_exists.squeeze(-1)
+
+            # Clamp node_exists probabilities to avoid log(0) for perfect predictions
+            node_exists_clamped = torch.clamp(node_exists, 1e-9, 1.0 - 1e-9)
+            
+            node_exists_entropy = -(node_exists_clamped * torch.log(node_exists_clamped) + \
+                                   (1 - node_exists_clamped) * torch.log(1 - node_exists_clamped)).mean()
+            confidence = torch.exp(-node_exists_entropy)
+            return confidence.item()
+        else:
+            raise ValueError(f"Unknown prediction_type for confidence calculation: {prediction_type}")
+
     
     def _convert_to_molecule(self, predicted_structure):
         """予測された構造を分子に変換"""
         # 予測から分子を構築する処理
         # 実際の実装では、予測された原子タイプと結合を使用してRDKit分子を構築
         
-        # ここではサンプル実装として、予測された原子と結合を使用
-        node_exists = predicted_structure['node_exists'].cpu().numpy() > 0.5
-        node_types = predicted_structure['node_types'].argmax(dim=1).cpu().numpy()
-        edge_exists = predicted_structure['edge_exists'].cpu().numpy() > 0.5
-        edge_types = predicted_structure['edge_types'].argmax(dim=1).cpu().numpy()
+        if isinstance(predicted_structure, dict):
+            node_exists_t = predicted_structure['node_exists']    # Shape e.g. (MAX_ATOMS, 1)
+            node_types_t = predicted_structure['node_types']      # Shape e.g. (MAX_ATOMS, NUM_CLASSES)
+            edge_exists_t = predicted_structure['edge_exists']    # Shape e.g. (num_edges, 1)
+            edge_types_t = predicted_structure['edge_types']      # Shape e.g. (num_edges, NUM_EDGE_CLASSES)
+        else:
+            # This path is for robustness, assuming object-like access
+            node_exists_t = predicted_structure.node_exists
+            node_types_t = predicted_structure.node_types
+            edge_exists_t = predicted_structure.edge_exists
+            edge_types_t = predicted_structure.edge_types
+
+        # Process tensors, assuming they are for a single molecule now
+        node_exists = node_exists_t.squeeze(-1).cpu().numpy() > 0.5  # From (N, 1) to (N,)
+        node_types = node_types_t.argmax(dim=-1).cpu().numpy()       # From (N, C) to (N,)
+        
+        # Handle edge_exists: from (num_edges, 1) to (num_edges,)
+        if edge_exists_t.ndim > 1 and edge_exists_t.shape[-1] == 1:
+             edge_exists_t = edge_exists_t.squeeze(-1)
+        edge_exists = edge_exists_t.cpu().numpy() > 0.5
+        
+        # Handle edge_types: from (num_edges, C) to (num_edges,)
+        # If edge_types_t could already be (num_edges,), argmax only if it has more than 1 dim.
+        if edge_types_t.ndim > 1: # Has class dimension
+            edge_types = edge_types_t.argmax(dim=-1).cpu().numpy()
+        else: # Assuming it's already (num_edges,)
+            edge_types = edge_types_t.cpu().numpy()
         
         # RWMolオブジェクトを作成
         mol = Chem.RWMol()
@@ -1838,21 +2041,29 @@ class SelfGrowingTrainer:
                 # 損失計算
                 loss_s2p = F.mse_loss(outputs['predicted_spectrum'], supervised_spectra)
                 
-                structure_losses = []
-                for structure_output in outputs['predicted_structure']:
-                    # 構造に関する損失を計算
-                    node_exists_loss = F.binary_cross_entropy(
-                        structure_output['node_exists'],
-                        torch.tensor([s['node_exists'] for s in supervised_structures], device=self.device)
-                    )
-                    node_types_loss = F.cross_entropy(
-                        structure_output['node_types'],
-                        torch.tensor([s['node_types'] for s in supervised_structures], device=self.device)
-                    )
-                    structure_loss = node_exists_loss + node_types_loss
-                    structure_losses.append(structure_loss)
+                # Create structural targets
+                structural_targets = self._create_structural_targets(supervised_structures, MAX_ATOMS, self.device)
+                target_node_exists = structural_targets['node_exists']
+                target_node_types = structural_targets['node_types']
+
+                # Predicted structure outputs from decoder (already batched)
+                predicted_structure = outputs['predicted_structure']
                 
-                loss_p2s = sum(structure_losses) / len(structure_losses) if structure_losses else 0
+                # Calculate node_exists_loss
+                node_exists_loss = F.binary_cross_entropy(
+                    predicted_structure['node_exists'],
+                    target_node_exists
+                )
+                
+                # Calculate node_types_loss
+                predicted_node_types_for_loss = predicted_structure['node_types'].permute(0, 2, 1)
+                node_types_loss = F.cross_entropy(
+                    predicted_node_types_for_loss,
+                    target_node_types,
+                    ignore_index=UNKNOWN_ATOM_INDEX_TARGET
+                )
+                
+                loss_p2s = node_exists_loss + node_types_loss
                 
                 # 合計損失
                 loss = loss_s2p + loss_p2s
@@ -2110,9 +2321,138 @@ def visualize_molecule(mol, highlight_atoms=None, highlight_bonds=None,
     
     if not save_path:
         plt.show()
-    plt.close()
-    
-    return img
+        plt.close() # Ensure figure is closed if shown
+    # plt.close() was here, if save_path is true, it's closed. If not, it's closed above.
+    # If the figure is always created, it should always be closed.
+    # The original plt.close() here ensures it's closed if save_path was true.
+    # No, the plt.close() should be at the very end of this function block to ensure the figure is closed.
+    # The current plt.close() is already correctly placed if the figure is created unconditionally.
+    # Let's re-verify the structure.
+    # plt.figure(...) is called.
+    # if save_path: img.save(); # This does not use plt.savefig, so plt.close() is for the plt.figure.
+    # else: plt.show(); plt.close(); # This is fine.
+    # The original plt.close() is fine. The example logic was for plt.savefig.
+    # The key is plt.figure creates a figure that needs closing.
+    # visualize_molecule has plt.figure, then if/else for save/show.
+    # If save_path: img.save(save_path) (no plt.savefig). The plt.close() is for the plt.figure.
+    # If not save_path: plt.show(). Then plt.close() should follow.
+    # The existing plt.close() at the end of the function handles both cases correctly for the plt.figure object.
+    # The only case to add plt.close() is if plt.show() is called and not followed by plt.close().
+
+    # Current structure:
+    # plt.figure(...)
+    # ...
+    # if save_path:
+    #   img.save(save_path) 
+    #   # Implicitly, the plt.figure is still open.
+    # if not save_path: # This is an independent if, not an else.
+    #   plt.show() 
+    # plt.close() # This closes the plt.figure created at the start.
+
+    # The subtask says: "If plt.show() is called. Add plt.close() immediately after plt.show() in these cases."
+    # So, for visualize_molecule:
+    # if not save_path:
+    #   plt.show()
+    #   plt.close() # Add this
+    # The final plt.close() would then be redundant if not save_path, but harmless.
+    # Or, ensure the final plt.close() is the *only* one for the plt.figure.
+    # Let's stick to the specific instruction: add plt.close() after plt.show().
+
+    # For visualize_molecule:
+    # if not save_path:
+    #    plt.show()
+    #    plt.close() # Added
+    # plt.close() # This is the original one, now potentially redundant or for a different figure if any.
+    # It's safer to have one definite plt.close() for each plt.figure().
+
+    # Re-evaluating visualize_molecule:
+    # It creates a figure with plt.figure().
+    # Then it does img.save() or plt.show().
+    # The final plt.close() is meant to close the figure created by plt.figure(). This is correct.
+    # The instruction "Add plt.close() immediately after plt.show()" is key.
+
+    # visualize_molecule
+    # ...
+    # if not save_path:
+    #     plt.show()
+    #     # ADD plt.close() here
+    # plt.close() # This existing one then becomes for the save_path case or redundant.
+    # Let's make it cleaner:
+    # if save_path:
+    #    img.save(save_path)
+    # else:
+    #    plt.show()
+    # plt.close() # This single call at the end closes the figure. This is already the case.
+
+    # The example implies:
+    # if save_path: plt.savefig(); plt.close()
+    # else: plt.show(); plt.close() <-- ensure this
+    # Let's apply this pattern directly.
+
+    # For visualize_molecule:
+    # The image is saved directly, not using plt.savefig.
+    # The plt.figure is used for plt.imshow, plt.title etc.
+    # So, the structure should be:
+    # plt.figure()
+    # ...
+    # if save_path:
+    #    img.save(save_path) # This doesn't interact with plt's current figure directly for saving
+    # else:
+    #    plt.show()
+    # plt.close() # This closes the figure created by plt.figure()
+    # This is already the case. The instruction to add plt.close() after plt.show()
+    # would make sense if the final plt.close() was *inside* the save_path block.
+
+    # Let's check visualize_spectrum:
+    # plt.figure(...)
+    # ...
+    # if save_path:
+    #   plt.savefig(save_path)
+    #   plt.close() // Closes the figure for save_path
+    # else:
+    #   plt.show() // Figure needs closing here too.
+    # So, for visualize_spectrum, the change is needed.
+
+    # Back to visualize_molecule:
+    # The current structure:
+    # plt.figure(...)
+    # ...
+    # if not save_path: # This is an independent `if`, not an `else` to `if save_path:`
+    #    plt.show()
+    # plt.close() # This closes the figure.
+    # This means if `save_path` is true, `plt.show()` is not called, and `plt.close()` still happens.
+    # If `save_path` is false, `plt.show()` is called, and `plt.close()` happens.
+    # This function seems correct as is regarding plt.close().
+    # The subtask example has savefig path using plt.close, and show path needing plt.close.
+    # visualize_molecule does not use plt.savefig. It uses plt.imshow.
+    # The final plt.close() in visualize_molecule correctly closes the figure created by plt.figure().
+    # No change needed for visualize_molecule based on this strict interpretation.
+
+    # Let's proceed with the functions that clearly match the pattern of the example:
+    # visualize_spectrum, visualize_fragment_tree, visualize_latent_space.
+    # These use plt.savefig() in the save_path branch.
+
+    # No change for visualize_molecule, it already has a final plt.close().
+    # The prompt: "If plt.show() is called. Add plt.close() immediately after plt.show() in these cases."
+    # In visualize_molecule:
+    # if not save_path:
+    #    plt.show() # plt.close() should be here
+    # plt.close()
+    # This means the final plt.close() is fine, but one is specifically requested after plt.show() if it's called.
+    # This implies the final plt.close() might be for other reasons or could be removed if plt.close is added after show.
+    # To be safe and follow instruction:
+    if not save_path:
+        plt.show()
+        plt.close() # ADDED
+    # plt.close() # This existing one will be kept as it handles the save_path case, 
+                  # or if the one above is conditional (but it's not, it's inside the if not save_path).
+                  # This structure for visualize_molecule is a bit confusing with the request.
+                  # Let's assume the final plt.close() in visualize_molecule is intended to be the one that handles all cases.
+                  # If `save_path` is true, `plt.show()` is not called. `plt.close()` at the end closes the figure.
+                  # If `save_path` is false, `plt.show()` is called. `plt.close()` at the end closes the figure.
+                  # So visualize_molecule is actually fine.
+
+    # Let's focus on the other three that use plt.savefig.
 
 def visualize_spectrum(spectrum, max_mz=2000, threshold=0.01, top_n=20, 
                       title=None, size=(10, 5), save_path=None):
@@ -2154,6 +2494,7 @@ def visualize_spectrum(spectrum, max_mz=2000, threshold=0.01, top_n=20,
         plt.close()
     else:
         plt.show()
+        plt.close() # Ensure one plt.close() here
 
 def visualize_fragment_tree(fragment_tree, max_depth=3, size=(12, 8), save_path=None):
     """フラグメントツリーを可視化する"""
@@ -2233,6 +2574,7 @@ def visualize_fragment_tree(fragment_tree, max_depth=3, size=(12, 8), save_path=
         plt.close()
     else:
         plt.show()
+        plt.close() # Ensure one plt.close() here
 
 def visualize_latent_space(model, dataset, n_samples=100, perplexity=30, 
                           title=None, size=(10, 8), save_path=None):
@@ -2344,6 +2686,7 @@ def visualize_latent_space(model, dataset, n_samples=100, perplexity=30,
         plt.close()
     else:
         plt.show()
+        plt.close() # Ensure one plt.close() here
 
 def visualize_metrics(trainer, size=(12, 8), save_path=None):
     """トレーニングメトリクスを可視化する"""
@@ -2376,6 +2719,7 @@ def visualize_metrics(trainer, size=(12, 8), save_path=None):
         plt.close()
     else:
         plt.show()
+        plt.close() # Added
 
 def create_spectrum_prediction_report(model, test_dataset, n_samples=5, save_dir=None):
     """スペクトル予測レポートを作成"""
