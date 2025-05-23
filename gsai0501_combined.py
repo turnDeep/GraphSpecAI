@@ -21,7 +21,7 @@ import seaborn as sns
 import torch
 from PIL import Image
 from rdkit import Chem
-from rdkit.Chem import AllChem, BRICS, Descriptors, Draw, MolToSmiles, MurckoScaffold, rdMolDescriptors
+from rdkit.Chem import AllChem, BRICS, DataStructs, Descriptors, Draw, MolToSmiles, MurckoScaffold, rdMolDescriptors
 from rdkit.Chem.Draw import rdMolDraw2D
 from rdkit.Chem.Scaffolds import MurckoScaffold as MS
 from rdkit.Chem.rdchem import BondType
@@ -105,7 +105,7 @@ class Fragment:
         self.formula = Chem.rdMolDescriptors.CalcMolFormula(mol)
         
         # 電子数や安定性などの特性を計算
-        self.electron_count = sum(atom.GetNumElectrons() for atom in mol.GetAtoms())
+        self.electron_count = sum(atom.GetTotalNumElectrons() for atom in mol.GetAtoms())
         self.stability = self._calculate_stability()
         self.ionization_efficiency = self._calculate_ionization_efficiency()
         
@@ -770,15 +770,15 @@ class SinusoidalPositionEmbeddings(nn.Module):
 
         half_dim = self.dim // 2
 
-        # Handle cases where the formula is problematic (dim < 4)
-        if self.dim < 4: # Covers half_dim = 0 and half_dim = 1
+        # Handle cases where the formula is problematic (dim < 2)
+        if self.dim < 2:  # More specific threshold
             # For very small dimensions, the formula for div_term breaks down or is ill-defined.
             # Returning zeros as a safe fallback.
             # A more specific embedding could be designed for these small dims if needed.
             # print(f"Warning: SinusoidalPositionEmbeddings dim {self.dim} is small, returning zeros.")
             return torch.zeros((time.shape[0], self.dim), device=device)
 
-        # Original formula for div_term, safe now because half_dim > 1
+        # Original formula for div_term, safe now because half_dim >= 1
         # Note: In the original code, 'embeddings' variable was reused. Renaming for clarity.
         div_term_val = math.log(10000) / (half_dim - 1) 
         
