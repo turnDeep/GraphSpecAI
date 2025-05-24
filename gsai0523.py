@@ -47,15 +47,19 @@ import torch.optim as optim
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# モデル定数
-HIDDEN_DIM = 256
-LATENT_DIM = 128
-SPECTRUM_DIM = 2000  # m/zの最大値
-MAX_ATOMS = 100  # 1分子あたりの最大原子数
-MAX_MOTIFS = 20  # 1分子あたりの最大モチーフ数
-ATOM_FEATURE_DIM = 150  # 原子特徴量の次元
-BOND_FEATURE_DIM = 10  # 結合特徴量の次元
-MOTIF_FEATURE_DIM = 20  # モチーフ特徴量の次元
+# --- Model Configuration ---
+class ModelConfig:
+    def __init__(self):
+        self.HIDDEN_DIM = 256
+        self.LATENT_DIM = 128
+        self.SPECTRUM_DIM = 2000  # m/zの最大値
+        self.MAX_ATOMS = 100  # 1分子あたりの最大原子数
+        self.MAX_MOTIFS = 20  # 1分子あたりの最大モチーフ数
+        self.ATOM_FEATURE_DIM = 150  # 原子特徴量の次元
+        self.BOND_FEATURE_DIM = 10  # 結合特徴量の次元
+        self.MOTIF_FEATURE_DIM = 20  # モチーフ特徴量の次元
+
+MODEL_CONFIG = ModelConfig()
 
 # 拡散モデル定数
 DIFFUSION_STEPS = 1000
@@ -174,7 +178,7 @@ class Fragment:
         
         # 1. 電子供与基/吸引基の存在をチェック
         donors = ['NH2', 'OH', 'OCH3', 'CH3']
-        acceptors = ['NO2', 'CN', 'CF3', 'COOR', 'COR'] # Assuming 'COOR' and 'COR' are valid SMARTS or will be handled if not.
+        acceptors = ['[N+](=O)[O-]', 'C#N', 'C(F)(F)F', 'C(=O)O[#6]', 'C(=O)[#6]'] # Assuming 'COOR' and 'COR' are valid SMARTS or will be handled if not.
                                                        # For RDKit, these might need to be more specific like '[CX3](=O)O[#6]' for COOR.
                                                        # However, the task is to fix the None check, not validate SMARTS strings themselves.
 
@@ -376,41 +380,47 @@ class StructureEncoder(nn.Module):
         )
     
     def forward(self, data):
-        """順伝播: 化学構造から潜在表現を生成"""
-        # 原子特徴量をエンコード
-        # Make sure data['atom_features'] is a tensor. It is from MoleculeData.
-        encoded_atom_features = self.atom_encoder(data['atom_features']) 
+        # dataがMoleculeDataオブジェクトの場合の処理
+        if hasattr(data, 'graph_data'):
+            graph_data = data.graph_data
+        else:
+            graph_data = data
         
+        # atom_featuresをテンソルに変換
+        # Ensure np and torch are imported.
+        # self.atom_encoder.weight.device should be valid.
+        if isinstance(graph_data['atom_features'], np.ndarray):
+            atom_features = torch.FloatTensor(graph_data['atom_features']).to(self.atom_encoder.weight.device)
+        else:
+            atom_features = graph_data['atom_features']
+        
+        encoded_atom_features = self.atom_encoder(atom_features)
+        
+        # The rest of the original forward method should follow, using the new encoded_atom_features.
+        # The issue description only provides the modification for atom_features.
+        # I will append the rest of the original method.
+        
+        # Original code after encoded_atom_features:
         # モチーフ特徴量をエンコード
-        encoded_motif_features = self.motif_encoder(data['motif_features'])
+        # This part needs to use graph_data which has been defined.
+        encoded_motif_features = self.motif_encoder(graph_data['motif_features'])
 
         # Atom processing
         if encoded_atom_features.shape[0] == 0:
+            # Ensure self.hidden_dim is available.
             atom_global = torch.zeros(self.hidden_dim, device=encoded_atom_features.device)
         else:
             atom_embeddings = encoded_atom_features
-            # GCN層で原子グラフを更新
-            # TODO: The current GCNConv layers do not utilize edge features (bond information from data['edge_attr']).
-            # For enhanced chemical structure representation, consider replacing GCNConv
-            # with a GNN layer that incorporates edge attributes (e.g., NNConv, GATConv with edge features, or a custom MessagePassing layer).
-            # The data['edge_attr'] is prepared by MoleculeData._build_graph_data and is available.
-            # The self.bond_encoder is also available but its output (encoded_bond_features) would need to be integrated into the GNN message passing.
-            
-            # Only run GCN if there are nodes and edges.
-            # GCNConv typically expects num_nodes > 0. If num_nodes == 0, edge_index will also be (2,0).
-            # If num_nodes > 0 but no edges, GCN can still process node features.
-            if atom_embeddings.shape[0] > 0 and data['edge_index'].shape[1] > 0:
+            if atom_embeddings.shape[0] > 0 and graph_data['edge_index'].shape[1] > 0:
                  for gcn in self.gcn_layers:
-                    atom_embeddings = F.relu(gcn(atom_embeddings, data['edge_index']))
-            elif atom_embeddings.shape[0] > 0: # Nodes exist but no edges
-                # Pass through atom_embeddings if GCN layers are not run
-                pass # atom_embeddings remains encoded_atom_features or last GCN output
+                    # Ensure F (torch.nn.functional) is imported
+                    atom_embeddings = F.relu(gcn(atom_embeddings, graph_data['edge_index']))
+            elif atom_embeddings.shape[0] > 0: 
+                pass 
 
-            # グローバルアテンション適用
-            # Input to attention: (N, L, E) where N is batch_size, L is seq_length, E is embedding_dim
-            atom_embeddings_for_attn = atom_embeddings.unsqueeze(0) # (1, num_atoms, hidden_dim)
+            atom_embeddings_for_attn = atom_embeddings.unsqueeze(0) 
             atom_attn_output, _ = self.attention(atom_embeddings_for_attn, atom_embeddings_for_attn, atom_embeddings_for_attn)
-            atom_attn_output = atom_attn_output.squeeze(0) # (num_atoms, hidden_dim)
+            atom_attn_output = atom_attn_output.squeeze(0) 
             atom_global = torch.mean(atom_attn_output, dim=0)
 
         # Motif processing
@@ -418,23 +428,18 @@ class StructureEncoder(nn.Module):
             motif_global = torch.zeros(self.hidden_dim, device=encoded_motif_features.device)
         else:
             motif_embeddings = encoded_motif_features
-            # GIN層でモチーフグラフを更新 if num_nodes > 0 and edges exist
-            if motif_embeddings.shape[0] > 0 and data['motif_edge_index'].shape[1] > 0:
+            if motif_embeddings.shape[0] > 0 and graph_data['motif_edge_index'].shape[1] > 0:
                 for gin in self.gin_layers:
-                    motif_embeddings = F.relu(gin(motif_embeddings, data['motif_edge_index']))
-            elif motif_embeddings.shape[0] > 0: # Motifs exist but no edges
-                pass # motif_embeddings remains encoded_motif_features or last GIN output
+                    motif_embeddings = F.relu(gin(motif_embeddings, graph_data['motif_edge_index']))
+            elif motif_embeddings.shape[0] > 0: 
+                pass 
             
-            # グローバルアテンション適用
-            motif_embeddings_for_attn = motif_embeddings.unsqueeze(0) # (1, num_motifs, hidden_dim)
+            motif_embeddings_for_attn = motif_embeddings.unsqueeze(0)
             motif_attn_output, _ = self.attention(motif_embeddings_for_attn, motif_embeddings_for_attn, motif_embeddings_for_attn)
-            motif_attn_output = motif_attn_output.squeeze(0) # (num_motifs, hidden_dim)
+            motif_attn_output = motif_attn_output.squeeze(0) 
             motif_global = torch.mean(motif_attn_output, dim=0)
         
-        # 原子とモチーフの表現を結合
         combined = torch.cat([atom_global, motif_global], dim=0)
-        
-        # 潜在表現に射影
         latent = self.projector(combined)
         
         return latent
@@ -454,6 +459,9 @@ class StructureDecoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim * 2)
         )
         
+        # New layer for projecting node features
+        self.node_feature_projector = nn.Linear(hidden_dim * 2 + 1, hidden_dim)
+
         # グラフ生成モジュール
         self.graph_generator = nn.ModuleDict({
             # ノード（原子）の存在確率を予測
@@ -504,146 +512,65 @@ class StructureDecoder(nn.Module):
                 nn.Linear(hidden_dim, len(MOTIF_TYPES))
             )
         })
-    
-    def forward(self, latent, max_atoms=MAX_ATOMS):
-        """順伝播: 潜在表現から化学構造を生成"""
-        # 潜在表現を拡張
+
+    def forward(self, latent, max_atoms=MODEL_CONFIG.MAX_ATOMS): # MAX_ATOMS is global
         expanded = self.expander(latent)
-        
-        # ノード（原子）の特徴量を生成
+    
         if len(latent.shape) == 1:  # Single sample
-            # Assuming 'expanded' for single sample is 1D, e.g. shape [hidden_dim*2]
-            # To make the original intent somewhat work, view it as [something, hidden_dim]
-            _expanded_view = expanded.view(-1, self.hidden_dim) # e.g. [2, hidden_dim]
-            node_hiddens = _expanded_view[:max_atoms, :]
-        else:  # Batch
-            batch_size = latent.shape[0]
-            # 'expanded' is [batch_size, hidden_dim*2]
-            _expanded_view = expanded.view(batch_size, -1, self.hidden_dim) # Shape [batch_size, 2, hidden_dim]
-            node_hiddens = _expanded_view[:, :max_atoms, :] # node_hiddens is [batch_size, min(max_atoms, 2), hidden_dim]
+            latent = latent.unsqueeze(0)  # Add batch dimension
+            expanded = self.expander(latent) # Re-expand with batch dimension
+    
+        batch_size = latent.shape[0]
         
-        # ノード（原子）の存在確率
+        # ノード特徴量の生成（各原子に対して独立した特徴量を生成）
+        node_features = []
+        for i in range(max_atoms):
+            # 位置エンコーディングを追加
+            position_encoding = torch.tensor([i / max_atoms], device=latent.device).expand(batch_size, 1)
+            atom_input = torch.cat([expanded, position_encoding], dim=-1) 
+            node_features.append(atom_input)
+        
+        node_hiddens = torch.stack(node_features, dim=1) # [B, max_atoms, H*2+1]
+        node_hiddens = self.node_feature_projector(node_hiddens) # [B, max_atoms, H]
+        
         node_exists = self.graph_generator['node_existence'](node_hiddens)
-        
-        # ノード（原子）の種類
         node_types = self.graph_generator['node_type'](node_hiddens)
-        
-        # エッジ（結合）の特徴量を生成
-        # Example: node_hiddens shape might be [B, N, H] where N = min(max_atoms, 2)
 
-        edge_hiddens_list = [] # To store edge feature tensors for each item in the batch or for a single sample
-
-        if len(latent.shape) == 1:  # Single sample
-            # Ensure node_hiddens for single sample is correctly shaped, e.g., [N, H]
-            # If node_hiddens was [min(max_atoms,2), H] from the unified logic:
-            num_nodes_for_sample = node_hiddens.shape[0]
+        edge_hiddens_list = []
+        for b_idx in range(batch_size):
             current_sample_edges = []
-            for i in range(num_nodes_for_sample):
-                for j in range(i + 1, num_nodes_for_sample):
-                    combined = torch.cat([node_hiddens[i], node_hiddens[j]], dim=0)
+            for i in range(max_atoms): 
+                for j in range(i + 1, max_atoms): 
+                    combined = torch.cat([node_hiddens[b_idx, i], node_hiddens[b_idx, j]], dim=0) 
                     current_sample_edges.append(combined)
-            if current_sample_edges:
+            if current_sample_edges: # Only stack if there are edges (max_atoms >= 2)
                 edge_hiddens_list.append(torch.stack(current_sample_edges))
-            # If no edges, edge_hiddens_list remains empty for single sample case.
-            # The original code produced a single tensor for edge_hiddens.
-            # So, if edge_hiddens_list is not empty, edge_hiddens = edge_hiddens_list[0]
-            # else, edge_hiddens = torch.zeros((0, self.hidden_dim * 2), device=node_hiddens.device, dtype=node_hiddens.dtype)
+            else: # For max_atoms < 2, this item in batch has no edges
+                edge_hiddens_list.append(torch.empty((0, self.hidden_dim * 2), device=node_hiddens.device, dtype=node_hiddens.dtype))
 
-        else:  # Batch processing
-            batch_size = node_hiddens.shape[0]
-            # num_nodes_for_item will be node_hiddens.shape[1], e.g., min(max_atoms, 2)
-            num_nodes_for_item = node_hiddens.shape[1] 
-                                                     
-            for b in range(batch_size):
-                current_item_edges = []
-                for i in range(num_nodes_for_item):
-                    for j in range(i + 1, num_nodes_for_item):
-                        # node_hiddens[b, i] is [H], node_hiddens[b, j] is [H]
-                        # torch.cat concatenates them to [2H]
-                        combined = torch.cat([node_hiddens[b, i], node_hiddens[b, j]], dim=0)
-                        current_item_edges.append(combined)
-                
-                if current_item_edges:
-                    edge_hiddens_list.append(torch.stack(current_item_edges))
-                else:
-                    # If an item in the batch has no edges, append an empty tensor with correct feature dimension.
-                    edge_hiddens_list.append(torch.empty((0, self.hidden_dim * 2), device=node_hiddens.device, dtype=node_hiddens.dtype))
+        # Stack the list of edge features for each batch item
+        # All items will have max_atoms * (max_atoms - 1) / 2 edges if max_atoms >=2
+        if batch_size > 0 and max_atoms >=2 : 
+            edge_hiddens = torch.stack(edge_hiddens_list) # [B, num_edges, H*2]
+        elif batch_size > 0 : # Batch exists, but no edges possible (max_atoms < 2)
+            edge_hiddens = torch.empty((batch_size, 0, self.hidden_dim *2), device=node_hiddens.device, dtype=node_hiddens.dtype)
+        else: # No batch, no edges
+            edge_hiddens = torch.empty((0, 0, self.hidden_dim*2), device=node_hiddens.device, dtype=node_hiddens.dtype)
 
-        # At this point, edge_hiddens_list contains a list of tensors.
-        # Each tensor is [num_edges_for_item, hidden_dim * 2].
-        # For downstream layers (edge_existence, edge_type prediction), these need to be a single tensor.
-        # The user's original code for single sample was:
-        # edge_hiddens = torch.stack(edge_hiddens) if edge_hiddens else torch.zeros((0, self.hidden_dim * 2))
-        # The user's suggestion for batch mode ended with:
-        # edge_hiddens = torch.stack(edge_hiddens) if edge_hiddens else torch.zeros((batch_size, 0, self.hidden_dim * 2))
-        # This implies edge_hiddens (the list) should be stackable, meaning all items have the same number of edges.
-
-        # Let's try to make it robust:
-        # If it was a single sample case and edge_hiddens_list has one item (or none)
-        if len(latent.shape) == 1:
-            if edge_hiddens_list:
-                edge_hiddens = edge_hiddens_list[0] # This is [NumEdges, FeatureDim]
-            else:
-                edge_hiddens = torch.zeros((0, self.hidden_dim * 2), device=node_hiddens.device, dtype=node_hiddens.dtype)
-        else: # Batch case
-            # Check if all tensors in edge_hiddens_list have the same number of edges (shape[0])
-            # This is a critical assumption for torch.stack to work directly to form [B, NumEdges, FeatureDim]
-            # For now, we follow the user's implicit assumption that they can be stacked.
-            # If edge_hiddens_list is empty (e.g. batch_size was 0, though unlikely here), handle it.
-            if not edge_hiddens_list: # Should not happen if batch_size > 0
-                 edge_hiddens = torch.zeros((node_hiddens.shape[0], 0, self.hidden_dim * 2), device=node_hiddens.device, dtype=node_hiddens.dtype)
-            else:
-                # Attempt to stack. This will fail if edge counts are not uniform.
-                try:
-                    edge_hiddens = torch.stack(edge_hiddens_list)
-                except RuntimeError as e:
-                    # This error means edge counts varied. This is a known limitation of this direct stacking.
-                    # For now, we can't proceed if they are not stackable with this simple approach.
-                    # Log a warning or re-raise. For the purpose of this subtask, let this error propagate
-                    # if it occurs, as it indicates a deeper issue than just the loop structure.
-                    # Or, as a fallback for this subtask, use the first item if stack fails (not ideal for batch)
-                    # For now, let it attempt to stack and fail, to highlight the issue.
-                    # A simple fallback might be to pad, but that's beyond this scope.
-                    # The user's code: torch.zeros((batch_size, 0, self.hidden_dim * 2)) was for if edge_hiddens (the list) was empty.
-                    # If the list is not empty, but elements are unstackable, it's different.
-                    # A more robust solution would involve padding, but let's stick to the simplest interpretation of user's code.
-                    # If any item had 0 edges, its tensor is [0, FeatureDim]. Stack will still work if others also have 0 edges.
-                    # The problem is if Item1 has 3 edges [3, Feat], Item2 has 4 edges [4, Feat]. Stack fails.
-                    # Given user's `torch.zeros((batch_size, 0, self.hidden_dim * 2))` fallback, it seems they might expect
-                    # this to be used if stacking is not possible / no edges.
-                    # This is ambiguous. Let's make it so if stacking fails, it produces an empty edge set for the batch.
-                    # This is not ideal but makes the code runnable.
-                    # A better solution is needed if edge counts vary and edges are essential.
-                    is_stackable = all(t.shape[0] == edge_hiddens_list[0].shape[0] for t in edge_hiddens_list)
-                    if is_stackable:
-                        edge_hiddens = torch.stack(edge_hiddens_list)
-                    else:
-                        # This is a problematic case. Downstream layers will get 0 edges for the whole batch.
-                        # logger.warning("Varying number of edges per item in batch. StructureDecoder edge generation will produce 0 edges for this batch.")
-                        batch_size = node_hiddens.shape[0]
-                        edge_hiddens = torch.zeros((batch_size, 0, self.hidden_dim * 2), device=node_hiddens.device, dtype=node_hiddens.dtype)
-
-        # Ensure 'edge_hiddens' is defined for the return statement.
-        # The original code had:
-        # edge_exists = self.graph_generator['edge_existence'](edge_hiddens)
-        # edge_types = self.graph_generator['edge_type'](edge_hiddens)
-        # These expect edge_hiddens to be a single tensor.
-        # If it's batch mode, it should be [B, NumEdges, FeatureDim] or [TotalBatchEdges, FeatureDim]
-        # The logic above producing [B, N_edges_const_across_batch, FeatDim] or [B, 0, FeatDim] fits this.
-        
-        # エッジ（結合）の存在確率
         edge_exists = self.graph_generator['edge_existence'](edge_hiddens)
-        
-        # エッジ（結合）の種類
         edge_types = self.graph_generator['edge_type'](edge_hiddens)
-        
-        # モチーフの特徴量を生成
-        motif_hiddens = expanded[max_atoms:, :self.hidden_dim]
-        
-        # モチーフの存在確率
+
+        # Motif generation: using a slice of `expanded` and repeating for MAX_MOTIFS
+        # `expanded` has shape [batch_size, hidden_dim * 2]
+        # `self.hidden_dim` is defined in __init__
+        # `MAX_MOTIFS` is a global constant
+        motif_hiddens_base = expanded[:, self.hidden_dim:] # Shape: [batch_size, hidden_dim]
+        if batch_size > 0:
+            motif_hiddens = motif_hiddens_base.unsqueeze(1).repeat(1, MAX_MOTIFS, 1) # Shape: [B, MAX_MOTIFS, H]
+        else: # Handle empty batch case
+            motif_hiddens = torch.empty((0, MAX_MOTIFS, self.hidden_dim), device=expanded.device, dtype=expanded.dtype)
+
         motif_exists = self.motif_generator['motif_existence'](motif_hiddens)
-        
-        # モチーフの種類
         motif_types = self.motif_generator['motif_type'](motif_hiddens)
         
         return {
@@ -914,7 +841,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
 class BidirectionalSelfGrowingModel(nn.Module):
     """構造-スペクトル間の双方向自己成長型モデル"""
     
-    def __init__(self, atom_fdim, bond_fdim, motif_fdim, spectrum_dim, hidden_dim=HIDDEN_DIM, latent_dim=LATENT_DIM):
+    def __init__(self, atom_fdim, bond_fdim, motif_fdim, spectrum_dim, hidden_dim=MODEL_CONFIG.HIDDEN_DIM, latent_dim=MODEL_CONFIG.LATENT_DIM):
         super(BidirectionalSelfGrowingModel, self).__init__()
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
@@ -1195,7 +1122,7 @@ class MoleculeData:
         
         return np.array(bond_features, dtype=np.float32), adjacency_list
     
-    def _extract_motifs(self, motif_size_threshold=3, max_motifs=MAX_MOTIFS):
+    def _extract_motifs(self, motif_size_threshold=3, max_motifs=MODEL_CONFIG.MAX_MOTIFS):
         """分子からモチーフを抽出"""
         motifs = []
         motif_types = []
@@ -1214,8 +1141,9 @@ class MoleculeData:
                         # モチーフタイプを判定
                         motif_type = self._determine_motif_type(frag_mol)
                         motif_types.append(motif_type)
-        except:
-            pass  # BRICSが失敗する場合はスキップ
+        except Exception as e:
+            logging.warning(f"BRICS decomposition failed for molecule {self.smiles if hasattr(self, 'smiles') else 'unknown'}: {e}")
+            # デフォルト処理を続行 (original comment was "BRICSが失敗する場合はスキップ", so just logging and continuing is appropriate)
         
         # 2. 環系モチーフの抽出
         try:
@@ -1230,8 +1158,9 @@ class MoleculeData:
                         ring_mol = Chem.PathToSubmol(self.mol, ring, atomMap={})
                         ring_type = "aromatic" if any(atom.GetIsAromatic() for atom in ring_mol.GetAtoms()) else "aliphatic_ring"
                         motif_types.append(ring_type)
-        except:
-            pass  # 環抽出が失敗する場合はスキップ
+        except Exception as e:
+            logging.warning(f"Ring system extraction failed for molecule {self.smiles if hasattr(self, 'smiles') else 'unknown'}: {e}")
+            # デフォルト処理を続行 (original comment was "環抽出が失敗する場合はスキップ")
         
         # 3. 機能性グループの抽出
         functional_groups = {
@@ -1253,7 +1182,8 @@ class MoleculeData:
                         if len(match) >= motif_size_threshold and list(match) not in motifs:
                             motifs.append(list(match))
                             motif_types.append(group_name)
-            except:
+            except Exception as e:
+                logging.warning(f"Functional group pattern matching failed for group {group_name} on molecule {self.smiles if hasattr(self, 'smiles') else 'unknown'}: {e}")
                 continue  # パターンマッチングが失敗する場合はスキップ
         
         # 最大モチーフ数を制限
@@ -1447,7 +1377,7 @@ class MoleculeData:
         
         return data
 
-def normalize_spectrum(peaks: List[Tuple[int, int]], max_mz: int = SPECTRUM_DIM, threshold: float = 0.01, top_n: int = 20) -> np.ndarray:
+def normalize_spectrum(peaks: List[Tuple[int, int]], max_mz: int = MODEL_CONFIG.SPECTRUM_DIM, threshold: float = 0.01, top_n: int = 20) -> np.ndarray:
     """マススペクトルを正規化してベクトル形式に変換"""
     spectrum = np.zeros(max_mz)
 
@@ -1502,55 +1432,130 @@ def normalize_spectrum(peaks: List[Tuple[int, int]], max_mz: int = SPECTRUM_DIM,
 class ChemicalStructureSpectumDataset(Dataset):
     """化学構造とマススペクトルのデータセット"""
     
-    def __init__(self, structures=None, spectra=None, structure_spectrum_pairs=None):
-        """
-        データセットを初期化
+    def __init__(self, structures=None, spectra=None, structure_spectrum_pairs=None, lazy_load=True):
+        self.lazy_load = lazy_load
         
-        Args:
-            structures: 構造のリスト（教師なしデータ）
-            spectra: スペクトルのリスト（教師なしデータ）
-            structure_spectrum_pairs: 構造とスペクトルのペアのリスト（教師ありデータ）
-        """
-        self.structures = structures or []
-        self.spectra = spectra or []
-        self.structure_spectrum_pairs = structure_spectrum_pairs or []
-        
-        # データのインデックス管理
-        self.n_pairs = len(self.structure_spectrum_pairs)
-        self.n_structures = len(self.structures)
-        self.n_spectra = len(self.spectra)
+        if self.lazy_load:
+            # In lazy_load mode, 'structures', 'spectra', and 'structure_spectrum_pairs'
+            # are expected to be lists of paths or path pairs.
+            self.structure_paths = structures if structures is not None else []
+            self.spectra_paths = spectra if spectra is not None else []
+            self.structure_spectrum_pair_paths = structure_spectrum_pairs if structure_spectrum_pairs is not None else []
+            
+            self.n_pairs = len(self.structure_spectrum_pair_paths)
+            self.n_structures = len(self.structure_paths)
+            self.n_spectra = len(self.spectra_paths)
+        else:
+            # In non-lazy_load mode, 'structures', 'spectra', and 'structure_spectrum_pairs'
+            # are expected to be lists of loaded data objects.
+            self.structures = structures if structures is not None else [] # List of MoleculeData
+            self.spectra = spectra if spectra is not None else []          # List of np.array
+            self.structure_spectrum_pairs = structure_spectrum_pairs if structure_spectrum_pairs is not None else [] # List of (MoleculeData, np.array)
+
+            self.n_pairs = len(self.structure_spectrum_pairs)
+            self.n_structures = len(self.structures)
+            self.n_spectra = len(self.spectra)
+            
         self.total = self.n_pairs + self.n_structures + self.n_spectra
     
     def __len__(self):
         return self.total
     
     def __getitem__(self, idx):
-        # 教師ありデータ（構造-スペクトルペア）
-        if idx < self.n_pairs:
-            structure, spectrum = self.structure_spectrum_pairs[idx]
-            return {
-                'type': 'supervised',
-                'structure': structure,
-                'spectrum': spectrum
-            }
-        
-        # 教師なし構造データ
-        elif idx < self.n_pairs + self.n_structures:
-            structure = self.structures[idx - self.n_pairs]
-            return {
-                'type': 'unsupervised_structure',
-                'structure': structure,
-                'spectrum': None
-            }
-        
-        # 教師なしスペクトルデータ
+        if self.lazy_load:
+            # --- LAZY LOADING LOGIC ---
+            if idx < self.n_pairs:
+                struct_path, spec_path = self.structure_spectrum_pair_paths[idx]
+                
+                mol = Chem.MolFromMolFile(struct_path)
+                if mol is None:
+                    logging.error(f"LazyLoad Error: Failed to load MOL file: {struct_path} for supervised pair.")
+                    # Return a structure that collate_fn can somewhat handle, or that indicates error.
+                    # Depending on collate_fn, this might need adjustment.
+                    # For now, returning None for data fields.
+                    return {'type': 'supervised', 'structure': None, 'spectrum': None}
+
+                peaks = []
+                try:
+                    with open(spec_path, 'r') as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if len(parts) == 2:
+                                peaks.append((int(float(parts[0])), int(float(parts[1])))) # mz can be float in some MSP, int for normalize
+                except Exception as e:
+                    logging.error(f"LazyLoad Error: Failed to load/parse spectrum file {spec_path} for supervised pair: {e}")
+                    # Create MoleculeData for structure if mol is valid, but spectrum is None.
+                    structure_obj = MoleculeData(mol) if mol else None
+                    return {'type': 'supervised', 'structure': structure_obj, 'spectrum': None}
+
+                # Assuming normalize_spectrum uses MODEL_CONFIG.SPECTRUM_DIM internally for default max_mz
+                spectrum_array = normalize_spectrum(peaks) 
+                structure_obj = MoleculeData(mol, spectrum_array) # Pass spectrum to MoleculeData
+
+                return {
+                    'type': 'supervised',
+                    'structure': structure_obj,
+                    'spectrum': spectrum_array
+                }
+
+            elif idx < self.n_pairs + self.n_structures:
+                struct_path = self.structure_paths[idx - self.n_pairs]
+                mol = Chem.MolFromMolFile(struct_path)
+                if mol is None:
+                    logging.error(f"LazyLoad Error: Failed to load MOL file for unsupervised structure: {struct_path}")
+                    return {'type': 'unsupervised_structure', 'structure': None, 'spectrum': None}
+                
+                structure_obj = MoleculeData(mol)
+
+                return {
+                    'type': 'unsupervised_structure',
+                    'structure': structure_obj,
+                    'spectrum': None
+                }
+            else: # Unsupervised spectrum
+                spec_path = self.spectra_paths[idx - self.n_pairs - self.n_structures]
+                peaks = []
+                try:
+                    with open(spec_path, 'r') as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if len(parts) == 2:
+                                peaks.append((int(float(parts[0])), int(float(parts[1]))))
+                except Exception as e:
+                    logging.error(f"LazyLoad Error: Failed to load/parse spectrum file {spec_path} for unsupervised spectrum: {e}")
+                    return {'type': 'unsupervised_spectrum', 'structure': None, 'spectrum': None}
+
+                spectrum_array = normalize_spectrum(peaks)
+
+                return {
+                    'type': 'unsupervised_spectrum',
+                    'structure': None,
+                    'spectrum': spectrum_array
+                }
         else:
-            spectrum = self.spectra[idx - self.n_pairs - self.n_structures]
-            return {
-                'type': 'unsupervised_spectrum',
-                'structure': None,
-                'spectrum': spectrum
-            }
+            # --- EXISTING NON-LAZY LOGIC ---
+            if idx < self.n_pairs:
+                # structure and spectrum are already loaded MoleculeData and np.array
+                structure, spectrum = self.structure_spectrum_pairs[idx]
+                return {
+                    'type': 'supervised',
+                    'structure': structure,
+                    'spectrum': spectrum
+                }
+            elif idx < self.n_pairs + self.n_structures:
+                structure = self.structures[idx - self.n_pairs] # MoleculeData
+                return {
+                    'type': 'unsupervised_structure',
+                    'structure': structure,
+                    'spectrum': None
+                }
+            else: # Unsupervised spectrum
+                spectrum = self.spectra[idx - self.n_pairs - self.n_structures] # np.array
+                return {
+                    'type': 'unsupervised_spectrum',
+                    'structure': None,
+                    'spectrum': spectrum
+                }
     
     def add_structure_spectrum_pair(self, structure, spectrum):
         """構造-スペクトルペアを追加"""
@@ -1662,18 +1667,20 @@ class SelfGrowingTrainer:
                 
                 # バッチから教師ありデータを抽出
                 supervised_structures_filtered = []
-                supervised_spectra_to_stack = [] # Renamed to avoid confusion with final tensor
+                supervised_spectra_to_stack = []
 
                 for i in supervised_indices:
                     spectrum_item = batch['spectrum'][i]
-                    structure_item = batch['structure'][i] # Assuming structure is always present for supervised
-
-                    if spectrum_item is not None:
-                        # Ensure structure_item is also valid if spectrum_item is valid
-                        # (though the primary concern is spectrum_item being None)
+                    structure_item = batch['structure'][i]
+                    
+                    # 両方が有効な場合のみ追加
+                    if spectrum_item is not None and structure_item is not None:
                         supervised_structures_filtered.append(structure_item)
-                        # Convert numpy array (or other compatible type) to FloatTensor
-                        supervised_spectra_to_stack.append(torch.FloatTensor(spectrum_item))
+                        if isinstance(spectrum_item, torch.Tensor):
+                            supervised_spectra_to_stack.append(spectrum_item)
+                        else:
+                            # Ensure torch is imported
+                            supervised_spectra_to_stack.append(torch.FloatTensor(spectrum_item))
                 
                 # If, after filtering, there are no valid supervised samples in this batch, skip
                 if not supervised_spectra_to_stack:
@@ -1697,7 +1704,7 @@ class SelfGrowingTrainer:
                 
                 # New calculation for loss_p2s:
                 if outputs.get('predicted_structure') and supervised_structures: # Check if prediction and targets are available
-                    structural_targets = self._create_structural_targets(supervised_structures, MAX_ATOMS, self.device)
+                    structural_targets = self._create_structural_targets(supervised_structures, MODEL_CONFIG.MAX_ATOMS, self.device)
 
                     # Ensure predicted_structure contains the expected keys
                     pred_node_exists = outputs['predicted_structure'].get('node_exists')
@@ -2153,7 +2160,7 @@ class SelfGrowingTrainer:
                 if outputs.get('predicted_structure') and supervised_structures: # Check if prediction and targets are available
                     # supervised_structures is a list of MoleculeData objects from the batch
                     # MAX_ATOMS is a global constant
-                    structural_targets = self._create_structural_targets(supervised_structures, MAX_ATOMS, self.device)
+                    structural_targets = self._create_structural_targets(supervised_structures, MODEL_CONFIG.MAX_ATOMS, self.device)
 
                     pred_node_exists = outputs['predicted_structure'].get('node_exists')
                     pred_node_types = outputs['predicted_structure'].get('node_types')
@@ -2290,12 +2297,12 @@ def load_mol_files(directory: str) -> Dict[str, Chem.Mol]:
     
     return mol_data
 
-def prepare_dataset(msp_data: Dict[str, Dict], mol_data: Dict[str, Chem.Mol], 
-                   spectrum_dim: int = SPECTRUM_DIM, test_ratio: float = 0.1, val_ratio: float = 0.1, # Assuming SPECTRUM_DIM is global
+def prepare_dataset(msp_data: Dict[str, Dict], mol_dict: Dict[str, Chem.Mol], 
+                   spectrum_dim: int = MODEL_CONFIG.SPECTRUM_DIM, test_ratio: float = 0.1, val_ratio: float = 0.1, # Assuming SPECTRUM_DIM is global
                    unlabeled_ratio: float = 0.3, seed: int = 42):
     """データセットを準備する"""
     # 共通のIDを持つ化合物だけを使用
-    common_ids = set(msp_data.keys()) & set(mol_data.keys())
+    common_ids = set(msp_data.keys()) & set(mol_dict.keys())
     # logger.info(f"Found {len(common_ids)} compounds with both MSP and MOL data") # Changed print to logger.info
     # Using print as per user's snippet for now.
     print(f"Found {len(common_ids)} compounds with both MSP and MOL data")
@@ -2312,7 +2319,7 @@ def prepare_dataset(msp_data: Dict[str, Dict], mol_data: Dict[str, Chem.Mol],
             spectrum = normalize_spectrum(peaks, max_mz=spectrum_dim)
 
             # 分子を処理
-            mol = mol_data[compound_id]
+            mol = mol_dict[compound_id]
             # MoleculeData should be available
             mol_data_obj = MoleculeData(mol, spectrum)
 
@@ -3059,18 +3066,18 @@ def main(args):
             "data": {
                 "msp_file": "data/NIST17.MSP",
                 "mol_dir": "data/mol_files",
-                "spectrum_dim": 2000,
+                "spectrum_dim": MODEL_CONFIG.SPECTRUM_DIM,
                 "test_ratio": 0.1,
                 "val_ratio": 0.1,
                 "unlabeled_ratio": 0.3,
                 "seed": 42
             },
             "model": {
-                "hidden_dim": 256,
-                "latent_dim": 128,
-                "atom_fdim": 150,
-                "bond_fdim": 10,
-                "motif_fdim": 20
+                "hidden_dim": MODEL_CONFIG.HIDDEN_DIM,
+                "latent_dim": MODEL_CONFIG.LATENT_DIM,
+                "atom_fdim": MODEL_CONFIG.ATOM_FEATURE_DIM,
+                "bond_fdim": MODEL_CONFIG.BOND_FEATURE_DIM,
+                "motif_fdim": MODEL_CONFIG.MOTIF_FEATURE_DIM
             },
             "training": {
                 "batch_size": 32,
