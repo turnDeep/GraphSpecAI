@@ -935,8 +935,9 @@ class BidirectionalSelfGrowingModel(nn.Module):
             # So spectrum_latent from its output is correct here for predicted_structure2.
 
             # Get what the spectrum should reconstruct to using the alignment and decoder
-            reconstructed_spectrum_latent = self.spectrum_to_structure_aligner(spectrum_latent) # Use spectrum_latent from p->s path
-            predicted_spectrum2_reconstructed = self.spectrum_decoder(reconstructed_spectrum_latent)
+            raw_spectrum_latent_for_cycle2 = self.spectrum_encoder(spectrum) # spectrum_latent comes from the p->s path, so it's already aligned for structure. We need raw spec_latent.
+            align_for_spectrum_decoder = self.structure_to_spectrum_aligner(raw_spectrum_latent_for_cycle2) # Align this raw latent for the spectrum decoder
+            predicted_spectrum2_reconstructed = self.spectrum_decoder(align_for_spectrum_decoder)
 
         except Exception as e:
             # Fallback: skip spectrum cycle if conversion fails
@@ -1013,7 +1014,9 @@ class BidirectionalSelfGrowingModel(nn.Module):
         spectrum_cycle_loss = F.mse_loss(predicted_spectrum2_reconstructed, spectrum)
 
         # 潜在表現の一貫性損失
-        latent_consistency_loss = F.mse_loss(structure_latent, spectrum_latent)
+        raw_structure_latent = self.structure_encoder(structure_data)
+        raw_spectrum_latent = self.spectrum_encoder(spectrum)
+        latent_consistency_loss = F.mse_loss(raw_structure_latent, raw_spectrum_latent)
 
         return structure_cycle_loss + spectrum_cycle_loss + 0.1 * latent_consistency_loss
 
