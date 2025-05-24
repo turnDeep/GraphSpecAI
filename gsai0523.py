@@ -24,6 +24,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem, BRICS, Descriptors, Draw, MolToSmiles, MurckoScaffold, rdMolDescriptors
 from rdkit.Chem.Draw import rdMolDraw2D
 from rdkit.Chem.Scaffolds import MurckoScaffold as MS
+from rdkit.Chem import DataStructs
 from rdkit.Chem.rdchem import BondType
 from sklearn.manifold import TSNE
 from sklearn.metrics import (accuracy_score, confusion_matrix,
@@ -510,7 +511,16 @@ class StructureDecoder(nn.Module):
         expanded = self.expander(latent)
         
         # ノード（原子）の特徴量を生成
-        node_hiddens = expanded[:max_atoms, :self.hidden_dim]
+        if len(latent.shape) == 1:  # Single sample
+            # Assuming 'expanded' for single sample is 1D, e.g. shape [hidden_dim*2]
+            # To make the original intent somewhat work, view it as [something, hidden_dim]
+            _expanded_view = expanded.view(-1, self.hidden_dim) # e.g. [2, hidden_dim]
+            node_hiddens = _expanded_view[:max_atoms, :]
+        else:  # Batch
+            batch_size = latent.shape[0]
+            # 'expanded' is [batch_size, hidden_dim*2]
+            _expanded_view = expanded.view(batch_size, -1, self.hidden_dim) # Shape [batch_size, 2, hidden_dim]
+            node_hiddens = _expanded_view[:, :max_atoms, :] # node_hiddens is [batch_size, min(max_atoms, 2), hidden_dim]
         
         # ノード（原子）の存在確率
         node_exists = self.graph_generator['node_existence'](node_hiddens)
@@ -944,70 +954,24 @@ class BidirectionalSelfGrowingModel(nn.Module):
             logger.warning(f"Spectrum cycle computation failed: {e}")
             predicted_spectrum2_reconstructed = spectrum  # Use original spectrum as fallback
 
-        # 構造サイクル損失 - compare in tensor space
-        # structure_data is a single MoleculeData graph_data dict here, not a list.
-        # The _create_structural_targets expects a list.
-        # This part needs adjustment if structure_data is not a list.
-        # Assuming structure_data is what self.structure_encoder expects, which is a dict.
-        # The original loss was: F.mse_loss(predicted_structure["node_exists"], structure_data["node_exists"])
-        # This implies structure_data should have 'node_exists'. MoleculeData.graph_data does not create it.
-        # StructureDecoder output has 'node_exists'.
-        # This part of the user's code implies SelfGrowingTrainer._create_structural_targets is called outside
-        # or structure_data is pre-processed.
-        # For now, let's keep the user's logic for loss calculation, assuming structure_data might be a list
-        # or this method is called from a context where structure_data is a list of MoleculeData objects.
-        # However, the signature is (self, structure_data, spectrum).
-        # Let's assume structure_data is a single graph_data for now, and adapt the loss.
-        # The original `structure_cycle_loss` compared `predicted_structure["node_exists"]` (output of StructureDecoder)
-        # with `structure_data["node_exists"]`. This latter part is problematic as `structure_data` (graph input)
-        # doesn't have pre-computed `node_exists` like decoder output.
-        # The new helper `_create_structural_targets` is intended to create these targets.
-        # It should be called with the original `structure_data` (MoleculeData object).
+        # Structure cycle loss:
+        # This part calculates loss for the structure predicted from the first cycle (structure -> spectrum -> structure)
+        # predicted_structure is available from:
+        # predicted_spectrum, structure_latent = self.structure_to_spectrum(structure_data)
+        # predicted_structure, _ = self.spectrum_to_structure(predicted_spectrum)
 
-        # If structure_data is a single MoleculeData graph dict (as typically passed to structure_to_spectrum):
-        if isinstance(structure_data, dict) and 'mol_obj_for_loss' in structure_data: # Expect a way to get Mol object
-            # This requires passing the RDKit Mol object or MoleculeData object somehow.
-            # Let's assume structure_data is actually the MoleculeData object itself or its graph_data dict
-            # and we can retrieve the mol object.
-            # This implies structure_data needs to be the full MoleculeData object.
-            # Or, the trainer should prepare these targets.
-            # For now, this part of the user code for structure_cycle_loss cannot be directly used
-            # without changing how structure_data is passed or what it contains.
-            # The original code was:
-            # structure_cycle_loss = F.mse_loss(
-            # predicted_structure["node_exists"],
-            # structure_data["node_exists"] # This was the presumed error source for structure_data
-            # )
-            # The new helper is in SelfGrowingTrainer. This method is in BidirectionalSelfGrowingModel.
-            # This suggests the loss calculation strategy in user feedback might be intended for the Trainer.
-            # Let's revert to a simpler MSE on available dict keys if direct target creation isn't possible here.
-            # The critical part of issue #26 was predicted_spectrum2. Let's focus the fix there.
-            # For structure_cycle_loss, we need a ground truth for predicted_structure (output of StructureDecoder).
-            # The original structure_data (input to StructureEncoder) is not in the same format.
-            # This is a complex part. Let's use a placeholder for structure_cycle_loss for now,
-            # or attempt to use the new logic if structure_data can be assumed to be [MoleculeData_object].
-            # Given the context, structure_data is likely a single graph dict.
-            # We cannot call _create_structural_targets here as it's in the trainer.
-            # So, the structure_cycle_loss part of the user's code is problematic here.
-            # I will use a simplified loss for node_exists, assuming structure_data might have an x feature.
-            # This is a deviation from user's code due to architectural constraints.
-
-            # Fallback for structure_cycle_loss:
-            # If predicted_structure is available and structure_data has 'x' (atom features)
-            if predicted_structure and 'x' in structure_data:
-                 # A very rough comparison: check if predicted nodes exist where actual atoms exist.
-                 # This is not ideal. The original structure_data['node_exists'] was never defined.
-                 # Let's make it a zero loss for now to avoid introducing new errors,
-                 # as the main fix is for predicted_spectrum2.
-                 num_predicted_nodes = predicted_structure.get('node_exists', torch.tensor(0.0, device=spectrum.device)).sum()
-                 num_actual_nodes = structure_data['x'].shape[0] if 'x' in structure_data else 0
-                 # This is not a good loss. Using zero for now.
-                 structure_cycle_loss = torch.tensor(0.0, device=spectrum.device) # Placeholder
-            else:
-                 structure_cycle_loss = torch.tensor(0.0, device=spectrum.device)
-
-        else: # If structure_data is not a dict or 'x' is not in it
-            structure_cycle_loss = torch.tensor(0.0, device=spectrum.device)
+        if isinstance(structure_data, dict) and 'x' in structure_data and            predicted_structure and 'node_exists' in predicted_structure:
+            num_actual_atoms = structure_data['x'].shape[0]
+            # node_exists is typically [max_atoms, 1] after sigmoid. Summing gives a soft count.
+            num_predicted_atoms = predicted_structure['node_exists'].sum()
+            
+            structure_cycle_loss = F.mse_loss(
+                num_predicted_atoms.float(),
+                torch.tensor(float(num_actual_atoms), device=spectrum.device) # Use spectrum's device
+            )
+        else:
+            # Fallback if data is not in expected format or prediction is missing
+            structure_cycle_loss = torch.tensor(0.0, device=spectrum.device) 
 
 
         # スペクトルサイクル損失
@@ -1638,22 +1602,32 @@ class SelfGrowingTrainer:
                 # 損失計算
                 loss_s2p = F.mse_loss(outputs['predicted_spectrum'], supervised_spectra)
                 
-                structure_losses = []
-                for i, structure_output in enumerate(outputs['predicted_structure']):
-                    # 構造に関する損失を計算
-                    node_exists_loss = F.binary_cross_entropy(
-                        structure_output['node_exists'],
-                        torch.tensor([s['node_exists'] for s in supervised_structures], device=self.device)
-                    )
-                    node_types_loss = F.cross_entropy(
-                        structure_output['node_types'],
-                        torch.tensor([s['node_types'] for s in supervised_structures], device=self.device)
-                    )
-                    structure_loss = node_exists_loss + node_types_loss
-                    structure_losses.append(structure_loss)
-                
-                loss_p2s = sum(structure_losses) / len(structure_losses) if structure_losses else 0
-                
+                # New calculation for loss_p2s:
+                if outputs.get('predicted_structure') and supervised_structures: # Check if prediction and targets are available
+                    structural_targets = self._create_structural_targets(supervised_structures, MAX_ATOMS, self.device)
+
+                    # Ensure predicted_structure contains the expected keys
+                    pred_node_exists = outputs['predicted_structure'].get('node_exists')
+                    pred_node_types = outputs['predicted_structure'].get('node_types')
+
+                    if pred_node_exists is not None and pred_node_types is not None:
+                        node_exists_loss = F.binary_cross_entropy(
+                            pred_node_exists,
+                            structural_targets['node_exists']
+                        )
+
+                        predicted_node_types_permuted = pred_node_types.permute(0, 2, 1)
+                        node_types_loss = F.cross_entropy(
+                            predicted_node_types_permuted,
+                            structural_targets['node_types']
+                        )
+                        loss_p2s = node_exists_loss + node_types_loss
+                    else:
+                        # Handle case where predicted structure or its components might be missing
+                        loss_p2s = torch.tensor(0.0, device=self.device) # Or log a warning
+                else:
+                    loss_p2s = torch.tensor(0.0, device=self.device) # Or log a warning
+
                 # 合計損失
                 loss = loss_s2p + loss_p2s
                 
@@ -1855,17 +1829,28 @@ class SelfGrowingTrainer:
                                    if t == 'unsupervised_spectrum']
                 
                 for idx in spectrum_indices:
-                    spectrum = torch.FloatTensor(batch['spectrum'][idx]).to(self.device)
+                    spectrum_input = torch.FloatTensor(batch['spectrum'][idx]).unsqueeze(0).to(self.device)
                     
                     # スペクトルから構造を予測
-                    spectrum_data = {'spectrum': spectrum}
+                    spectrum_data = {'spectrum': spectrum_input}
                     outputs = self.model(spectrum_data, direction="spectrum_to_structure")
-                    predicted_structure = outputs['predicted_structure']
+                    predicted_structure_batch = outputs['predicted_structure']
+                    
+                    # Create a dictionary for a single prediction by indexing/squeezing the batch dimension
+                    single_pred_data_dict = {}
+                    for key, batched_tensor in predicted_structure_batch.items():
+                        if isinstance(batched_tensor, torch.Tensor):
+                            single_pred_data_dict[key] = batched_tensor.squeeze(0) # Remove the batch dim of 1
+                        else:
+                            single_pred_data_dict[key] = batched_tensor # Handle non-tensor data if any
+
+                    # Now call _convert_to_molecule with the single prediction data
+                    molecule_object = self._convert_to_molecule(single_pred_data_dict)
                     
                     # 疑似ラベルとして追加
                     pseudo_labeled_data.append({
-                        'structure': self._convert_to_molecule(predicted_structure),
-                        'spectrum': batch['spectrum'][idx],
+                        'structure': molecule_object,
+                        'spectrum': batch['spectrum'][idx], # This is the original spectrum
                         'confidence': self._calculate_confidence(outputs)
                     })
         
