@@ -400,9 +400,10 @@ class StructureEncoder(nn.Module):
         # Ensure np and torch are imported.
         # self.atom_encoder.weight.device should be valid.
         if isinstance(graph_data['atom_features'], np.ndarray):
-            atom_features = torch.FloatTensor(graph_data['atom_features']).to(self.atom_encoder.weight.device)
+            atom_features = torch.FloatTensor(graph_data['atom_features'])
         else:
             atom_features = graph_data['atom_features']
+        atom_features = atom_features.to(self.atom_encoder.weight.device) # Ensure device
         
         encoded_atom_features = self.atom_encoder(atom_features)
         
@@ -413,7 +414,13 @@ class StructureEncoder(nn.Module):
         # Original code after encoded_atom_features:
         # モチーフ特徴量をエンコード
         # This part needs to use graph_data which has been defined.
-        encoded_motif_features = self.motif_encoder(graph_data['motif_features'])
+        motif_features = graph_data['motif_features']
+        if isinstance(motif_features, np.ndarray): # Should not happen based on MoleculeData._build_graph_data
+            motif_features = torch.FloatTensor(motif_features).to(self.motif_encoder.weight.device)
+        else:
+            motif_features = motif_features.to(self.motif_encoder.weight.device)
+        # Then call the encoder:
+        encoded_motif_features = self.motif_encoder(motif_features)
 
         # Atom processing
         if encoded_atom_features.shape[0] == 0:
@@ -422,9 +429,10 @@ class StructureEncoder(nn.Module):
         else:
             atom_embeddings = encoded_atom_features
             if atom_embeddings.shape[0] > 0 and graph_data['edge_index'].shape[1] > 0:
+                 edge_index = graph_data['edge_index'].to(atom_embeddings.device)
                  for gcn in self.gcn_layers:
                     # Ensure F (torch.nn.functional) is imported
-                    atom_embeddings = F.relu(gcn(atom_embeddings, graph_data['edge_index']))
+                    atom_embeddings = F.relu(gcn(atom_embeddings, edge_index))
             elif atom_embeddings.shape[0] > 0: 
                 pass 
 
@@ -439,8 +447,9 @@ class StructureEncoder(nn.Module):
         else:
             motif_embeddings = encoded_motif_features
             if motif_embeddings.shape[0] > 0 and graph_data['motif_edge_index'].shape[1] > 0:
+                motif_edge_index = graph_data['motif_edge_index'].to(motif_embeddings.device)
                 for gin in self.gin_layers:
-                    motif_embeddings = F.relu(gin(motif_embeddings, graph_data['motif_edge_index']))
+                    motif_embeddings = F.relu(gin(motif_embeddings, motif_edge_index))
             elif motif_embeddings.shape[0] > 0: 
                 pass 
             
