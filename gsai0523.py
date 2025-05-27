@@ -21,7 +21,7 @@ import seaborn as sns
 import torch
 from PIL import Image
 from rdkit import Chem
-from rdkit.Chem import AllChem, BRICS, Descriptors, Draw, MolToSmiles, MurckoScaffold, rdMolDescriptors
+from rdkit.Chem import AllChem, BRICS, Descriptors, Draw, MolToSmiles, rdMolDescriptors
 from rdkit.Chem.Draw import rdMolDraw2D
 from rdkit.Chem.Scaffolds import MurckoScaffold as MS
 from rdkit.Chem import DataStructs
