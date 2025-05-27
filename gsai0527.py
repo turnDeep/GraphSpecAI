@@ -880,11 +880,35 @@ class BidirectionalSelfGrowingModel(nn.Module):
     
     def structure_to_spectrum(self, structure_data):
         """構造からスペクトルを予測"""
-        # 構造をエンコード
-        latent = self.structure_encoder(structure_data)
-        
+        if isinstance(structure_data, list):
+            latents = []
+            for item in structure_data:
+                current_latent = self.structure_encoder(item)
+                if current_latent is not None: # Add check for None
+                    latents.append(current_latent)
+            
+            if latents: # Check if latents list is not empty
+                latent_batch = torch.stack(latents)
+            else:
+                # Handle case where structure_data was a list but all items failed to encode
+                # For now, returning None or raising an error might be options.
+                # Based on problem description, assume this won't happen due to prior checks.
+                # If it can, this needs robust error handling.
+                # For example, return (None, None) or raise ValueError
+                logger.warning("structure_to_spectrum: structure_data was a list, but all items failed to encode.")
+                return None, None 
+        else:
+            # Single MoleculeData object
+            latent_val = self.structure_encoder(structure_data)
+            if latent_val is not None:
+                latent_batch = latent_val.unsqueeze(0)
+            else:
+                # Handle case where single structure_data failed to encode
+                logger.warning("structure_to_spectrum: single structure_data failed to encode.")
+                return None, None
+
         # 潜在表現を調整
-        aligned_latent = self.structure_to_spectrum_aligner(latent)
+        aligned_latent = self.structure_to_spectrum_aligner(latent_batch)
         
         # スペクトルをデコード
         spectrum = self.spectrum_decoder(aligned_latent)
