@@ -2065,8 +2065,8 @@ class SelfGrowingTrainer:
         except:
             # 構築に失敗した場合はデフォルト分子を返す
             return Chem.MolFromSmiles("C")
-    
-   def train_semi_supervised(self, labeled_dataloader, pseudo_labeled_data, epochs=1):
+  
+    def train_semi_supervised(self, labeled_dataloader, pseudo_labeled_data, epochs=1):
         """半教師あり学習"""
         # 高信頼度の疑似ラベルをフィルタリング
         high_confidence_data = self.filter_high_confidence_pseudo_labels(pseudo_labeled_data)
