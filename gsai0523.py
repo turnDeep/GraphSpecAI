@@ -40,7 +40,15 @@ from mpl_toolkits.mplot3d import Axes3D
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+# インポート部分の後に追加
+import logging
+from rdkit import RDLogger
 
+# RDKitの警告を抑制
+RDLogger.DisableLog('rdApp.*')
+
+# ログレベル設定を調整
+logging.getLogger().setLevel(logging.INFO)  # DEBUGレベルの大量ログを抑制
 # --- Content from gsai0501-1.py ---
 
 # デバイス設定
@@ -1122,6 +1130,8 @@ class MoleculeData:
         
         return np.array(bond_features, dtype=np.float32), adjacency_list
     
+    # MoleculeDataクラスの_extract_motifsメソッドを修正
+    
     def _extract_motifs(self, motif_size_threshold=3, max_motifs=MODEL_CONFIG.MAX_MOTIFS):
         """分子からモチーフを抽出"""
         motifs = []
@@ -1143,11 +1153,11 @@ class MoleculeData:
                         motif_types.append(motif_type)
         except Exception as e:
             logging.warning(f"BRICS decomposition failed for molecule {self.smiles if hasattr(self, 'smiles') else 'unknown'}: {e}")
-            # デフォルト処理を続行 (original comment was "BRICSが失敗する場合はスキップ", so just logging and continuing is appropriate)
         
-        # 2. 環系モチーフの抽出
+        # 2. 環系モチーフの抽出 - 修正版
         try:
-            rings = self.mol.GetSSSR()
+            # 新しいRDKitでは Chem.GetSSSR() を使用
+            rings = Chem.GetSSSR(self.mol)
             for ring in rings:
                 if len(ring) >= motif_size_threshold:
                     ring_atoms = list(ring)
@@ -1155,12 +1165,19 @@ class MoleculeData:
                         motifs.append(ring_atoms)
                         
                         # 環タイプを判定
-                        ring_mol = Chem.PathToSubmol(self.mol, ring, atomMap={})
-                        ring_type = "aromatic" if any(atom.GetIsAromatic() for atom in ring_mol.GetAtoms()) else "aliphatic_ring"
-                        motif_types.append(ring_type)
+                        try:
+                            ring_mol = Chem.PathToSubmol(self.mol, ring, atomMap={})
+                            ring_type = "aromatic" if any(atom.GetIsAromatic() for atom in ring_mol.GetAtoms()) else "aliphatic_ring"
+                            motif_types.append(ring_type)
+                        except Exception as submol_e:
+                            # PathToSubmolが失敗した場合の代替処理
+                            logging.warning(f"PathToSubmol failed for ring in molecule {self.smiles if hasattr(self, 'smiles') else 'unknown'}: {submol_e}")
+                            # 環の原子を直接チェック
+                            is_aromatic = any(self.mol.GetAtomWithIdx(atom_idx).GetIsAromatic() for atom_idx in ring_atoms)
+                            ring_type = "aromatic" if is_aromatic else "aliphatic_ring"
+                            motif_types.append(ring_type)
         except Exception as e:
             logging.warning(f"Ring system extraction failed for molecule {self.smiles if hasattr(self, 'smiles') else 'unknown'}: {e}")
-            # デフォルト処理を続行 (original comment was "環抽出が失敗する場合はスキップ")
         
         # 3. 機能性グループの抽出
         functional_groups = {
@@ -1184,7 +1201,7 @@ class MoleculeData:
                             motif_types.append(group_name)
             except Exception as e:
                 logging.warning(f"Functional group pattern matching failed for group {group_name} on molecule {self.smiles if hasattr(self, 'smiles') else 'unknown'}: {e}")
-                continue  # パターンマッチングが失敗する場合はスキップ
+                continue
         
         # 最大モチーフ数を制限
         if len(motifs) > max_motifs:
