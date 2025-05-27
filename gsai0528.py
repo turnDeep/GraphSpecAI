@@ -400,9 +400,10 @@ class StructureEncoder(nn.Module):
         # Ensure np and torch are imported.
         # self.atom_encoder.weight.device should be valid.
         if isinstance(graph_data['atom_features'], np.ndarray):
-            atom_features = torch.FloatTensor(graph_data['atom_features']).to(self.atom_encoder.weight.device)
+            atom_features = torch.FloatTensor(graph_data['atom_features'])
         else:
             atom_features = graph_data['atom_features']
+        atom_features = atom_features.to(self.atom_encoder.weight.device) # Ensure device
         
         encoded_atom_features = self.atom_encoder(atom_features)
         
@@ -413,7 +414,13 @@ class StructureEncoder(nn.Module):
         # Original code after encoded_atom_features:
         # モチーフ特徴量をエンコード
         # This part needs to use graph_data which has been defined.
-        encoded_motif_features = self.motif_encoder(graph_data['motif_features'])
+        motif_features = graph_data['motif_features']
+        if isinstance(motif_features, np.ndarray): # Should not happen based on MoleculeData._build_graph_data
+            motif_features = torch.FloatTensor(motif_features).to(self.motif_encoder.weight.device)
+        else:
+            motif_features = motif_features.to(self.motif_encoder.weight.device)
+        # Then call the encoder:
+        encoded_motif_features = self.motif_encoder(motif_features)
 
         # Atom processing
         if encoded_atom_features.shape[0] == 0:
@@ -422,9 +429,10 @@ class StructureEncoder(nn.Module):
         else:
             atom_embeddings = encoded_atom_features
             if atom_embeddings.shape[0] > 0 and graph_data['edge_index'].shape[1] > 0:
+                 edge_index = graph_data['edge_index'].to(atom_embeddings.device)
                  for gcn in self.gcn_layers:
                     # Ensure F (torch.nn.functional) is imported
-                    atom_embeddings = F.relu(gcn(atom_embeddings, graph_data['edge_index']))
+                    atom_embeddings = F.relu(gcn(atom_embeddings, edge_index))
             elif atom_embeddings.shape[0] > 0: 
                 pass 
 
@@ -439,8 +447,9 @@ class StructureEncoder(nn.Module):
         else:
             motif_embeddings = encoded_motif_features
             if motif_embeddings.shape[0] > 0 and graph_data['motif_edge_index'].shape[1] > 0:
+                motif_edge_index = graph_data['motif_edge_index'].to(motif_embeddings.device)
                 for gin in self.gin_layers:
-                    motif_embeddings = F.relu(gin(motif_embeddings, graph_data['motif_edge_index']))
+                    motif_embeddings = F.relu(gin(motif_embeddings, motif_edge_index))
             elif motif_embeddings.shape[0] > 0: 
                 pass 
             
@@ -670,7 +679,7 @@ class SpectrumDecoder(nn.Module):
         self.upsampler = nn.Sequential(
             nn.Linear(hidden_dim * 2, spectrum_dim // 8 * 128),
             nn.ReLU(),
-            nn.Unflatten(1, (spectrum_dim // 8, 128)),
+            nn.Unflatten(1, (128, spectrum_dim // 8)),
             nn.ConvTranspose1d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
             nn.ReLU(),
             nn.ConvTranspose1d(64, 32, kernel_size=5, stride=2, padding=2, output_padding=1),
@@ -880,11 +889,35 @@ class BidirectionalSelfGrowingModel(nn.Module):
     
     def structure_to_spectrum(self, structure_data):
         """構造からスペクトルを予測"""
-        # 構造をエンコード
-        latent = self.structure_encoder(structure_data)
-        
+        if isinstance(structure_data, list):
+            latents = []
+            for item in structure_data:
+                current_latent = self.structure_encoder(item)
+                if current_latent is not None: # Add check for None
+                    latents.append(current_latent)
+            
+            if latents: # Check if latents list is not empty
+                latent_batch = torch.stack(latents)
+            else:
+                # Handle case where structure_data was a list but all items failed to encode
+                # For now, returning None or raising an error might be options.
+                # Based on problem description, assume this won't happen due to prior checks.
+                # If it can, this needs robust error handling.
+                # For example, return (None, None) or raise ValueError
+                logger.warning("structure_to_spectrum: structure_data was a list, but all items failed to encode.")
+                return None, None 
+        else:
+            # Single MoleculeData object
+            latent_val = self.structure_encoder(structure_data)
+            if latent_val is not None:
+                latent_batch = latent_val.unsqueeze(0)
+            else:
+                # Handle case where single structure_data failed to encode
+                logger.warning("structure_to_spectrum: single structure_data failed to encode.")
+                return None, None
+
         # 潜在表現を調整
-        aligned_latent = self.structure_to_spectrum_aligner(latent)
+        aligned_latent = self.structure_to_spectrum_aligner(latent_batch)
         
         # スペクトルをデコード
         spectrum = self.spectrum_decoder(aligned_latent)
@@ -1722,7 +1755,8 @@ class SelfGrowingTrainer:
                         predicted_node_types_permuted = pred_node_types.permute(0, 2, 1)
                         node_types_loss = F.cross_entropy(
                             predicted_node_types_permuted,
-                            structural_targets['node_types']
+                            structural_targets['node_types'],
+                            ignore_index=UNKNOWN_ATOM_INDEX_TARGET
                         )
                         loss_p2s = node_exists_loss + node_types_loss
                     else:
@@ -2191,7 +2225,8 @@ class SelfGrowingTrainer:
                         predicted_node_types_permuted = pred_node_types.permute(0, 2, 1)
                         node_types_loss = F.cross_entropy(
                             predicted_node_types_permuted,
-                            structural_targets['node_types']
+                            structural_targets['node_types'],
+                            ignore_index=UNKNOWN_ATOM_INDEX_TARGET
                         )
                         
                         loss_p2s = node_exists_loss + node_types_loss
