@@ -63,9 +63,11 @@ class ModelConfig:
         self.SPECTRUM_DIM = 2000  # m/zの最大値
         self.MAX_ATOMS = 100  # 1分子あたりの最大原子数
         self.MAX_MOTIFS = 20  # 1分子あたりの最大モチーフ数
-        self.ATOM_FEATURE_DIM = 150  # 原子特徴量の次元
-        self.BOND_FEATURE_DIM = 10  # 結合特徴量の次元
-        self.MOTIF_FEATURE_DIM = 20  # モチーフ特徴量の次元
+        
+        # 特徴量次元を正確に定義
+        self.ATOM_FEATURE_DIM = 149  # 119+11+8+9+2
+        self.BOND_FEATURE_DIM = 9   # 6+1+1+1
+        self.MOTIF_FEATURE_DIM = 1 + len(MOTIF_TYPES) + 3  # size + types + flags
 
 MODEL_CONFIG = ModelConfig()
 
