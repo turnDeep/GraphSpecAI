@@ -55,6 +55,25 @@ logging.getLogger().setLevel(logging.INFO)  # DEBUGレベルの大量ログを�
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+# 拡散モデル定数
+DIFFUSION_STEPS = 1000
+DIFFUSION_BETA_START = 1e-4
+DIFFUSION_BETA_END = 0.02
+
+# モチーフの種類 - MOVED BEFORE ModelConfig
+MOTIF_TYPES = [
+    "ester", "amide", "amine", "urea", "ether", "olefin", 
+    "aromatic", "heterocycle", "lactam", "lactone", "carbonyl"
+]
+
+# 破壊モード
+BREAK_MODES = ["single_cleavage", "multiple_cleavage", "ring_opening"]
+
+# Atom type mapping for target creation in cycle consistency
+ATOM_TYPES_TARGET_LIST = [6, 1, 7, 8, 9, 16, 15, 17, 35, 53]  # C, H, N, O, F, S, P, Cl, Br, I
+ATOM_TYPE_TO_INDEX = {atomic_num: i for i, atomic_num in enumerate(ATOM_TYPES_TARGET_LIST)}
+UNKNOWN_ATOM_INDEX_TARGET = len(ATOM_TYPES_TARGET_LIST) # Index for unknown atom types
+
 # --- Model Configuration ---
 class ModelConfig:
     def __init__(self):
@@ -70,25 +89,6 @@ class ModelConfig:
         self.MOTIF_FEATURE_DIM = 1 + len(MOTIF_TYPES) + 3  # size + types + flags
 
 MODEL_CONFIG = ModelConfig()
-
-# 拡散モデル定数
-DIFFUSION_STEPS = 1000
-DIFFUSION_BETA_START = 1e-4
-DIFFUSION_BETA_END = 0.02
-
-# モチーフの種類
-MOTIF_TYPES = [
-    "ester", "amide", "amine", "urea", "ether", "olefin", 
-    "aromatic", "heterocycle", "lactam", "lactone", "carbonyl"
-]
-
-# 破壊モード
-BREAK_MODES = ["single_cleavage", "multiple_cleavage", "ring_opening"]
-
-# Atom type mapping for target creation in cycle consistency
-ATOM_TYPES_TARGET_LIST = [6, 1, 7, 8, 9, 16, 15, 17, 35, 53]  # C, H, N, O, F, S, P, Cl, Br, I
-ATOM_TYPE_TO_INDEX = {atomic_num: i for i, atomic_num in enumerate(ATOM_TYPES_TARGET_LIST)}
-UNKNOWN_ATOM_INDEX_TARGET = len(ATOM_TYPES_TARGET_LIST) # Index for unknown atom types
 
 #------------------------------------------------------
 # データ構造の定義
@@ -140,7 +140,7 @@ class Fragment:
 
         # Ensure adjusted mass is not negative
         if adjusted_mass < 0:
-            logger.warning(f"Negative adjusted mass for fragment atoms: {self.atoms} (SMILES: {Chem.MolToSmiles(self.mol) if self.mol else 'N/A'}). Setting to 0.0. Original exact_mass: {exact_mass}, lost_hydrogens: {self.lost_hydrogens}")
+            logging.warning(f"Negative adjusted mass for fragment atoms: {self.atoms} (SMILES: {Chem.MolToSmiles(self.mol) if self.mol else 'N/A'}). Setting to 0.0. Original exact_mass: {exact_mass}, lost_hydrogens: {self.lost_hydrogens}")
             adjusted_mass = 0.0
 
         # m/z値を計算（電荷で割る）
@@ -576,9 +576,9 @@ class StructureDecoder(nn.Module):
         # `MAX_MOTIFS` is a global constant
         motif_hiddens_base = expanded[:, self.hidden_dim:] # Shape: [batch_size, hidden_dim]
         if batch_size > 0:
-            motif_hiddens = motif_hiddens_base.unsqueeze(1).repeat(1, MAX_MOTIFS, 1) # Shape: [B, MAX_MOTIFS, H]
+            motif_hiddens = motif_hiddens_base.unsqueeze(1).repeat(1, MODEL_CONFIG.MAX_MOTIFS, 1) # Shape: [B, MAX_MOTIFS, H]
         else: # Handle empty batch case
-            motif_hiddens = torch.empty((0, MAX_MOTIFS, self.hidden_dim), device=expanded.device, dtype=expanded.dtype)
+            motif_hiddens = torch.empty((0, MODEL_CONFIG.MAX_MOTIFS, self.hidden_dim), device=expanded.device, dtype=expanded.dtype)
 
         motif_exists = self.motif_generator['motif_existence'](motif_hiddens)
         motif_types = self.motif_generator['motif_type'](motif_hiddens)
@@ -981,7 +981,7 @@ class BidirectionalSelfGrowingModel(nn.Module):
 
         except Exception as e:
             # Fallback: skip spectrum cycle if conversion fails
-            logger.warning(f"Spectrum cycle computation failed: {e}")
+            logging.warning(f"Spectrum cycle computation failed: {e}")
             predicted_spectrum2_reconstructed = spectrum  # Use original spectrum as fallback
 
         # Structure cycle loss:
@@ -1014,7 +1014,7 @@ class BidirectionalSelfGrowingModel(nn.Module):
 
         return structure_cycle_loss + spectrum_cycle_loss + 0.1 * latent_consistency_loss
 
-# --- Content from gsai0501-2.py ---
+# --- Continue with rest of the code (MoleculeData, dataset classes, etc.) ---
 
 # ロギング設定
 log_filename = f"self_growing_model_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -1027,24 +1027,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("SelfGrowingModel")
-
-#------------------------------------------------------
-# データ構造とデータセット
-#------------------------------------------------------
-
-# import logging # Already imported at top
-# import re # Already imported at top
-# import numpy as np # Already imported at top
-# import torch # Already imported at top
-# from rdkit import Chem # Already imported at top
-# from rdkit.Chem import BRICS # Already imported at top
-# from rdkit.Chem.rdchem import BondType # Already imported at top
-
-# Assuming MODEL_CONFIG and MOTIF_TYPES are defined globally in the file gsai0527.py
-# For example:
-# class ModelConfig: ...
-# MODEL_CONFIG = ModelConfig()
-# MOTIF_TYPES = ["type1", "type2", ...]
 
 class MoleculeData:
     """分子データを処理するクラス - 完全版"""
@@ -1069,7 +1051,6 @@ class MoleculeData:
         # デフォルト値の安全な設定
         self.max_atoms = max_atoms if max_atoms is not None else getattr(MODEL_CONFIG, 'MAX_ATOMS', 100)
         self.max_motifs = max_motifs if max_motifs is not None else getattr(MODEL_CONFIG, 'MAX_MOTIFS', 20)
-
 
         # 基本情報の安全な取得
         try:
@@ -1108,20 +1089,14 @@ class MoleculeData:
         self.adjacency_list = [[] for _ in range(self.max_atoms)]
         self.motifs = []
         self.motif_types = []
-        # Ensure MOTIF_TYPES is accessible here, it's a global variable.
-        global MOTIF_TYPES # Make sure MOTIF_TYPES is defined globally or passed
         self.motif_features = np.zeros((0, 1 + len(MOTIF_TYPES) + 3), dtype=np.float32)
         self.motif_graph = []
         self.motif_edge_features = np.zeros((0, 6), dtype=np.float32)
-        # graph_data build should ideally handle empty/fallback features correctly.
-        # Call _build_graph_data ensuring it can handle this state.
         self.graph_data = self._build_graph_data(fallback_mode=True)
-
 
     def _get_atom_features(self):
         """改善された原子特徴量抽出"""
         features = []
-        # Ensure self.mol is valid before proceeding
         if self.mol is None:
             for _ in range(self.max_atoms):
                  features.append([0] * self.ATOM_FEATURE_DIM)
@@ -1160,12 +1135,11 @@ class MoleculeData:
     def _get_bond_features_and_adjacency(self):
         """改善された結合特徴量と隣接リスト取得"""
         bond_features = []
-        if self.mol is None: # Guard against None mol
+        if self.mol is None:
             return np.array(bond_features, dtype=np.float32), [[] for _ in range(self.max_atoms)]
 
         num_actual_atoms = self.mol.GetNumAtoms()
         adjacency_list = [[] for _ in range(num_actual_atoms)]
-
 
         bond_types_enum = [
             BondType.SINGLE, BondType.DOUBLE, BondType.TRIPLE, BondType.AROMATIC,
@@ -1184,7 +1158,7 @@ class MoleculeData:
             is_stereo = int(bond.GetStereo() != Chem.rdchem.BondStereo.STEREONONE)
             bond_feature = bond_type_oh + [is_in_ring, is_conjugated, is_stereo]
             bond_features.append(bond_feature)
-            if begin_idx < num_actual_atoms and end_idx < num_actual_atoms: # Check indices
+            if begin_idx < num_actual_atoms and end_idx < num_actual_atoms:
                 bond_idx_in_list = len(bond_features) - 1
                 adjacency_list[begin_idx].append((end_idx, bond_idx_in_list))
                 adjacency_list[end_idx].append((begin_idx, bond_idx_in_list))
@@ -1271,23 +1245,21 @@ class MoleculeData:
                     pattern_mol = Chem.MolFromSmarts(smarts_str)
                     if pattern_mol and motif_mol.HasSubstructMatch(pattern_mol):
                         m_type = name; break
-                except: continue # Smarts parsing error
+                except: continue
         except Exception as e_det: logging.debug(f"Motif type determination error: {e_det}")
         return m_type
 
     def _get_motif_features(self):
         """改善されたモチーフ特徴量計算"""
-        global MOTIF_TYPES # Ensure MOTIF_TYPES is global or passed
         if not self.motifs or self.mol is None:
             return np.zeros((0, 1 + len(MOTIF_TYPES) + 3), dtype=np.float32)
         
         features = []
         num_mol_atoms = self.mol.GetNumAtoms()
-        if num_mol_atoms == 0: # Avoid division by zero if mol has no atoms
-             for _ in self.motifs: # Add fallback for each motif
+        if num_mol_atoms == 0:
+             for _ in self.motifs:
                 features.append([0.0] + [0]*len(MOTIF_TYPES) + [0,0,0])
              return np.array(features, dtype=np.float32)
-
 
         for motif_atom_indices, current_motif_type_str in zip(self.motifs, self.motif_types):
             try:
@@ -1296,7 +1268,6 @@ class MoleculeData:
                 if current_motif_type_str in MOTIF_TYPES:
                     type_oh_feat[MOTIF_TYPES.index(current_motif_type_str)] = 1
                 
-                # Check if all atoms in motif are part of ANY ring in the parent molecule
                 is_ring_feat = all(self.mol.GetAtomWithIdx(idx).IsInRing() for idx in motif_atom_indices)
                 is_aromatic_feat = any(self.mol.GetAtomWithIdx(idx).GetIsAromatic() for idx in motif_atom_indices)
                 has_hetero_feat = any(self.mol.GetAtomWithIdx(idx).GetAtomicNum() != 6 for idx in motif_atom_indices)
@@ -1332,7 +1303,7 @@ class MoleculeData:
                         motif_edges_list.append((i, j))
                         n_shared_feat = min(len(shared_atoms_set) / 10.0, 1.0)
                         n_bonds_feat = min(len(boundary_bonds_list) / 5.0, 1.0)
-                        counts = [0,0,0,0] # S,D,T,A
+                        counts = [0,0,0,0]
                         for b in boundary_bonds_list:
                             bt = b.GetBondType()
                             if bt == BondType.SINGLE: counts[0]+=1
@@ -1344,23 +1315,21 @@ class MoleculeData:
                 except Exception as e_bmg: logging.debug(f"Motif graph edge {i}-{j} error: {e_bmg}")
         return motif_edges_list, np.array(motif_edge_features_list, dtype=np.float32) if motif_edge_features_list else np.zeros((0,6), dtype=np.float32)
 
-
     def _build_graph_data(self, fallback_mode=False):
         """改善されたグラフデータ構築"""
-        global MOTIF_TYPES # Ensure MOTIF_TYPES is accessible
         try:
-            if fallback_mode or self.mol is None: # Handle fallback or None mol
+            if fallback_mode or self.mol is None:
                 num_actual_atoms = 0
-                x_tensor = torch.FloatTensor(self.atom_features) # Use full padded features
+                x_tensor = torch.FloatTensor(self.atom_features)
             else:
                 num_actual_atoms = self.mol.GetNumAtoms()
                 x_tensor = torch.FloatTensor(self.atom_features[:num_actual_atoms]) if num_actual_atoms > 0 else torch.zeros((0, self.ATOM_FEATURE_DIM))
 
             edge_indices_list = []
             if not fallback_mode and self.mol is not None:
-                for src_idx, neighbors_list in enumerate(self.adjacency_list): # adj_list from actual atoms
+                for src_idx, neighbors_list in enumerate(self.adjacency_list):
                     for dest_idx, _ in neighbors_list:
-                        if src_idx < num_actual_atoms and dest_idx < num_actual_atoms: # Should always be true if adj_list is correct
+                        if src_idx < num_actual_atoms and dest_idx < num_actual_atoms:
                             edge_indices_list.append([src_idx, dest_idx])
             edge_index_tensor = torch.tensor(edge_indices_list, dtype=torch.long).t().contiguous() if edge_indices_list else torch.zeros((2,0), dtype=torch.long)
             
@@ -1392,7 +1361,7 @@ class MoleculeData:
                 'motif_edge_index': motif_edge_index_tensor, 'motif_edge_attr': motif_edge_attr_tensor,
                 'spectrum': spectrum_tensor, 'smiles': self.smiles, 'formula': self.formula,
                 'atom_features': torch.FloatTensor(self.atom_features), 
-                'motif_features': motif_x_tensor # Use the tensor version
+                'motif_features': motif_x_tensor
             }
         except Exception as e_graph:
             logging.error(f"Graph data construction error for {self.smiles}: {e_graph}")
@@ -1408,85 +1377,47 @@ class MoleculeData:
                 'motif_features': torch.FloatTensor(motif_feats_fallback)
             }
 
-    def validate(self):
-        """データの妥当性を検証"""
-        issues = []
-        if self.mol is None:
-            issues.append("Molecule object (self.mol) is None"); return issues
-        if self.mol.GetNumAtoms() == 0 and self.smiles != "INVALID":
-            issues.append("Molecule has no atoms")
-        
-        if not hasattr(self, 'atom_features') or not isinstance(self.atom_features, np.ndarray):
-            issues.append("atom_features is not a numpy array or not initialized")
-        elif self.atom_features.shape[0] != self.max_atoms:
-             issues.append(f"Atom features row count: expected {self.max_atoms}, got {self.atom_features.shape[0]}")
-        elif self.atom_features.shape[1] != self.ATOM_FEATURE_DIM:
-            issues.append(f"Atom features dim: expected {self.ATOM_FEATURE_DIM}, got {self.atom_features.shape[1]}")
-
-        if hasattr(self, 'bond_features') and isinstance(self.bond_features, np.ndarray) and self.bond_features.size > 0:
-            if self.bond_features.shape[1] != self.BOND_FEATURE_DIM:
-                issues.append(f"Bond features dim: expected {self.BOND_FEATURE_DIM}, got {self.bond_features.shape[1]}")
-        
-        if self.spectrum is not None:
-            if not isinstance(self.spectrum, np.ndarray): issues.append("Spectrum is not numpy array")
-            elif np.all(self.spectrum == 0) and self.smiles != "INVALID" : issues.append("Spectrum is all zeros") # Check if all elements are zero
-        return issues
-
-    def __repr__(self):
-        num_actual_atoms = self.mol.GetNumAtoms() if self.mol else 0
-        return f"MoleculeData(smiles='{self.smiles}', atoms={num_actual_atoms}, motifs={len(self.motifs) if hasattr(self, 'motifs') else 0})"
-
 def normalize_spectrum(peaks: List[Tuple[int, int]], max_mz: int = MODEL_CONFIG.SPECTRUM_DIM, threshold: float = 0.01, top_n: int = 20) -> np.ndarray:
     """マススペクトルを正規化してベクトル形式に変換"""
     spectrum = np.zeros(max_mz)
 
-    # ピークがない場合は空のスペクトルを返す
     if not peaks:
         return spectrum
 
-    # Adhering to user's provided function structure for Issue #16:
-    
-    # Step 1 from user's code logic (for max_intensity calc):
-    # Get intensities of peaks that are within the mz range
     intensities_in_range = [intensity for mz_val, intensity in peaks if mz_val < max_mz]
     if not intensities_in_range:
-        logger.warning(f"No peaks found with mz < {max_mz}. Input peaks (first 5): {peaks[:5]}")
+        logging.warning(f"No peaks found with mz < {max_mz}. Input peaks (first 5): {peaks[:5]}")
         return spectrum
 
-    # 最大強度を見つける (Step 2 & 3 from user's code)
-    max_intensity = max(intensities_in_range) # max() on non-empty list of intensities_in_range
+    max_intensity = max(intensities_in_range)
     if max_intensity <= 0:
-        logger.warning(f"All peak intensities within mz range are <= 0. Max intensity: {max_intensity}")
+        logging.warning(f"All peak intensities within mz range are <= 0. Max intensity: {max_intensity}")
         return spectrum
 
-    # 相対強度の閾値を計算 (Step 4)
     intensity_threshold = max_intensity * threshold
 
-    # 閾値以上のピークを抽出 (Step 5) - also re-applying mz < max_mz
     filtered_peaks = [(mz, intensity) for mz, intensity in peaks 
                      if mz < max_mz and intensity >= intensity_threshold]
 
-    # CRITICAL FIX: Handle case where no peaks pass the threshold (Step 6 from user's code)
     if not filtered_peaks:
-        logger.warning(f"No peaks passed intensity threshold {intensity_threshold:.4f} (max_intensity in range: {max_intensity:.4f}).")
+        logging.warning(f"No peaks passed intensity threshold {intensity_threshold:.4f} (max_intensity in range: {max_intensity:.4f}).")
         return spectrum
 
-    # 上位N個のピークのみを保持 (Step 7)
     if top_n > 0 and len(filtered_peaks) > top_n:
-        # 強度の降順でソート
         filtered_peaks.sort(key=lambda x: x[1], reverse=True)
-        # 上位N個のみを保持
         filtered_peaks = filtered_peaks[:top_n]
 
-    # 選択されたピークをスペクトルに設定 (Step 8 & 9)
     for mz, intensity in filtered_peaks:
-        # The user code has an additional `0 <= mz` check here.
-        # Since mz for spectra is usually non-negative, this is fine.
-        # max_mz is exclusive for array indexing (0 to max_mz-1)
-        if 0 <= mz < max_mz:  # Ensure mz is within the bounds of the spectrum array
-            spectrum[mz] = intensity / max_intensity # Intensities are normalized by the true max_intensity in range
+        if 0 <= mz < max_mz:
+            spectrum[mz] = intensity / max_intensity
 
     return spectrum
+
+# Simple test to verify the fix
+if __name__ == "__main__":
+    print("MOTIF_TYPES defined:", MOTIF_TYPES)
+    print("MODEL_CONFIG initialized successfully")
+    print("MOTIF_FEATURE_DIM:", MODEL_CONFIG.MOTIF_FEATURE_DIM)
 
 class ChemicalStructureSpectumDataset(Dataset):
     """化学構造とマススペクトルのデータセット"""
