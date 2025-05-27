@@ -275,24 +275,40 @@ class FragmentNode:
 # 拡散モデル基本コンポーネント
 #------------------------------------------------------
 
-class DiffusionModel:
+class DiffusionModel(nn.Module):
     """拡散モデルの基本クラス"""
     
     def __init__(self, num_steps=DIFFUSION_STEPS, beta_start=DIFFUSION_BETA_START, beta_end=DIFFUSION_BETA_END):
         """拡散モデルの初期化"""
+        super().__init__()
         self.num_steps = num_steps
         self.beta_start = beta_start
         self.beta_end = beta_end
         
         # スケジューリングパラメータの計算
-        self.betas = self._get_beta_schedule()
-        self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-        self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0)
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
-        self.sqrt_recip_alphas = torch.sqrt(1.0 / self.alphas)
-        self.posterior_variance = self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        betas = self._get_beta_schedule()
+        self.register_buffer("betas", betas)
+        
+        alphas = 1.0 - betas
+        self.register_buffer("alphas", alphas)
+        
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        self.register_buffer("alphas_cumprod", alphas_cumprod)
+        
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
+        self.register_buffer("alphas_cumprod_prev", alphas_cumprod_prev)
+        
+        sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+        self.register_buffer("sqrt_alphas_cumprod", sqrt_alphas_cumprod)
+        
+        sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
+        self.register_buffer("sqrt_one_minus_alphas_cumprod", sqrt_one_minus_alphas_cumprod)
+        
+        sqrt_recip_alphas = torch.sqrt(1.0 / alphas)
+        self.register_buffer("sqrt_recip_alphas", sqrt_recip_alphas)
+        
+        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        self.register_buffer("posterior_variance", posterior_variance)
         
     def _get_beta_schedule(self):
         """ベータスケジュールを計算"""
