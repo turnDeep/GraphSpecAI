@@ -679,7 +679,7 @@ class SpectrumDecoder(nn.Module):
         self.upsampler = nn.Sequential(
             nn.Linear(hidden_dim * 2, spectrum_dim // 8 * 128),
             nn.ReLU(),
-            nn.Unflatten(1, (spectrum_dim // 8, 128)),
+            nn.Unflatten(1, (128, spectrum_dim // 8)),
             nn.ConvTranspose1d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
             nn.ReLU(),
             nn.ConvTranspose1d(64, 32, kernel_size=5, stride=2, padding=2, output_padding=1),
