@@ -1540,7 +1540,7 @@ class ChemicalStructureSpectumDataset(Dataset):
                 return {
                     'type': 'supervised',
                     'structure': structure,
-                    'spectrum': spectrum
+                    'spectrum': torch.FloatTensor(spectrum) if isinstance(spectrum, np.ndarray) else spectrum
                 }
             elif idx < self.n_pairs + self.n_structures:
                 structure = self.structures[idx - self.n_pairs] # MoleculeData
@@ -1554,7 +1554,7 @@ class ChemicalStructureSpectumDataset(Dataset):
                 return {
                     'type': 'unsupervised_spectrum',
                     'structure': None,
-                    'spectrum': spectrum
+                    'spectrum': torch.FloatTensor(spectrum) if isinstance(spectrum, np.ndarray) else spectrum
                 }
     
     def add_structure_spectrum_pair(self, structure, spectrum):
@@ -1588,7 +1588,20 @@ def collate_fn(batch):
             batch_dict[key].append(data[key])
     
     # スペクトルをスタック（あれば）
-    spectra = [item for item in batch_dict['spectrum'] if item is not None]
+    spectra = []
+    for item in batch_dict['spectrum']:
+        if item is not None:
+            if isinstance(item, torch.Tensor):
+                spectra.append(item)
+            elif isinstance(item, np.ndarray):
+                spectra.append(torch.FloatTensor(item))
+            else:
+                # その他の形式の場合もFloatTensorに変換を試みる
+                try:
+                    spectra.append(torch.FloatTensor(item))
+                except:
+                    pass
+    
     if spectra:
         batch_dict['spectrum_tensor'] = torch.stack(spectra)
     else:
@@ -1947,9 +1960,15 @@ class SelfGrowingTrainer:
                     # Now call _convert_to_molecule with the single prediction data
                     molecule_object = self._convert_to_molecule(single_pred_data_dict)
                     
+                    # MoleculeDataオブジェクトでラップ
+                    if molecule_object is not None:
+                        molecule_data = MoleculeData(molecule_object)
+                    else:
+                        continue  # 変換に失敗した場合はスキップ
+                    
                     # 疑似ラベルとして追加
                     pseudo_labeled_data.append({
-                        'structure': molecule_object,
+                        'structure': molecule_data,  # MoleculeDataオブジェクト
                         'spectrum': batch['spectrum'][idx], # This is the original spectrum
                         'confidence': self._calculate_confidence(outputs)
                     })
@@ -2047,7 +2066,7 @@ class SelfGrowingTrainer:
             # 構築に失敗した場合はデフォルト分子を返す
             return Chem.MolFromSmiles("C")
     
-    def train_semi_supervised(self, labeled_dataloader, pseudo_labeled_data, epochs=1):
+   def train_semi_supervised(self, labeled_dataloader, pseudo_labeled_data, epochs=1):
         """半教師あり学習"""
         # 高信頼度の疑似ラベルをフィルタリング
         high_confidence_data = self.filter_high_confidence_pseudo_labels(pseudo_labeled_data)
@@ -2055,7 +2074,10 @@ class SelfGrowingTrainer:
         # 教師ありデータと疑似ラベルデータを組み合わせる
         combined_dataset = ConcatDataset([
             labeled_dataloader.dataset,
-            ChemicalStructureSpectumDataset(structure_spectrum_pairs=high_confidence_data)
+            ChemicalStructureSpectumDataset(
+                structure_spectrum_pairs=high_confidence_data,
+                lazy_load=False  # MoleculeDataオブジェクトを直接渡しているため
+            )
         ])
         
         combined_dataloader = DataLoader(
@@ -2408,7 +2430,8 @@ def prepare_dataset(msp_data: Dict[str, Dict], mol_dict: Dict[str, Chem.Mol],
     train_dataset = ChemicalStructureSpectumDataset(
         structures=unlabeled_structures,
         spectra=unlabeled_spectra,
-        structure_spectrum_pairs=structure_spectrum_pairs
+        structure_spectrum_pairs=structure_spectrum_pairs,
+        lazy_load=False  # MoleculeDataオブジェクトを直接渡しているため
     )
 
     val_pairs = []
@@ -2416,7 +2439,8 @@ def prepare_dataset(msp_data: Dict[str, Dict], mol_dict: Dict[str, Chem.Mol],
         val_pairs.append((mol_data_obj_val, mol_data_obj_val.spectrum))
 
     val_dataset = ChemicalStructureSpectumDataset(
-        structure_spectrum_pairs=val_pairs
+        structure_spectrum_pairs=val_pairs,
+        lazy_load=False  # MoleculeDataオブジェクトを直接渡しているため
     )
 
     test_pairs = []
@@ -2424,7 +2448,8 @@ def prepare_dataset(msp_data: Dict[str, Dict], mol_dict: Dict[str, Chem.Mol],
         test_pairs.append((mol_data_obj_test, mol_data_obj_test.spectrum))
 
     test_dataset = ChemicalStructureSpectumDataset(
-        structure_spectrum_pairs=test_pairs
+        structure_spectrum_pairs=test_pairs,
+        lazy_load=False  # MoleculeDataオブジェクトを直接渡しているため
     )
     # logger.info(f"Final dataset objects - Train: {len(train_dataset)} items, Val: {len(val_dataset)} items, Test: {len(test_dataset)} items")
     # logger.info(f"Train dataset composition: {len(structure_spectrum_pairs)} supervised pairs, {len(unlabeled_structures)} unsupervised structures, {len(unlabeled_spectra)} unsupervised spectra")
