@@ -1032,186 +1032,220 @@ logger = logging.getLogger("SelfGrowingModel")
 
 class MoleculeData:
     """分子データを処理するクラス"""
-    
-    def __init__(self, mol, spectrum=None):
+
+    def __init__(self, mol, spectrum=None, max_atoms=MODEL_CONFIG.MAX_ATOMS, max_motifs=MODEL_CONFIG.MAX_MOTIFS):
         """
         分子データを初期化
-        
+
         Args:
             mol: RDKit分子オブジェクト
             spectrum: 分子のマススペクトル（あれば）
+            max_atoms: 許容される最大原子数
+            max_motifs: 許容される最大モチーフ数
         """
         self.mol = mol
         self.spectrum = spectrum
-        
+        self.max_atoms = max_atoms # Store max_atoms
+        self.max_motifs = max_motifs # Store max_motifs
+
         # 分子の基本情報
         self.smiles = Chem.MolToSmiles(mol)
         self.formula = Chem.rdMolDescriptors.CalcMolFormula(mol)
-        
+
         # 原子と結合の特徴量
         self.atom_features = self._get_atom_features()
         self.bond_features, self.adjacency_list = self._get_bond_features_and_adjacency()
-        
+
         # モチーフの抽出と特徴量
-        self.motifs, self.motif_types = self._extract_motifs()
+        self.motifs, self.motif_types = self._extract_motifs(max_motifs=self.max_motifs) # Pass max_motifs
         self.motif_features = self._get_motif_features()
         self.motif_graph, self.motif_edge_features = self._build_motif_graph()
-        
+
         # グラフデータ構造
         self.graph_data = self._build_graph_data()
-    
+
     def _get_atom_features(self):
         """原子の特徴量を抽出"""
         features = []
-        for atom in self.mol.GetAtoms():
-            # 原子番号（one-hot）
-            atom_type = atom.GetAtomicNum()
-            atom_type_oh = [0] * 119
-            atom_type_oh[atom_type] = 1
-            
-            # 形式電荷
-            charge = atom.GetFormalCharge()
-            charge_oh = [0] * 11  # -5 ~ +5
-            charge_oh[charge + 5] = 1
-            
-            # 混成軌道状態
-            hybridization = atom.GetHybridization()
-            hybridization_types = [Chem.rdchem.HybridizationType.SP, 
-                                  Chem.rdchem.HybridizationType.SP2,
-                                  Chem.rdchem.HybridizationType.SP3, 
-                                  Chem.rdchem.HybridizationType.SP3D, 
-                                  Chem.rdchem.HybridizationType.SP3D2]
-            hybridization_oh = [int(hybridization == i) for i in hybridization_types]
-            
-            # 水素の数
-            h_count = atom.GetTotalNumHs()
-            h_count_oh = [0] * 9
-            h_count_oh[min(h_count, 8)] = 1
-            
-            # 特性フラグ
-            is_aromatic = atom.GetIsAromatic()
-            is_in_ring = atom.IsInRing()
-            
-            # 特徴量を結合
-            atom_features = atom_type_oh + charge_oh + hybridization_oh + h_count_oh + [is_aromatic, is_in_ring]
-            features.append(atom_features)
-        
+        num_atoms = self.mol.GetNumAtoms()
+
+        for i in range(self.max_atoms): # Iterate up to max_atoms
+            if i < num_atoms:
+                atom = self.mol.GetAtomWithIdx(i)
+                # 原子番号（one-hot）
+                atom_type = atom.GetAtomicNum()
+                atom_type_oh = [0] * 119 # Index 0 for padding, 1-118 for elements
+                atom_type_oh[atom_type] = 1
+
+                # 形式電荷
+                charge = atom.GetFormalCharge()
+                charge_oh = [0] * 11  # -5 to +5, so index charge+5
+                charge_oh[charge + 5] = 1
+
+                # 混成軌道状態
+                hybridization = atom.GetHybridization()
+                hybridization_types = [
+                    Chem.rdchem.HybridizationType.UNSPECIFIED, # Added for completeness
+                    Chem.rdchem.HybridizationType.S,
+                    Chem.rdchem.HybridizationType.SP,
+                    Chem.rdchem.HybridizationType.SP2,
+                    Chem.rdchem.HybridizationType.SP3,
+                    Chem.rdchem.HybridizationType.SP3D,
+                    Chem.rdchem.HybridizationType.SP3D2,
+                    Chem.rdchem.HybridizationType.OTHER # Added for completeness
+                ]
+                hybridization_map = {h: i for i, h in enumerate(hybridization_types)}
+                hybridization_idx = hybridization_map.get(hybridization, hybridization_map[Chem.rdchem.HybridizationType.OTHER])
+                hybridization_oh = [0] * len(hybridization_types)
+                hybridization_oh[hybridization_idx] = 1
+                
+                # 水素の数
+                h_count = atom.GetTotalNumHs()
+                h_count_oh = [0] * 9 # 0-8 Hs
+                h_count_oh[min(h_count, 8)] = 1 # Cap at 8
+
+                # 特性フラグ
+                is_aromatic = int(atom.GetIsAromatic()) # Cast to int
+                is_in_ring = int(atom.IsInRing()) # Cast to int
+
+                # 特徴量を結合
+                atom_f = atom_type_oh + charge_oh + hybridization_oh + h_count_oh + [is_aromatic, is_in_ring]
+                features.append(atom_f)
+            else:
+                # Padding for non-existent atoms
+                # Length should be 119 (atom_type) + 11 (charge) + 8 (hybridization) + 9 (h_count) + 1 (aromatic) + 1 (in_ring) = 149
+                features.append([0] * (119 + 11 + len(hybridization_types) + 9 + 2))
+
+
         return np.array(features, dtype=np.float32)
-    
+
     def _get_bond_features_and_adjacency(self):
         """結合の特徴量と隣接リストを取得"""
         bond_features = []
+        # Adjacency list for actual atoms
         adjacency_list = [[] for _ in range(self.mol.GetNumAtoms())]
-        
+
         for bond in self.mol.GetBonds():
-            # 結合のインデックス
             begin_idx = bond.GetBeginAtomIdx()
             end_idx = bond.GetEndAtomIdx()
-            
+
             # 結合タイプ（one-hot）
             bond_type = bond.GetBondType()
-            bond_types = [Chem.rdchem.BondType.SINGLE, Chem.rdchem.BondType.DOUBLE,
-                         Chem.rdchem.BondType.TRIPLE, Chem.rdchem.BondType.AROMATIC]
-            bond_type_oh = [int(bond_type == i) for i in bond_types]
+            bond_types_enum = [
+                BondType.SINGLE, BondType.DOUBLE, BondType.TRIPLE, BondType.AROMATIC,
+                BondType.UNSPECIFIED, BondType.OTHER # Added for completeness
+            ]
+            bond_type_map = {bt: i for i, bt in enumerate(bond_types_enum)}
+            bond_type_idx = bond_type_map.get(bond_type, bond_type_map[BondType.OTHER])
+            bond_type_oh = [0] * len(bond_types_enum)
+            bond_type_oh[bond_type_idx] = 1
             
             # 特性フラグ
-            is_in_ring = bond.IsInRing()
-            is_conjugated = bond.GetIsConjugated()
-            is_stereo = bond.GetStereo() != Chem.rdchem.BondStereo.STEREONONE
+            is_in_ring = int(bond.IsInRing()) # Cast to int
+            is_conjugated = int(bond.GetIsConjugated()) # Cast to int
             
+            # Stereo is more complex, for now a simple flag if any stereo is set
+            is_stereo = int(bond.GetStereo() != Chem.rdchem.BondStereo.STEREONONE) # Cast to int
+
             # 特徴量を結合
+            # Length: 6 (bond_type) + 1 (in_ring) + 1 (conjugated) + 1 (stereo) = 9
             bond_feature = bond_type_oh + [is_in_ring, is_conjugated, is_stereo]
             bond_features.append(bond_feature)
+
+            # 隣接リストに追加 (using actual atom indices)
+            bond_idx_in_list = len(bond_features) - 1 # This is the index in the bond_features list
+            adjacency_list[begin_idx].append((end_idx, bond_idx_in_list))
+            adjacency_list[end_idx].append((begin_idx, bond_idx_in_list))
             
-            # 隣接リストに追加
-            bond_idx = len(bond_features) - 1
-            adjacency_list[begin_idx].append((end_idx, bond_idx))
-            adjacency_list[end_idx].append((begin_idx, bond_idx))
-        
+        # Padding for bond features if needed (though typically bond features are only for existing bonds)
+        # The design implies bond_features list might not be padded to a max_bonds length.
+        # If padding is required elsewhere, it should be handled there.
+
         return np.array(bond_features, dtype=np.float32), adjacency_list
-    
-    # MoleculeDataクラスの_extract_motifsメソッドを修正
-    
-    def _extract_motifs(self, motif_size_threshold=3, max_motifs=MODEL_CONFIG.MAX_MOTIFS):
+
+    def _extract_motifs(self, motif_size_threshold=3, max_motifs=20): # Ensure max_motifs=20
         """分子からモチーフを抽出"""
         motifs = []
         motif_types = []
-        
+
         # 1. BRICS分解によるモチーフ抽出
         try:
-            brics_frags = list(BRICS.BRICSDecompose(self.mol, keepNonLeafNodes=True))
-            for frag_smiles in brics_frags:
-                frag_mol = Chem.MolFromSmiles(frag_smiles)
+            # For BRICS, use minFragmentSize to control fragment size directly if possible,
+            # or filter by GetNumAtoms post-decomposition.
+            # RDKit's BRICS.BRICSDecompose doesn't have minFragmentSize. Filter manually.
+            brics_frags_smiles = list(BRICS.BRICSDecompose(self.mol, keepNonLeafNodes=True, returnMols=False))
+            for frag_smi in brics_frags_smiles:
+                frag_mol = Chem.MolFromSmiles(frag_smi)
                 if frag_mol and frag_mol.GetNumAtoms() >= motif_size_threshold:
-                    # モチーフに含まれる原子のインデックスを特定
-                    substructure = self.mol.GetSubstructMatch(frag_mol)
-                    if substructure and len(substructure) > 0:
-                        motifs.append(list(substructure))
-                        
-                        # モチーフタイプを判定
-                        motif_type = self._determine_motif_type(frag_mol)
-                        motif_types.append(motif_type)
+                    substructure_match = self.mol.GetSubstructMatch(frag_mol)
+                    if substructure_match: # Ensure match is found
+                        motifs.append(list(substructure_match))
+                        motif_types.append(self._determine_motif_type(frag_mol))
         except Exception as e:
-            logging.warning(f"BRICS decomposition failed for molecule {self.smiles if hasattr(self, 'smiles') else 'unknown'}: {e}")
-        
-        # 2. 環系モチーフの抽出 - 修正版
+            logging.warning(f"BRICS decomposition failed for molecule {self.smiles}: {e}")
+
+        # 2. 環系モチーフの抽出 (using GetRingInfo().AtomRings())
         try:
-            # 新しいRDKitでは Chem.GetSSSR() を使用
-            rings = Chem.GetSSSR(self.mol)
-            for ring in rings:
-                if len(ring) >= motif_size_threshold:
-                    ring_atoms = list(ring)
-                    if ring_atoms not in motifs:
-                        motifs.append(ring_atoms)
-                        
-                        # 環タイプを判定
-                        try:
-                            ring_mol = Chem.PathToSubmol(self.mol, ring, atomMap={})
-                            ring_type = "aromatic" if any(atom.GetIsAromatic() for atom in ring_mol.GetAtoms()) else "aliphatic_ring"
-                            motif_types.append(ring_type)
-                        except Exception as submol_e:
-                            # PathToSubmolが失敗した場合の代替処理
-                            logging.warning(f"PathToSubmol failed for ring in molecule {self.smiles if hasattr(self, 'smiles') else 'unknown'}: {submol_e}")
-                            # 環の原子を直接チェック
-                            is_aromatic = any(self.mol.GetAtomWithIdx(atom_idx).GetIsAromatic() for atom_idx in ring_atoms)
-                            ring_type = "aromatic" if is_aromatic else "aliphatic_ring"
-                            motif_types.append(ring_type)
+            ring_info = self.mol.GetRingInfo()
+            atom_rings = ring_info.AtomRings() # Returns tuples of atom indices in rings
+            for ring_atom_indices in atom_rings:
+                if len(ring_atom_indices) >= motif_size_threshold:
+                    # Convert tuple to list and check for duplicates
+                    current_motif_atoms = sorted(list(ring_atom_indices))
+                    is_duplicate = False
+                    for existing_motif in motifs:
+                        if sorted(existing_motif) == current_motif_atoms:
+                            is_duplicate = True
+                            break
+                    if not is_duplicate:
+                        motifs.append(current_motif_atoms)
+                        # Aromaticity check for the ring motif based on atoms in the parent molecule
+                        is_ring_aromatic = all(self.mol.GetAtomWithIdx(idx).GetIsAromatic() for idx in current_motif_atoms)
+                        motif_types.append("aromatic_ring" if is_ring_aromatic else "aliphatic_ring")
         except Exception as e:
-            logging.warning(f"Ring system extraction failed for molecule {self.smiles if hasattr(self, 'smiles') else 'unknown'}: {e}")
-        
-        # 3. 機能性グループの抽出
+            logging.warning(f"Ring system extraction failed for molecule {self.smiles}: {e}")
+            
+        # 3. 機能性グループの抽出 (as per existing, ensure thresholding)
         functional_groups = {
-            "carboxyl": "[CX3](=O)[OX2H1]",
-            "hydroxyl": "[OX2H]",
-            "amine": "[NX3;H2,H1,H0;!$(NC=O)]",
-            "amide": "[NX3][CX3](=[OX1])",
-            "ether": "[OD2]([#6])[#6]",
-            "ester": "[#6][CX3](=O)[OX2][#6]",
+            "carboxyl": "[CX3](=O)[OX2H1]", "hydroxyl": "[OX2H]",
+            "amine": "[NX3;H2,H1,H0;!$(NC=O)]", "amide": "[NX3][CX3](=[OX1])",
+            "ether": "[OD2]([#6])[#6]", "ester": "[#6][CX3](=O)[OX2][#6]",
             "carbonyl": "[CX3]=[OX1]"
+            # Add more from MOTIF_TYPES if they have SMARTS definitions
         }
-        
         for group_name, smarts in functional_groups.items():
             try:
                 pattern = Chem.MolFromSmarts(smarts)
-                if pattern:
+                if pattern: # Ensure pattern compilation was successful
                     matches = self.mol.GetSubstructMatches(pattern)
-                    for match in matches:
-                        if len(match) >= motif_size_threshold and list(match) not in motifs:
-                            motifs.append(list(match))
-                            motif_types.append(group_name)
+                    for match_indices in matches:
+                        if len(match_indices) >= motif_size_threshold:
+                            current_motif_atoms = sorted(list(match_indices))
+                            is_duplicate = False
+                            for existing_motif in motifs:
+                                if sorted(existing_motif) == current_motif_atoms:
+                                    is_duplicate = True
+                                    break
+                            if not is_duplicate:
+                                motifs.append(current_motif_atoms)
+                                motif_types.append(group_name)
             except Exception as e:
-                logging.warning(f"Functional group pattern matching failed for group {group_name} on molecule {self.smiles if hasattr(self, 'smiles') else 'unknown'}: {e}")
-                continue
-        
-        # 最大モチーフ数を制限
+                logging.warning(f"Functional group SMARTS matching failed for {group_name} in {self.smiles}: {e}")
+
+        # 最大モチーフ数を制限 (sort by size, then take top N)
         if len(motifs) > max_motifs:
-            # サイズで並べ替えて大きいものを優先
-            sorted_pairs = sorted(zip(motifs, motif_types), key=lambda x: len(x[0]), reverse=True)
-            motifs, motif_types = zip(*sorted_pairs[:max_motifs])
-            motifs, motif_types = list(motifs), list(motif_types)
+            # Sort by motif size (number of atoms) descending
+            sorted_indices = sorted(range(len(motifs)), key=lambda k: len(motifs[k]), reverse=True)
+            
+            # Select top max_motifs
+            final_motifs = [motifs[i] for i in sorted_indices[:max_motifs]]
+            final_motif_types = [motif_types[i] for i in sorted_indices[:max_motifs]]
+            
+            motifs = final_motifs
+            motif_types = final_motif_types
         
         return motifs, motif_types
-    
+
     def _determine_motif_type(self, motif_mol):
         """モチーフの化学的タイプを判定"""
         # デフォルトタイプ
@@ -3293,3 +3327,29 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     main(args)
+
+# Additional helper functions (should be at the end of the file)
+# import logging # Ensure logging is imported if not already - ALREADY IMPORTED
+# from rdkit import Chem # Ensure Chem is imported - ALREADY IMPORTED
+
+def safe_mol_from_smiles(smiles, sanitize=True):
+    """安全にSMILESから分子を作成"""
+    try:
+        mol = Chem.MolFromSmiles(smiles, sanitize=sanitize)
+        if mol is None:
+            logging.warning(f"Failed to create molecule from SMILES: {smiles}")
+        return mol # Return mol whether it's None or a valid molecule
+    except Exception as e:
+        logging.error(f"Error creating molecule from SMILES {smiles}: {e}")
+        return None
+
+def safe_mol_from_mol_file(file_path, sanitize=True):
+    """安全にMOLファイルから分子を作成"""
+    try:
+        mol = Chem.MolFromMolFile(file_path, sanitize=sanitize)
+        if mol is None:
+            logging.warning(f"Failed to load MOL file: {file_path}")
+        return mol # Return mol whether it's None or a valid molecule
+    except Exception as e:
+        logging.error(f"Error loading MOL file {file_path}: {e}")
+        return None
