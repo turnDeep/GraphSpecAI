@@ -1771,7 +1771,8 @@ class SelfGrowingTrainer:
                         predicted_node_types_permuted = pred_node_types.permute(0, 2, 1)
                         node_types_loss = F.cross_entropy(
                             predicted_node_types_permuted,
-                            structural_targets['node_types']
+                            structural_targets['node_types'],
+                            ignore_index=UNKNOWN_ATOM_INDEX_TARGET
                         )
                         loss_p2s = node_exists_loss + node_types_loss
                     else:
@@ -2240,7 +2241,8 @@ class SelfGrowingTrainer:
                         predicted_node_types_permuted = pred_node_types.permute(0, 2, 1)
                         node_types_loss = F.cross_entropy(
                             predicted_node_types_permuted,
-                            structural_targets['node_types']
+                            structural_targets['node_types'],
+                            ignore_index=UNKNOWN_ATOM_INDEX_TARGET
                         )
                         
                         loss_p2s = node_exists_loss + node_types_loss
