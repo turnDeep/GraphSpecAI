@@ -658,7 +658,12 @@ class SpectrumEncoder(nn.Module):
     def forward(self, spectrum):
         """順伝播: マススペクトルから潜在表現を生成"""
         # 入力形状を調整
-        x = spectrum.unsqueeze(1)  # [batch_size, 1, spectrum_dim]
+        if spectrum.ndim == 1: # Input is (spectrum_dim)
+            x = spectrum.unsqueeze(0).unsqueeze(1) # Shape: [1, 1, spectrum_dim]
+        elif spectrum.ndim == 2: # Input is (batch_size, spectrum_dim)
+            x = spectrum.unsqueeze(1) # Shape: [batch_size, 1, spectrum_dim]
+        else:
+            raise ValueError(f"SpectrumEncoder input spectrum has unexpected ndim: {spectrum.ndim}, shape: {spectrum.shape}")
         
         # 次元削減
         x = self.dim_reducer(x)  # [batch_size, 128, spectrum_dim/8]
@@ -1771,7 +1776,8 @@ class SelfGrowingTrainer:
                         predicted_node_types_permuted = pred_node_types.permute(0, 2, 1)
                         node_types_loss = F.cross_entropy(
                             predicted_node_types_permuted,
-                            structural_targets['node_types']
+                            structural_targets['node_types'],
+                            ignore_index=UNKNOWN_ATOM_INDEX_TARGET
                         )
                         loss_p2s = node_exists_loss + node_types_loss
                     else:
@@ -2240,7 +2246,8 @@ class SelfGrowingTrainer:
                         predicted_node_types_permuted = pred_node_types.permute(0, 2, 1)
                         node_types_loss = F.cross_entropy(
                             predicted_node_types_permuted,
-                            structural_targets['node_types']
+                            structural_targets['node_types'],
+                            ignore_index=UNKNOWN_ATOM_INDEX_TARGET
                         )
                         
                         loss_p2s = node_exists_loss + node_types_loss
