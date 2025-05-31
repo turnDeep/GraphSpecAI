@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
+import torch.utils.checkpoint
 from PIL import Image
 from rdkit import Chem
 from rdkit.Chem import AllChem, BRICS, Descriptors, Draw, MolToSmiles, rdMolDescriptors
@@ -40,6 +41,13 @@ from mpl_toolkits.mplot3d import Axes3D
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+
+try:
+    from xformers.ops import memory_efficient_attention
+    _has_flash_attention = True
+except ImportError:
+    _has_flash_attention = False
+
 # インポート部分の後に追加
 import logging
 from rdkit import RDLogger
@@ -360,6 +368,37 @@ class DiffusionModel(nn.Module):
         out = a.gather(-1, t)
         return out.reshape(b, *((1,) * (len(shape) - 1))).to(t.device)
 
+class EfficientCrossEntropyLoss(nn.Module):
+    def __init__(self, ignore_index=-100):
+        super().__init__()
+        self.ignore_index = ignore_index
+
+    def forward(self, logits, targets):
+        # チャンクベースの計算でメモリを節約
+        batch_size, seq_len, vocab_size = logits.shape
+        chunk_size = min(1024, seq_len)  # チャンクサイズを調整
+
+        total_loss = 0
+        valid_tokens = 0
+
+        for i in range(0, seq_len, chunk_size):
+            end_idx = min(i + chunk_size, seq_len)
+            chunk_logits = logits[:, i:end_idx, :].reshape(-1, vocab_size)
+            chunk_targets = targets[:, i:end_idx].reshape(-1)
+
+            # 有効なトークンのみ計算
+            mask = chunk_targets != self.ignore_index
+            if mask.any():
+                chunk_loss = F.cross_entropy(
+                    chunk_logits[mask],
+                    chunk_targets[mask],
+                    reduction='sum'
+                )
+                total_loss += chunk_loss
+                valid_tokens += mask.sum()
+
+        return total_loss / valid_tokens if valid_tokens > 0 else torch.tensor(0.0, device=logits.device)
+
 #------------------------------------------------------
 # グラフニューラルネットワークコンポーネント
 #------------------------------------------------------
@@ -367,10 +406,12 @@ class DiffusionModel(nn.Module):
 class StructureEncoder(nn.Module):
     """化学構造をエンコードするモジュール（モチーフベースGNN）"""
     
-    def __init__(self, atom_fdim, bond_fdim, motif_fdim, hidden_dim, latent_dim):
+    def __init__(self, atom_fdim, bond_fdim, motif_fdim, hidden_dim, latent_dim, use_gradient_checkpointing=False):
         super(StructureEncoder, self).__init__()
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.use_flash_attention = _has_flash_attention
         
         # 原子特徴量エンコーダ
         self.atom_encoder = nn.Linear(atom_fdim, hidden_dim)
@@ -447,13 +488,23 @@ class StructureEncoder(nn.Module):
             if atom_embeddings.shape[0] > 0 and graph_data['edge_index'].shape[1] > 0:
                  edge_index = graph_data['edge_index'].to(atom_embeddings.device)
                  for gcn in self.gcn_layers:
-                    # Ensure F (torch.nn.functional) is imported
-                    atom_embeddings = F.relu(gcn(atom_embeddings, edge_index))
+                    if self.training and self.use_gradient_checkpointing:
+                        def _gcn_block(current_atom_embeddings, current_edge_index):
+                            return gcn(current_atom_embeddings, current_edge_index)
+                        atom_embeddings = torch.utils.checkpoint.checkpoint(
+                            _gcn_block, atom_embeddings, edge_index
+                        )
+                        atom_embeddings = F.relu(atom_embeddings)
+                    else:
+                        atom_embeddings = F.relu(gcn(atom_embeddings, edge_index))
             elif atom_embeddings.shape[0] > 0: 
                 pass 
 
-            atom_embeddings_for_attn = atom_embeddings.unsqueeze(0) 
-            atom_attn_output, _ = self.attention(atom_embeddings_for_attn, atom_embeddings_for_attn, atom_embeddings_for_attn)
+            atom_embeddings_for_attn = atom_embeddings.unsqueeze(0)
+            if self.use_flash_attention and atom_embeddings_for_attn.shape[0] > 0 and atom_embeddings_for_attn.shape[1] > 0: # Check for non-empty sequence
+                atom_attn_output = memory_efficient_attention(atom_embeddings_for_attn, atom_embeddings_for_attn, atom_embeddings_for_attn)
+            else:
+                atom_attn_output, _ = self.attention(atom_embeddings_for_attn, atom_embeddings_for_attn, atom_embeddings_for_attn)
             atom_attn_output = atom_attn_output.squeeze(0) 
             atom_global = torch.mean(atom_attn_output, dim=0)
 
@@ -470,7 +521,10 @@ class StructureEncoder(nn.Module):
                 pass 
             
             motif_embeddings_for_attn = motif_embeddings.unsqueeze(0)
-            motif_attn_output, _ = self.attention(motif_embeddings_for_attn, motif_embeddings_for_attn, motif_embeddings_for_attn)
+            if self.use_flash_attention and motif_embeddings_for_attn.shape[0] > 0 and motif_embeddings_for_attn.shape[1] > 0: # Check for non-empty sequence
+                motif_attn_output = memory_efficient_attention(motif_embeddings_for_attn, motif_embeddings_for_attn, motif_embeddings_for_attn)
+            else:
+                motif_attn_output, _ = self.attention(motif_embeddings_for_attn, motif_embeddings_for_attn, motif_embeddings_for_attn)
             motif_attn_output = motif_attn_output.squeeze(0) 
             motif_global = torch.mean(motif_attn_output, dim=0)
         
@@ -730,7 +784,7 @@ class StructureNoisePredictor(nn.Module):
         
         # 時間埋め込み
         self.time_mlp = nn.Sequential(
-            SinusoidalPositionEmbeddings(time_dim),
+            OptimizedSinusoidalPositionEmbeddings(time_dim),
             nn.Linear(time_dim, time_dim * 2),
             nn.GELU(),
             nn.Linear(time_dim * 2, time_dim)
@@ -771,7 +825,7 @@ class SpectrumNoisePredictor(nn.Module):
         
         # 時間埋め込み
         self.time_mlp = nn.Sequential(
-            SinusoidalPositionEmbeddings(time_dim),
+            OptimizedSinusoidalPositionEmbeddings(time_dim),
             nn.Linear(time_dim, time_dim * 2),
             nn.GELU(),
             nn.Linear(time_dim * 2, time_dim)
@@ -825,53 +879,34 @@ class SpectrumNoisePredictor(nn.Module):
         
         return predicted_noise
 
-class SinusoidalPositionEmbeddings(nn.Module):
-    """サイン波ベースの位置埋め込み"""
-    
+class OptimizedSinusoidalPositionEmbeddings(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
+        # 事前計算された埋め込みをキャッシュ
+        self._cached_embeddings = {}
 
     def forward(self, time):
         device = time.device
+        batch_size = time.shape[0]
+
+        # キャッシュチェック
+        cache_key = (batch_size, device)
+        if cache_key in self._cached_embeddings:
+            base_embeddings = self._cached_embeddings[cache_key]
+        else:
+            # 効率的な計算
+            half_dim = self.dim // 2
+            emb = torch.exp(torch.arange(half_dim, device=device) *
+                          -(math.log(10000) / (half_dim - 1)))
+            base_embeddings = emb
+            self._cached_embeddings[cache_key] = base_embeddings
+
+        # ベクトル化された計算
+        scaled_time = time[:, None] * base_embeddings[None, :]
+        embeddings = torch.cat([torch.sin(scaled_time),
+                               torch.cos(scaled_time)], dim=-1)
         
-        if self.dim == 0:
-            return torch.zeros((time.shape[0], 0), device=device)
-
-        half_dim = self.dim // 2
-
-        # Handle cases where the formula is problematic (dim < 4)
-        if self.dim < 4: # Covers half_dim = 0 and half_dim = 1
-            # For very small dimensions, the formula for div_term breaks down or is ill-defined.
-            # Returning zeros as a safe fallback.
-            # A more specific embedding could be designed for these small dims if needed.
-            # print(f"Warning: SinusoidalPositionEmbeddings dim {self.dim} is small, returning zeros.")
-            return torch.zeros((time.shape[0], self.dim), device=device)
-
-        # Original formula for div_term, safe now because half_dim > 1
-        # Note: In the original code, 'embeddings' variable was reused. Renaming for clarity.
-        div_term_val = math.log(10000) / (half_dim - 1) 
-        
-        # Exponents for div_term
-        exponents = torch.arange(half_dim, device=device, dtype=torch.float32) * -div_term_val
-        div_term_tensor = torch.exp(exponents)
-
-        # Apply to time
-        # time shape: (batch_size,) -> make it (batch_size, 1) for broadcasting
-        # div_term_tensor shape: (half_dim,) -> make it (1, half_dim) for broadcasting
-        scaled_time = time.unsqueeze(1) * div_term_tensor.unsqueeze(0) # broadcasts to (batch_size, half_dim)
-
-        # Concatenate sin and cos
-        # Result shape: (batch_size, 2 * half_dim)
-        embeddings = torch.cat((torch.sin(scaled_time), torch.cos(scaled_time)), dim=-1)
-
-        # If self.dim is odd, the above produces a tensor of shape (batch_size, self.dim - 1)
-        # Add padding if necessary to match self.dim
-        if self.dim % 2 == 1:
-            # This condition implies embeddings.shape[1] would be self.dim - 1
-            padding = torch.zeros((time.shape[0], 1), device=device)
-            embeddings = torch.cat((embeddings, padding), dim=-1)
-            
         return embeddings
 
 #------------------------------------------------------
@@ -881,14 +916,14 @@ class SinusoidalPositionEmbeddings(nn.Module):
 class BidirectionalSelfGrowingModel(nn.Module):
     """構造-スペクトル間の双方向自己成長型モデル"""
     
-    def __init__(self, atom_fdim, bond_fdim, motif_fdim, spectrum_dim, hidden_dim=MODEL_CONFIG.HIDDEN_DIM, latent_dim=MODEL_CONFIG.LATENT_DIM):
+    def __init__(self, atom_fdim, bond_fdim, motif_fdim, spectrum_dim, hidden_dim=MODEL_CONFIG.HIDDEN_DIM, latent_dim=MODEL_CONFIG.LATENT_DIM, use_gradient_checkpointing=False):
         super(BidirectionalSelfGrowingModel, self).__init__()
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
         self.spectrum_dim = spectrum_dim
         
         # 構造→スペクトル方向
-        self.structure_encoder = StructureEncoder(atom_fdim, bond_fdim, motif_fdim, hidden_dim, latent_dim)
+        self.structure_encoder = StructureEncoder(atom_fdim, bond_fdim, motif_fdim, hidden_dim, latent_dim, use_gradient_checkpointing=use_gradient_checkpointing)
         self.spectrum_decoder = SpectrumDecoder(latent_dim, hidden_dim, spectrum_dim)
         
         # スペクトル→構造方向
@@ -1473,6 +1508,18 @@ if __name__ == "__main__":
     print("MODEL_CONFIG initialized successfully")
     print("MOTIF_FEATURE_DIM:", MODEL_CONFIG.MOTIF_FEATURE_DIM)
 
+class OptimizedDataLoader(DataLoader):
+    def __init__(self, dataset, batch_size, num_workers=4, **kwargs):
+        super().__init__(
+            dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=num_workers > 0,
+            prefetch_factor=2 if num_workers > 0 else None,
+            **kwargs
+        )
+
 class ChemicalStructureSpectumDataset(Dataset):
     """化学構造とマススペクトルのデータセット"""
     
@@ -1707,6 +1754,9 @@ class SelfGrowingTrainer:
         
         # 拡散モデルのウェイト
         self.diffusion_weight = config.get('diffusion_weight', 0.1)
+
+        # 効率的なクロスエントロピー損失
+        self.efficient_cross_entropy_loss = EfficientCrossEntropyLoss(ignore_index=UNKNOWN_ATOM_INDEX_TARGET)
     
     def train_supervised(self, dataloader, epochs=1):
         """教師あり学習"""
@@ -1773,11 +1823,9 @@ class SelfGrowingTrainer:
                             structural_targets['node_exists']
                         )
 
-                        predicted_node_types_permuted = pred_node_types.permute(0, 2, 1)
-                        node_types_loss = F.cross_entropy(
-                            predicted_node_types_permuted,
-                            structural_targets['node_types'],
-                            ignore_index=UNKNOWN_ATOM_INDEX_TARGET
+                        node_types_loss = self.efficient_cross_entropy_loss(
+                            pred_node_types, # Expected shape: [batch_size, max_atoms, num_classes]
+                            structural_targets['node_types'] # Expected shape: [batch_size, max_atoms]
                         )
                         loss_p2s = node_exists_loss + node_types_loss
                     else:
@@ -2243,11 +2291,9 @@ class SelfGrowingTrainer:
                         # Input shape for cross_entropy: (N, C, ...) where C is number of classes
                         # pred_node_types is likely [batch_size, max_atoms, num_classes]
                         # structural_targets['node_types'] is [batch_size, max_atoms] (class indices)
-                        predicted_node_types_permuted = pred_node_types.permute(0, 2, 1)
-                        node_types_loss = F.cross_entropy(
-                            predicted_node_types_permuted,
-                            structural_targets['node_types'],
-                            ignore_index=UNKNOWN_ATOM_INDEX_TARGET
+                        node_types_loss = self.efficient_cross_entropy_loss(
+                            pred_node_types, # Expected shape: [batch_size, max_atoms, num_classes]
+                            structural_targets['node_types'] # Expected shape: [batch_size, max_atoms]
                         )
                         
                         loss_p2s = node_exists_loss + node_types_loss
@@ -3148,7 +3194,8 @@ def main(args):
                 "latent_dim": MODEL_CONFIG.LATENT_DIM,
                 "atom_fdim": MODEL_CONFIG.ATOM_FEATURE_DIM,
                 "bond_fdim": MODEL_CONFIG.BOND_FEATURE_DIM,
-                "motif_fdim": MODEL_CONFIG.MOTIF_FEATURE_DIM
+                "motif_fdim": MODEL_CONFIG.MOTIF_FEATURE_DIM,
+                "use_gradient_checkpointing": False # Default to False
             },
             "training": {
                 "batch_size": 32,
@@ -3208,21 +3255,21 @@ def main(args):
     )
     
     # データローダーの作成
-    train_loader = DataLoader(
+    train_loader = OptimizedDataLoader(
         train_dataset,
         batch_size=config["training"]["batch_size"],
         shuffle=True,
         collate_fn=collate_fn
     )
     
-    val_loader = DataLoader(
+    val_loader = OptimizedDataLoader(
         val_dataset,
         batch_size=config["training"]["batch_size"],
         shuffle=False,
         collate_fn=collate_fn
     )
     
-    test_loader = DataLoader(
+    test_loader = OptimizedDataLoader(
         test_dataset,
         batch_size=config["training"]["batch_size"],
         shuffle=False,
@@ -3237,7 +3284,8 @@ def main(args):
         motif_fdim=config["model"]["motif_fdim"],
         spectrum_dim=config["data"]["spectrum_dim"],
         hidden_dim=config["model"]["hidden_dim"],
-        latent_dim=config["model"]["latent_dim"]
+        latent_dim=config["model"]["latent_dim"],
+        use_gradient_checkpointing=config["model"].get("use_gradient_checkpointing", False)
     ).to(device)
     
     # トレーナーの初期化
