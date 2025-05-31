@@ -403,6 +403,95 @@ class EfficientCrossEntropyLoss(nn.Module):
 # グラフニューラルネットワークコンポーネント
 #------------------------------------------------------
 
+class FlashAttentionWrapper(nn.Module):
+    def __init__(self, embed_dim, num_heads, dropout=0.0):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.can_use_flash_pkg = _has_flash_attention
+
+        self.standard_attention = nn.MultiheadAttention(
+            embed_dim, num_heads, dropout=dropout, batch_first=True
+        )
+
+    def forward(self, x, key=None, value=None, need_weights=False):
+        if key is None: key = x
+        if value is None: value = x
+
+        # Conditions to use flash: package available AND input has batch & seq_len dimensions and they are not empty
+        # Also ensuring x is a tensor.
+        if self.can_use_flash_pkg and isinstance(x, torch.Tensor) and x.ndim == 3 and x.shape[0] > 0 and x.shape[1] > 0 and memory_efficient_attention is not None:
+            try:
+                return memory_efficient_attention(x, key, value), None # MHA typically returns (output, weights)
+            except Exception as e:
+                logging.warning(f"FlashAttentionWrapper: falling back to standard attention due to runtime error with memory_efficient_attention: {e}")
+                return self.standard_attention(x, key, value, need_weights=need_weights)
+        else:
+            # Fallback if flash package not available, memory_efficient_attention is None, or input is empty/unsuitable for flash
+            return self.standard_attention(x, key, value, need_weights=need_weights)
+
+# Triton Fused GELU
+_has_triton = False # Default value
+fused_gelu_kernel = None # Placeholder
+
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def fused_gelu_kernel_core(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = tl.load(x_ptr + offsets, mask=mask)
+
+        x3 = x * x * x
+        inner = 0.7978845608 * (x + 0.044715 * x3)
+        gelu_out = x * 0.5 * (1.0 + tl.tanh(inner))
+
+        tl.store(output_ptr + offsets, gelu_out, mask=mask)
+
+    fused_gelu_kernel = fused_gelu_kernel_core # Assign the JIT function
+    _has_triton = True
+    logging.info("Triton imported successfully. FusedGELU will attempt to use Triton kernel.")
+
+except ImportError:
+    logging.info("Triton not found. FusedGELU will use nn.GELU as fallback.")
+    # _has_triton remains False
+
+class FusedGELU(nn.Module):
+    def __init__(self):
+        super().__init__()
+        if not _has_triton:
+            self.fallback_gelu = nn.GELU()
+
+    def forward(self, x):
+        if _has_triton and x.is_cuda:
+            output = torch.empty_like(x)
+            n_elements = x.numel()
+
+            if n_elements == 0:
+                return output
+
+            BLOCK_SIZE = 1024
+            grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+
+            try:
+                # Ensure fused_gelu_kernel (the JIT function) is used here
+                fused_gelu_kernel[grid](x, output, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+                return output
+            except Exception as e:
+                logging.error(f"FusedGELU: Triton kernel execution failed: {e}. Falling back to F.gelu.")
+                return F.gelu(x)
+        else:
+            # Fallback if Triton is not available, or if x is not on CUDA
+            if hasattr(self, 'fallback_gelu'): # Triton was never imported
+                 return self.fallback_gelu(x)
+            else: # Triton was imported, but x is not CUDA
+                 # logging.warning("FusedGELU: Input tensor is not on CUDA or Triton disabled, falling back to F.gelu.")
+                 return F.gelu(x)
+
 class StructureEncoder(nn.Module):
     """化学構造をエンコードするモジュール（モチーフベースGNN）"""
     
@@ -411,7 +500,7 @@ class StructureEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
         self.use_gradient_checkpointing = use_gradient_checkpointing
-        self.use_flash_attention = _has_flash_attention
+        # self.use_flash_attention is now managed by FlashAttentionWrapper
         
         # 原子特徴量エンコーダ
         self.atom_encoder = nn.Linear(atom_fdim, hidden_dim)
@@ -437,7 +526,7 @@ class StructureEncoder(nn.Module):
         ])
         
         # グローバルアテンション
-        self.attention = nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True)
+        self.attention_layer = FlashAttentionWrapper(hidden_dim, num_heads=4) # Assuming num_heads=4 and dropout=0.0
         
         # 最終潜在表現への射影
         self.projector = nn.Sequential(
@@ -501,10 +590,7 @@ class StructureEncoder(nn.Module):
                 pass 
 
             atom_embeddings_for_attn = atom_embeddings.unsqueeze(0)
-            if self.use_flash_attention and atom_embeddings_for_attn.shape[0] > 0 and atom_embeddings_for_attn.shape[1] > 0: # Check for non-empty sequence
-                atom_attn_output = memory_efficient_attention(atom_embeddings_for_attn, atom_embeddings_for_attn, atom_embeddings_for_attn)
-            else:
-                atom_attn_output, _ = self.attention(atom_embeddings_for_attn, atom_embeddings_for_attn, atom_embeddings_for_attn)
+            atom_attn_output, _ = self.attention_layer(atom_embeddings_for_attn)
             atom_attn_output = atom_attn_output.squeeze(0) 
             atom_global = torch.mean(atom_attn_output, dim=0)
 
@@ -521,10 +607,7 @@ class StructureEncoder(nn.Module):
                 pass 
             
             motif_embeddings_for_attn = motif_embeddings.unsqueeze(0)
-            if self.use_flash_attention and motif_embeddings_for_attn.shape[0] > 0 and motif_embeddings_for_attn.shape[1] > 0: # Check for non-empty sequence
-                motif_attn_output = memory_efficient_attention(motif_embeddings_for_attn, motif_embeddings_for_attn, motif_embeddings_for_attn)
-            else:
-                motif_attn_output, _ = self.attention(motif_embeddings_for_attn, motif_embeddings_for_attn, motif_embeddings_for_attn)
+            motif_attn_output, _ = self.attention_layer(motif_embeddings_for_attn)
             motif_attn_output = motif_attn_output.squeeze(0) 
             motif_global = torch.mean(motif_attn_output, dim=0)
         
@@ -786,18 +869,18 @@ class StructureNoisePredictor(nn.Module):
         self.time_mlp = nn.Sequential(
             OptimizedSinusoidalPositionEmbeddings(time_dim),
             nn.Linear(time_dim, time_dim * 2),
-            nn.GELU(),
+            FusedGELU(),
             nn.Linear(time_dim * 2, time_dim)
         )
         
         # ノイズ予測ネットワーク
         self.noise_predictor = nn.Sequential(
             nn.Linear(latent_dim + time_dim, hidden_dim),
-            nn.GELU(),
+            FusedGELU(),
             nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.GELU(),
+            FusedGELU(),
             nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.GELU(),
+            FusedGELU(),
             nn.Linear(hidden_dim, latent_dim)
         )
     
@@ -827,33 +910,33 @@ class SpectrumNoisePredictor(nn.Module):
         self.time_mlp = nn.Sequential(
             OptimizedSinusoidalPositionEmbeddings(time_dim),
             nn.Linear(time_dim, time_dim * 2),
-            nn.GELU(),
+            FusedGELU(),
             nn.Linear(time_dim * 2, time_dim)
         )
         
         # 1D CNN特徴抽出
         self.feature_extractor = nn.Sequential(
             nn.Conv1d(1, 32, kernel_size=7, stride=1, padding=3),
-            nn.GELU(),
+            FusedGELU(),
             nn.Conv1d(32, 64, kernel_size=5, stride=1, padding=2),
-            nn.GELU(),
+            FusedGELU(),
             nn.Conv1d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.GELU()
+            FusedGELU()
         )
         
         # 時間条件付き特徴処理
         self.time_processor = nn.Sequential(
             nn.Linear(128 + time_dim, hidden_dim),
-            nn.GELU(),
+            FusedGELU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
         
         # アップサンプリングでスペクトルノイズを予測
         self.noise_predictor = nn.Sequential(
             nn.ConvTranspose1d(hidden_dim, 64, kernel_size=3, stride=1, padding=1),
-            nn.GELU(),
+            FusedGELU(),
             nn.ConvTranspose1d(64, 32, kernel_size=5, stride=1, padding=2),
-            nn.GELU(),
+            FusedGELU(),
             nn.ConvTranspose1d(32, 1, kernel_size=7, stride=1, padding=3)
         )
     
@@ -1102,6 +1185,45 @@ class BidirectionalSelfGrowingModel(nn.Module):
         latent_consistency_loss = F.mse_loss(raw_structure_latent, raw_spectrum_latent)
 
         return structure_cycle_loss + spectrum_cycle_loss + 0.1 * latent_consistency_loss
+
+class MemoryMonitor:
+    """GPUメモリ使用状況を監視するクラス"""
+    def __init__(self, device):
+        self.device = device
+        self.peak_memory = 0
+
+    def get_memory_usage_ratio(self):
+        """現在のメモリ使用率を取得"""
+        if self.device.type != 'cuda':
+            return 0.0
+
+        # Peak memory update based on allocated
+        self.peak_memory = max(self.peak_memory, torch.cuda.memory_allocated(self.device))
+
+        # Get reserved memory and total memory for ratio calculation
+        reserved_memory = torch.cuda.memory_reserved(self.device)
+        _, total_memory = torch.cuda.mem_get_info(self.device) # free_memory, total_memory
+
+        if total_memory == 0: # Avoid division by zero
+            return 0.0
+        usage_ratio = reserved_memory / total_memory
+
+        return usage_ratio
+
+    def get_detailed_stats(self):
+        """詳細なメモリ統計を取得"""
+        if self.device.type != 'cuda':
+            return {}
+
+        free_mem_info, total_mem_info = torch.cuda.mem_get_info(self.device)
+
+        return {
+            'allocated': torch.cuda.memory_allocated(self.device) / 1e9,  # GB
+            'reserved': torch.cuda.memory_reserved(self.device) / 1e9, # GB
+            'free': free_mem_info / 1e9, # GB
+            'total': total_mem_info / 1e9, # GB
+            'peak': self.peak_memory / 1e9 # GB
+        }
 
 # --- Continue with rest of the code (MoleculeData, dataset classes, etc.) ---
 
@@ -1519,6 +1641,207 @@ class OptimizedDataLoader(DataLoader):
             prefetch_factor=2 if num_workers > 0 else None,
             **kwargs
         )
+
+class DynamicBatchDataLoader:
+    """バッチサイズを動的に変更可能なDataLoaderラッパー"""
+
+    def __init__(self, dataset, initial_batch_size, num_workers=4, **kwargs):
+        self.dataset = dataset
+        self.num_workers = num_workers
+        self.kwargs = kwargs # Stores other DataLoader args like shuffle, collate_fn
+        self.current_batch_size = initial_batch_size
+        self._dataloader = None
+        self._recreate_dataloader()
+
+    def _recreate_dataloader(self):
+        """DataLoaderを再作成"""
+        # 既存のDataLoaderをクリーンアップ
+        if self._dataloader is not None:
+            # ワーカープロセスを適切に終了させる試み
+            # This is tricky. The most robust way is to ensure the old loader's workers are shut down.
+            # For PyTorch >= 1.7.0, deleting the iterator might help if it exists and holds references.
+            if hasattr(self._dataloader, '_iterator') and self._dataloader._iterator is not None:
+                try:
+                    # If the iterator is a MultiProcessingDataLoaderIter, it has a _shutdown property
+                    # and a _shutdown_workers method. However, these are internal.
+                    # A simpler approach is just to delete it.
+                    del self._dataloader._iterator
+                except AttributeError:
+                    pass # Might not have _iterator or it's already gone.
+            del self._dataloader # Remove reference to allow garbage collection
+
+        # 新しいDataLoaderを作成
+        # OptimizedDataLoader should be defined in the file already
+        self._dataloader = OptimizedDataLoader(
+            self.dataset,
+            batch_size=self.current_batch_size,
+            num_workers=self.num_workers,
+            **self.kwargs # Pass through other args like shuffle, collate_fn
+        )
+
+    def update_batch_size(self, new_batch_size):
+        """バッチサイズを更新"""
+        if new_batch_size != self.current_batch_size:
+            self.current_batch_size = new_batch_size
+            self._recreate_dataloader()
+            # logger should be globally defined
+            logger.info(f"DynamicBatchDataLoader: Batch size updated to: {new_batch_size}")
+
+    def __iter__(self):
+        return iter(self._dataloader)
+
+    def __len__(self):
+        return len(self._dataloader)
+
+class AdaptiveBatchSizeScheduler:
+    def __init__(self, initial_batch_size, max_batch_size, warmup_steps=100):
+        self.current_batch_size = initial_batch_size
+        self.max_batch_size = max_batch_size
+        self.warmup_steps = warmup_steps
+        self.step_count = 0
+        self.memory_usage_history = deque(maxlen=10) # Default maxlen, user might tune this in AdaptiveTrainingManager
+
+    def step(self, memory_usage_ratio): # This method is called by AdaptiveTrainingManager's logic
+        self.step_count += 1
+        self.memory_usage_history.append(memory_usage_ratio)
+
+        # The logic for adjusting current_batch_size is actually handled more directly
+        # by the AdaptiveTrainingManager in the user's more detailed proposal.
+        # This basic scheduler mainly tracks history and step count.
+        # The AdaptiveTrainingManager will read self.current_batch_size and self.memory_usage_history.
+
+        # Original logic from user's first proposal (will be superseded by AdaptiveTrainingManager's logic,
+        # but let's include it for completeness of this specific class as requested):
+        if self.step_count > self.warmup_steps:
+            avg_memory_usage = np.mean(self.memory_usage_history)
+
+            if avg_memory_usage < 0.7:  # 70%未満なら増加
+                self.current_batch_size = min(
+                    int(self.current_batch_size * 1.2),
+                    self.max_batch_size
+                )
+            elif avg_memory_usage > 0.9:  # 90%超なら減少
+                self.current_batch_size = max(
+                    int(self.current_batch_size * 0.8),
+                    1 # min batch size of 1
+                )
+        return self.current_batch_size
+
+class AdaptiveTrainingManager:
+    """適応的バッチサイズを管理する統合クラス"""
+
+    def __init__(self, config, device): # config here is expected to be the 'training' part of the main config
+        self.device = device
+        self.memory_monitor = MemoryMonitor(device) # MemoryMonitor should be defined
+
+        # 設定
+        self.initial_batch_size = config.get('batch_size', 32) # Default from main config
+        self.max_batch_size = config.get('max_batch_size', 128)
+        self.min_batch_size = config.get('min_batch_size', 1)
+        self.memory_target = config.get('memory_target', 0.8)  # 目標メモリ使用率
+        self.adaptation_interval = config.get('adaptation_interval', 10)  # 適応間隔（イテレーション）
+
+        # 状態
+        self.iteration_count = 0
+        self.memory_history = deque(maxlen=20) # User specified maxlen=20 here
+        self.batch_size_history = []
+
+        # スケジューラ
+        # AdaptiveBatchSizeScheduler should be defined
+        self.batch_scheduler = AdaptiveBatchSizeScheduler(
+            self.initial_batch_size,
+            self.max_batch_size, # Pass max_batch_size to it
+            warmup_steps=config.get('adaptive_warmup_steps', 50) # Make warmup_steps configurable
+        )
+
+    def create_adaptive_dataloaders(self, train_dataset, val_dataset, test_dataset, num_workers=4, train_collate_fn=collate_fn, eval_collate_fn=collate_fn):
+        """適応的DataLoaderを作成"""
+        # DynamicBatchDataLoader should be defined
+        # collate_fn should be a globally defined function
+
+        # Get num_workers from config if available, else default to 4
+        # Corrected this line: initial_batch_size should be from the scheduler for consistency
+        current_initial_batch_size = self.batch_scheduler.current_batch_size
+
+        train_loader = DynamicBatchDataLoader(
+            train_dataset,
+            initial_batch_size=current_initial_batch_size, # Use the scheduler's current_batch_size
+            num_workers=num_workers, # Pass num_workers
+            shuffle=True, # Common for training
+            collate_fn=train_collate_fn
+        )
+
+        # 検証・テスト用は固定バッチサイズ（メモリ効率重視）
+        # OptimizedDataLoader should be defined
+        val_batch_size = current_initial_batch_size
+        val_loader = OptimizedDataLoader(
+            val_dataset,
+            batch_size=min(val_batch_size, 16),
+            num_workers=num_workers, # Pass num_workers
+            shuffle=False,
+            collate_fn=eval_collate_fn
+        )
+
+        test_batch_size = current_initial_batch_size
+        test_loader = OptimizedDataLoader(
+            test_dataset,
+            batch_size=min(test_batch_size, 16),
+            num_workers=num_workers, # Pass num_workers
+            shuffle=False,
+            collate_fn=eval_collate_fn
+        )
+
+        return train_loader, val_loader, test_loader
+
+    def step(self, train_loader=None): # train_loader is expected to be a DynamicBatchDataLoader instance
+        """適応的バッチサイズの更新ステップ"""
+        self.iteration_count += 1
+
+        # メモリ使用率を記録
+        memory_ratio = self.memory_monitor.get_memory_usage_ratio()
+        self.memory_history.append(memory_ratio)
+
+        # 適応間隔でバッチサイズを更新
+        if self.iteration_count % self.adaptation_interval == 0 and train_loader is not None:
+            if not self.memory_history: # Ensure memory_history is not empty
+                return
+
+            avg_memory = np.mean(self.memory_history)
+
+            current_bs = train_loader.current_batch_size # Get current batch size from the dynamic loader
+            new_batch_size = current_bs # Default to current
+
+            # 新しいバッチサイズを計算
+            if avg_memory < self.memory_target * 0.9 and avg_memory > 0:  # 目標の90%未満 and valid avg_memory
+                scale_factor = min(1.2, self.memory_target / avg_memory if avg_memory > 1e-6 else 1.2) # avoid division by zero or too small avg_memory
+                new_batch_size = int(current_bs * scale_factor)
+            elif avg_memory > self.memory_target * 1.1:  # 目標の110%超
+                scale_factor = max(0.8, self.memory_target / avg_memory if avg_memory > 1e-6 else 0.8) # Ensure scale_factor is not too small, avoid division by zero
+                new_batch_size = int(current_bs * scale_factor)
+
+            # 制限を適用
+            new_batch_size = max(self.min_batch_size, min(new_batch_size, self.max_batch_size))
+
+            # バッチサイズを更新
+            if new_batch_size != current_bs:
+                train_loader.update_batch_size(new_batch_size)
+                # Update the scheduler's internal current_batch_size as well,
+                # as AdaptiveBatchSizeScheduler's own step() method might not be called directly by the trainer.
+                self.batch_scheduler.current_batch_size = new_batch_size
+                self.batch_size_history.append((self.iteration_count, new_batch_size))
+                # logger should be globally defined
+                logger.info(f"AdaptiveTrainingManager: Adaptive batch size updated to: {new_batch_size} (Avg. Memory: {avg_memory:.2%}, Target: {self.memory_target:.2%})")
+
+    def log_statistics(self):
+        """統計情報をログ出力"""
+        stats = self.memory_monitor.get_detailed_stats()
+        # logger should be globally defined
+        logger.info(f"AdaptiveTrainingManager: Memory Stats - Allocated: {stats['allocated']:.2f}GB, "
+                   f"Reserved: {stats['reserved']:.2f}GB, "
+                   f"Peak: {stats['peak']:.2f}GB, "
+                   f"Total: {stats['total']:.2f}GB")
+        if self.batch_size_history:
+            logger.info(f"AdaptiveTrainingManager: Batch size history (last 5): {self.batch_size_history[-5:]}")
 
 class ChemicalStructureSpectumDataset(Dataset):
     """化学構造とマススペクトルのデータセット"""
