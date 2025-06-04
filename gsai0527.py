@@ -1727,6 +1727,40 @@ class AdaptiveBatchSizeScheduler:
                 )
         return self.current_batch_size
 
+def collate_fn(batch):
+    """バッチ処理用の関数"""
+    batch_dict = {
+        'type': [],
+        'structure': [],
+        'spectrum': []
+    }
+    
+    for data in batch:
+        for key in batch_dict:
+            batch_dict[key].append(data[key])
+    
+    # スペクトルをスタック（あれば）
+    spectra = []
+    for item in batch_dict['spectrum']:
+        if item is not None:
+            if isinstance(item, torch.Tensor):
+                spectra.append(item)
+            elif isinstance(item, np.ndarray):
+                spectra.append(torch.FloatTensor(item))
+            else:
+                # その他の形式の場合もFloatTensorに変換を試みる
+                try:
+                    spectra.append(torch.FloatTensor(item))
+                except:
+                    pass
+    
+    if spectra:
+        batch_dict['spectrum_tensor'] = torch.stack(spectra)
+    else:
+        batch_dict['spectrum_tensor'] = None
+    
+    return batch_dict
+
 class AdaptiveTrainingManager:
     """適応的バッチサイズを管理する統合クラス"""
 
@@ -1988,40 +2022,6 @@ class ChemicalStructureSpectumDataset(Dataset):
         self.spectra.append(spectrum)
         self.n_spectra += 1
         self.total += 1
-
-def collate_fn(batch):
-    """バッチ処理用の関数"""
-    batch_dict = {
-        'type': [],
-        'structure': [],
-        'spectrum': []
-    }
-    
-    for data in batch:
-        for key in batch_dict:
-            batch_dict[key].append(data[key])
-    
-    # スペクトルをスタック（あれば）
-    spectra = []
-    for item in batch_dict['spectrum']:
-        if item is not None:
-            if isinstance(item, torch.Tensor):
-                spectra.append(item)
-            elif isinstance(item, np.ndarray):
-                spectra.append(torch.FloatTensor(item))
-            else:
-                # その他の形式の場合もFloatTensorに変換を試みる
-                try:
-                    spectra.append(torch.FloatTensor(item))
-                except:
-                    pass
-    
-    if spectra:
-        batch_dict['spectrum_tensor'] = torch.stack(spectra)
-    else:
-        batch_dict['spectrum_tensor'] = None
-    
-    return batch_dict
 
 #------------------------------------------------------
 # 自己成長トレーニングループとアルゴリズム
